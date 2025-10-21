@@ -17,6 +17,6 @@ pub use errors::Error;
 pub use exchange::*;
 pub use helpers::{bps_diff, truncate_float, BaseUrl};
 pub use info::{info_client::*, *};
-pub use market_maker::{MarketMaker, MarketMakerInput, MarketMakerRestingOrder};
+pub use market_maker::{MarketMaker, MarketMakerInput, MarketMakerRestingOrder, OrderBookAnalyzer};
 pub use meta::{AssetContext, AssetMeta, Meta, MetaAndAssetCtxs, SpotAssetMeta, SpotMeta};
 pub use ws::*;
