@@ -61,4 +61,6 @@ pub enum Error {
     SignatureFailure(String),
     #[error("Vault address not found")]
     VaultAddressNotFound,
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
 }

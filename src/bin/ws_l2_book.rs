@@ -16,7 +16,7 @@ async fn main() {
     let subscription_id = info_client
         .subscribe(
             Subscription::L2Book {
-                coin: "ETH".to_string(),
+                coin: "HYPE".to_string(),
             },
             sender,
         )
