@@ -3,7 +3,7 @@
 We subscribe to the current mid price and build a market around this price. Whenever our market becomes outdated, we place and cancel orders to renew it.
 */
 use alloy::signers::local::PrivateKeySigner;
-use hyperliquid_rust_sdk::{AssetType, MarketMaker, MarketMakerInput};
+use hyperliquid_rust_sdk::{AssetType, InventorySkewConfig, MarketMaker, MarketMakerInput};
 use std::env;
 use tokio::signal;
 use log::info;
@@ -22,6 +22,14 @@ async fn main() {
     let wallet: PrivateKeySigner = private_key
         .parse()
         .expect("Invalid private key format");
+    
+    // Configure inventory skewing
+    let skew_config = InventorySkewConfig::new(
+        0.5,  // inventory_skew_factor: moderate aggression (0.0-1.0)
+        0.3,  // book_imbalance_factor: some reaction to book (0.0-1.0)
+        5,    // depth_analysis_levels: analyze top 5 levels
+    ).expect("Failed to create skew config");
+    
     let market_maker_input = MarketMakerInput {
         asset: "HYPE".to_string(),
         target_liquidity: 2.0,
@@ -30,6 +38,7 @@ async fn main() {
         max_absolute_position_size: 3.0,
         asset_type: AssetType::Perp, // HYPE is a perpetual
         wallet,
+        inventory_skew_config: Some(skew_config), // Enable inventory skewing
     };
     
     let mut market_maker = MarketMaker::new(market_maker_input).await

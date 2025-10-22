@@ -5,9 +5,10 @@ use tokio::sync::mpsc::unbounded_channel;
 //RUST_LOG=info cargo run --bin market_maker
 
 use crate::{
-    bps_diff, AssetType, BaseUrl, ClientCancelRequest, ClientLimit, ClientOrder,
+    bps_diff, AssetType, BaseUrl, BookAnalysis, ClientCancelRequest, ClientLimit, ClientOrder,
     ClientOrderRequest, ExchangeClient, ExchangeDataStatus, ExchangeResponseStatus, InfoClient,
-    Message, Subscription, TickLotValidator, UserData, EPSILON,
+    InventorySkewCalculator, InventorySkewConfig, Message, OrderBook, Subscription,
+    TickLotValidator, UserData, EPSILON,
 };
 #[derive(Debug)]
 pub struct MarketMakerRestingOrder {
@@ -25,6 +26,7 @@ pub struct MarketMakerInput {
     pub max_absolute_position_size: f64, // Absolute value of the max position we can take on
     pub asset_type: AssetType, // Asset type (Perp or Spot) for tick/lot size validation
     pub wallet: PrivateKeySigner, // Wallet containing private key
+    pub inventory_skew_config: Option<InventorySkewConfig>, // Optional inventory skewing configuration
 }
 
 #[derive(Debug)]
@@ -42,6 +44,9 @@ pub struct MarketMaker {
     pub info_client: InfoClient,
     pub exchange_client: ExchangeClient,
     pub user_address: Address,
+    pub inventory_skew_calculator: Option<InventorySkewCalculator>,
+    pub latest_book: Option<OrderBook>,
+    pub latest_book_analysis: Option<BookAnalysis>,
 }
 
 impl MarketMaker {
@@ -107,6 +112,10 @@ impl MarketMaker {
             sz_decimals,
         );
 
+        let inventory_skew_calculator = input
+            .inventory_skew_config
+            .map(|config| InventorySkewCalculator::new(config));
+
         Ok(MarketMaker {
             asset: input.asset,
             target_liquidity: input.target_liquidity,
@@ -129,6 +138,9 @@ impl MarketMaker {
             info_client,
             exchange_client,
             user_address,
+            inventory_skew_calculator,
+            latest_book: None,
+            latest_book_analysis: None,
         })
     }
 
@@ -152,9 +164,23 @@ impl MarketMaker {
 
         // Subscribe to AllMids so we can market make around the mid price
         self.info_client
-            .subscribe(Subscription::AllMids, sender)
+            .subscribe(Subscription::AllMids, sender.clone())
             .await
             .unwrap();
+
+        // Subscribe to L2Book if inventory skewing is enabled
+        if self.inventory_skew_calculator.is_some() {
+            info!("Subscribing to L2 book data for inventory skewing");
+            self.info_client
+                .subscribe(
+                    Subscription::L2Book {
+                        coin: self.asset.clone(),
+                    },
+                    sender,
+                )
+                .await
+                .unwrap();
+        }
 
         loop {
             tokio::select! {
@@ -174,6 +200,21 @@ impl MarketMaker {
                 message = receiver.recv() => {
             let message = message.unwrap();
             match message {
+                Message::L2Book(l2_book) => {
+                    // Update our order book state
+                    if let Some(book) = OrderBook::from_l2_data(&l2_book.data) {
+                        // Analyze the book if we have a skew calculator
+                        if let Some(calculator) = &self.inventory_skew_calculator {
+                            let depth_levels = calculator.config.depth_analysis_levels;
+                            if let Some(analysis) = book.analyze(depth_levels) {
+                                // Optionally log book stats (can be disabled for performance)
+                                // book.log_stats(&analysis);
+                                self.latest_book_analysis = Some(analysis);
+                            }
+                        }
+                        self.latest_book = Some(book);
+                    }
+                }
                 Message::AllMids(all_mids) => {
                     let all_mids = all_mids.data.mids;
                     let mid = all_mids.get(&self.asset);
@@ -480,10 +521,32 @@ impl MarketMaker {
         self.cleanup_invalid_resting_orders();
         
         let half_spread = (self.latest_mid_price * self.half_spread as f64) / 10000.0;
-        // Determine prices to target from the half spread
+        
+        // Calculate inventory skew if enabled
+        let skew_adjustment = if let Some(calculator) = &self.inventory_skew_calculator {
+            let skew = calculator.calculate_skew(
+                self.cur_position,
+                self.max_absolute_position_size,
+                self.latest_book_analysis.as_ref(),
+                self.half_spread as f64,
+            );
+            
+            // Log the skew information
+            calculator.log_skew(&skew);
+            
+            // Convert skew from bps to actual price adjustment
+            (self.latest_mid_price * skew.skew_bps) / 10000.0
+        } else {
+            0.0
+        };
+        
+        // Determine prices to target from the half spread and skew
+        // The skew_adjustment modifies the spread width around mid, creating asymmetry
+        // When long (negative skew): narrower spread below mid, wider above mid -> easier to sell
+        // When short (positive skew): wider spread below mid, narrower above mid -> easier to buy
         let (lower_price, upper_price) = (
-            self.latest_mid_price - half_spread,
-            self.latest_mid_price + half_spread,
+            self.latest_mid_price - half_spread - skew_adjustment,
+            self.latest_mid_price + half_spread + skew_adjustment,
         );
         let (mut lower_price, mut upper_price) = (
             self.tick_lot_validator.round_price(lower_price, false), // Round down for buy orders
