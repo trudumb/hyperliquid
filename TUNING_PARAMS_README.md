@@ -155,6 +155,51 @@ The Market Maker V2 supports **hot-reloading** of tuning parameters. You can adj
 
 ---
 
+### `control_gap_threshold`
+**Range:** `[0.1, 50.0]`  
+**Default:** `1.0`  
+**Purpose:** Minimum control gap (in bps²) required to trigger Adam optimizer parameter tuning. This is a **meta-parameter** that controls when the optimizer runs, not a parameter being optimized itself.
+
+- **Higher values** (5.0-20.0): Conservative tuning
+  - Only tune when quotes deviate significantly from optimal
+  - Prevents optimizer from chasing noise
+  - Better for volatile or noisy markets
+  - Reduces computational overhead
+  
+- **Lower values** (0.5-2.0): Aggressive tuning
+  - Tune even for small deviations from optimal
+  - Allows extremely fine-grained parameter adjustment
+  - Better for stable, quiet markets
+  - Higher computational overhead
+
+**How it works:**
+- Control gap = (bid_optimal - bid_heuristic)² + (ask_optimal - ask_heuristic)²
+- If control gap > threshold, Adam optimizer runs and tunes parameters
+- If control gap ≤ threshold, no tuning occurs (heuristic is "close enough")
+
+**Market condition guidelines:**
+- **Stable/Quiet markets** (low volatility, tight spreads): 0.5-2.0
+  - Small deviations are meaningful and worth correcting
+  - Fine-tuning improves performance
+  
+- **Normal markets** (moderate volatility): 1.0-3.0
+  - Default range works well for most conditions
+  
+- **Volatile/Noisy markets** (high volatility, wide spreads): 5.0-20.0
+  - Large deviations are normal and may be transient
+  - Prevents overreacting to noise
+
+**Example:** With threshold = 1.0:
+- If bid_gap=0.5bps and ask_gap=0.5bps: gap=0.5 (no tuning)
+- If bid_gap=0.8bps and ask_gap=0.6bps: gap=1.0 (tuning triggers)
+- If bid_gap=1.0bps and ask_gap=1.0bps: gap=2.0 (tuning triggers)
+
+**Example use case:** 
+- Increase to 10.0 during volatile market conditions (VIX > 30) to prevent Adam from chasing transient noise
+- Decrease to 0.5 during overnight hours with stable conditions for maximum precision
+
+---
+
 ## Pre-Configured Scenarios
 
 ### 🔴 Conservative (High Risk Aversion)
@@ -166,7 +211,8 @@ The Market Maker V2 supports **hot-reloading** of tuning parameters. You can adj
   "inventory_urgency_threshold": 0.6,
   "liquidation_rate_multiplier": 15.0,
   "min_spread_base_ratio": 0.3,
-  "adverse_selection_spread_scale": 150.0
+  "adverse_selection_spread_scale": 150.0,
+  "control_gap_threshold": 5.0
 }
 ```
 **Use when:** High volatility, news events, low liquidity, uncertain conditions
@@ -182,7 +228,8 @@ The Market Maker V2 supports **hot-reloading** of tuning parameters. You can adj
   "inventory_urgency_threshold": 0.8,
   "liquidation_rate_multiplier": 8.0,
   "min_spread_base_ratio": 0.15,
-  "adverse_selection_spread_scale": 70.0
+  "adverse_selection_spread_scale": 70.0,
+  "control_gap_threshold": 0.5
 }
 ```
 **Use when:** Low volatility, stable markets, high liquidity, tight spreads beneficial
@@ -198,7 +245,8 @@ The Market Maker V2 supports **hot-reloading** of tuning parameters. You can adj
   "inventory_urgency_threshold": 0.7,
   "liquidation_rate_multiplier": 10.0,
   "min_spread_base_ratio": 0.2,
-  "adverse_selection_spread_scale": 100.0
+  "adverse_selection_spread_scale": 100.0,
+  "control_gap_threshold": 1.0
 }
 ```
 **Use when:** Normal market conditions, default starting point
@@ -214,7 +262,8 @@ The Market Maker V2 supports **hot-reloading** of tuning parameters. You can adj
   "inventory_urgency_threshold": 0.65,
   "liquidation_rate_multiplier": 12.0,
   "min_spread_base_ratio": 0.25,
-  "adverse_selection_spread_scale": 120.0
+  "adverse_selection_spread_scale": 120.0,
+  "control_gap_threshold": 10.0
 }
 ```
 **Use when:** VIX spike, market crash, flash crash, extreme volatility
@@ -230,7 +279,8 @@ The Market Maker V2 supports **hot-reloading** of tuning parameters. You can adj
   "inventory_urgency_threshold": 0.85,
   "liquidation_rate_multiplier": 5.0,
   "min_spread_base_ratio": 0.18,
-  "adverse_selection_spread_scale": 80.0
+  "adverse_selection_spread_scale": 80.0,
+  "control_gap_threshold": 0.8
 }
 ```
 **Use when:** Building position, confident in direction, want to hold inventory

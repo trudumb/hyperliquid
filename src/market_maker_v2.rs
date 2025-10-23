@@ -52,6 +52,13 @@ pub struct TuningParams {
     /// Denominator for normalizing spread in adverse selection calculation
     /// Higher = less sensitivity to spread changes
     pub adverse_selection_spread_scale: f64,
+    
+    /// Control gap threshold for Adam optimizer (default: 1.0 bps²)
+    /// Minimum control gap (bid_gap² + ask_gap²) required to trigger parameter tuning
+    /// Higher = more conservative, only tune when quotes deviate significantly from optimal
+    /// Lower = more aggressive, tune even for small deviations
+    /// Recommended: 1.0-5.0 for stable markets, 5.0-20.0 for volatile/noisy markets
+    pub control_gap_threshold: f64,
 }
 
 /// Adam Optimizer State for automatic parameter tuning
@@ -87,9 +94,9 @@ impl Default for AdamOptimizerState {
             m: vec![0.0; 7], // 7 parameters
             v: vec![0.0; 7],
             t: 0,
-            alpha: 0.001,  // Conservative default learning rate
+            alpha: 0.01,   // Increased 10x: allows meaningful parameter updates
             beta1: 0.9,
-            beta2: 0.999,
+            beta2: 0.99,   // Reduced from 0.999: "forgets" old gradients 10x faster, prevents v explosion
             epsilon: 1e-8,
         }
     }
@@ -174,6 +181,7 @@ impl Default for TuningParams {
             liquidation_rate_multiplier: 10.0,
             min_spread_base_ratio: 0.2,
             adverse_selection_spread_scale: 100.0,
+            control_gap_threshold: 1.0,
         }
     }
 }
@@ -201,6 +209,9 @@ impl TuningParams {
         }
         if self.adverse_selection_spread_scale <= 0.0 {
             return Err(format!("adverse_selection_spread_scale must be positive, got {}", self.adverse_selection_spread_scale));
+        }
+        if self.control_gap_threshold <= 0.0 {
+            return Err(format!("control_gap_threshold must be positive, got {}", self.control_gap_threshold));
         }
         Ok(())
     }
@@ -245,6 +256,15 @@ pub struct StateVector {
     /// Calculated as V^b / (V^b + V^a)
     /// Key predictor used to update adverse selection estimate
     pub lob_imbalance: f64,
+    
+    /// σ̂_t: Volatility Estimate - EMA of realized volatility in basis points
+    /// Used to dynamically adjust spread based on market conditions
+    /// Higher volatility = wider spreads to manage adverse selection risk
+    pub volatility_ema_bps: f64,
+    
+    /// S_{t-1}: Previous mid-price - used for volatility calculation
+    /// Tracks the last mid-price to compute log returns
+    pub previous_mid_price: f64,
 }
 
 impl StateVector {
@@ -256,7 +276,32 @@ impl StateVector {
             adverse_selection_estimate: 0.0,
             market_spread_bps: 0.0,
             lob_imbalance: 0.0,
+            volatility_ema_bps: 10.0, // Default to 10 bps volatility estimate
+            previous_mid_price: 0.0,
         }
+    }
+    
+    /// Calculate new volatility estimate from price change
+    /// Returns instantaneous volatility in basis points if valid
+    fn calculate_new_volatility(&self, new_mid_price: f64) -> Option<f64> {
+        // Need both prices to be positive and previous price to be set
+        if self.previous_mid_price <= 0.0 || new_mid_price <= 0.0 {
+            return None;
+        }
+        
+        // Calculate log return: ln(P_t / P_{t-1})
+        let log_return = (new_mid_price / self.previous_mid_price).ln();
+        
+        // Convert to basis points (multiply by 10,000)
+        // Take absolute value as we care about magnitude of volatility
+        let instantaneous_vol_bps = log_return.abs() * 10000.0;
+        
+        // Sanity check: reject extreme outliers (> 1000 bps = 10% move)
+        if instantaneous_vol_bps > 1000.0 {
+            return None;
+        }
+        
+        Some(instantaneous_vol_bps)
     }
     
     /// Update the state vector from current market data
@@ -268,6 +313,15 @@ impl StateVector {
         order_book: Option<&OrderBook>,
         tuning_params: &TuningParams,
     ) {
+        // Calculate volatility before updating mid_price
+        if let Some(new_vol) = self.calculate_new_volatility(mid_price) {
+            // EMA smoothing: σ̂_t = λ * vol_t + (1 - λ) * σ̂_{t-1}
+            let lambda = tuning_params.adverse_selection_lambda; // Reuse lambda for consistency
+            self.volatility_ema_bps = lambda * new_vol + (1.0 - lambda) * self.volatility_ema_bps;
+        }
+        
+        // Store current mid_price for next volatility calculation
+        self.previous_mid_price = self.mid_price;
         self.mid_price = mid_price;
         self.inventory = inventory;
         
@@ -372,12 +426,13 @@ impl StateVector {
     /// Get a string representation of the state vector for logging
     pub fn to_log_string(&self) -> String {
         format!(
-            "StateVector[S={:.2}, Q={:.4}, μ̂={:.4}, Δ={:.1}bps, I={:.3}]",
+            "StateVector[S={:.2}, Q={:.4}, μ̂={:.4}, Δ={:.1}bps, I={:.3}, σ̂={:.2}bps]",
             self.mid_price,
             self.inventory,
             self.adverse_selection_estimate,
             self.market_spread_bps,
-            self.lob_imbalance
+            self.lob_imbalance,
+            self.volatility_ema_bps
         )
     }
 }
@@ -532,23 +587,29 @@ impl ControlVector {
         max_inventory: f64,
         tuning_params: &TuningParams,
     ) {
-        // 1. Adverse Selection Adjustment
+        // 1. Adverse Selection Adjustment (Two-Sided Shift)
         let adverse_adj = state.get_adverse_selection_adjustment(
             base_spread_bps,
             tuning_params.adverse_selection_adjustment_factor,
         );
-        if adverse_adj > 0.0 {
-            // Bearish signal - widen bid (make buying less attractive)
-            self.bid_offset_bps += adverse_adj;
-        } else {
-            // Bullish signal - widen ask (make selling less attractive)
-            self.ask_offset_bps -= adverse_adj;
-        }
         
-        // 2. Inventory Risk Adjustment
+        // This shifts the entire quote.
+        // If bullish (adj is neg): ask widens (ask - neg = ask + pos), bid tightens (bid + neg = bid - pos)
+        // If bearish (adj is pos): ask tightens (ask - pos), bid widens (bid + pos)
+        self.ask_offset_bps -= adverse_adj;
+        self.bid_offset_bps += adverse_adj;
+        
+        // 2. Inventory Risk Adjustment (Asymmetric)
         let risk_multiplier = state.get_inventory_risk_multiplier(max_inventory);
-        self.ask_offset_bps *= risk_multiplier;
-        self.bid_offset_bps *= risk_multiplier;
+        if state.inventory > 0.0 {
+            // We are LONG. Widen the BID to discourage more buying.
+            self.bid_offset_bps *= risk_multiplier;
+        } else if state.inventory < 0.0 {
+            // We are SHORT. Widen the ASK to discourage more selling.
+            self.ask_offset_bps *= risk_multiplier;
+        }
+        // The side we *want* to get filled on (ask if long, bid if short)
+        // is left alone, allowing the skew adjustment in step 3 to tighten it.
         
         // 3. Inventory-based Quote Skewing
         // If long, tighten ask and widen bid to encourage selling
@@ -952,20 +1013,21 @@ pub struct MarketMakerRestingOrder {
 pub struct MarketMakerInput {
     pub asset: String,
     pub target_liquidity: f64, // Amount of liquidity on both sides to target
-    pub half_spread: u16,      // Half of the spread for our market making (in BPS)
-    pub max_bps_diff: u16, // Max deviation before we cancel and put new orders on the book (in BPS)
+    pub half_spread: u16,      // Half of the spread for our market making (in BPS) - DEPRECATED: use spread_volatility_multiplier instead
+    pub reprice_threshold_ratio: f64, // Ratio of spread movement to trigger reprice (e.g., 0.5 = reprices if mid moves 50% of spread)
     pub max_absolute_position_size: f64, // Absolute value of the max position we can take on
     pub asset_type: AssetType, // Asset type (Perp or Spot) for tick/lot size validation
     pub wallet: PrivateKeySigner, // Wallet containing private key
     pub inventory_skew_config: Option<InventorySkewConfig>, // Optional inventory skewing configuration
+    pub spread_volatility_multiplier: f64, // Multiplier for dynamic spread: spread = volatility_ema * multiplier (e.g., 1.5)
 }
 
 #[derive(Debug)]
 pub struct MarketMaker {
     pub asset: String,
     pub target_liquidity: f64,
-    pub half_spread: u16,
-    pub max_bps_diff: u16,
+    pub half_spread: u16, // DEPRECATED: kept for backward compatibility, use spread_volatility_multiplier instead
+    pub reprice_threshold_ratio: f64, // Ratio of spread movement to trigger reprice
     pub max_absolute_position_size: f64,
     pub tick_lot_validator: TickLotValidator,
     pub lower_resting: MarketMakerRestingOrder,
@@ -990,6 +1052,8 @@ pub struct MarketMaker {
     pub tuning_params: Arc<RwLock<TuningParams>>,
     /// Adam optimizer state for automatic parameter tuning
     pub adam_optimizer: Arc<RwLock<AdamOptimizerState>>,
+    /// Multiplier for dynamic spread calculation: spread = volatility_ema * multiplier
+    pub spread_volatility_multiplier: f64,
 }
 
 impl MarketMaker {
@@ -1015,8 +1079,25 @@ impl MarketMaker {
     
     /// Calculate optimal control vector based on current state
     fn calculate_optimal_control(&mut self) {
-        let base_spread_bps = self.half_spread as f64;
+        // Dynamic spread calculation based on real-time volatility
+        // base_spread = volatility_ema * spread_volatility_multiplier
+        // This adapts to market conditions automatically:
+        // - High volatility = wider spreads (more protection from adverse selection)
+        // - Low volatility = tighter spreads (more competitive quotes)
+        let base_spread_bps = self.state_vector.volatility_ema_bps * self.spread_volatility_multiplier;
+        
+        // Ensure minimum spread to avoid zero or negative spreads
+        let base_spread_bps = base_spread_bps.max(5.0); // Minimum 5 bps total spread
+        
         let params = self.tuning_params.read().unwrap();
+        
+        // Log dynamic spread calculation
+        info!(
+            "Dynamic spread: volatility={:.2}bps * multiplier={:.2} = {:.2}bps total spread",
+            self.state_vector.volatility_ema_bps,
+            self.spread_volatility_multiplier,
+            base_spread_bps
+        );
         
         // Update value function time if needed
         // In production, this would be updated based on actual time
@@ -1050,7 +1131,9 @@ impl MarketMaker {
     /// This is more computationally expensive but theoretically optimal
     /// By default, calculate_optimal_control() uses fast heuristics
     pub fn calculate_optimal_control_hjb(&mut self) {
-        let base_spread_bps = self.half_spread as f64;
+        // Use dynamic spread calculation (same as heuristic method)
+        let base_spread_bps = self.state_vector.volatility_ema_bps * self.spread_volatility_multiplier;
+        let base_spread_bps = base_spread_bps.max(5.0); // Minimum 5 bps
         
         self.control_vector = self.hjb_components.optimize_control(
             &self.state_vector,
@@ -1146,7 +1229,8 @@ impl MarketMaker {
         let state_vector = self.state_vector.clone();
         let value_function = self.value_function.clone();
         let current_control = self.control_vector.clone();
-        let base_spread_bps = self.half_spread as f64;
+        // Use dynamic spread calculation
+        let base_spread_bps = (state_vector.volatility_ema_bps * self.spread_volatility_multiplier).max(5.0);
         let max_absolute_position_size = self.max_absolute_position_size;
         let tuning_params = Arc::clone(&self.tuning_params);
         let adam_optimizer = Arc::clone(&self.adam_optimizer);
@@ -1184,16 +1268,21 @@ impl MarketMaker {
             let ask_gap = optimal_control.ask_offset_bps - current_control.ask_offset_bps;
             let current_loss = bid_gap.powi(2) + ask_gap.powi(2);
             
-            // Only tune if control gap is significant (> 1 bps squared total)
-            // This means quotes differ by ~0.7 bps RMS, which is meaningful
-            let control_gap_threshold = 1.0;
+            // Get configurable control gap threshold from tuning params
+            // This allows adaptive tuning based on market conditions:
+            // - Volatile/noisy markets: higher threshold (5.0-20.0) prevents chasing noise
+            // - Stable/quiet markets: lower threshold (0.5-2.0) allows fine-tuning
+            let control_gap_threshold = {
+                let params = tuning_params.read().unwrap();
+                params.control_gap_threshold
+            };
             
             if current_loss > control_gap_threshold {
-                info!("Control gap detected: {:.6} bps² (bid_gap={:.2}bps, ask_gap={:.2}bps). Running Adam optimizer parameter tuning...", 
-                    current_loss, bid_gap, ask_gap);
+                info!("Control gap detected: {:.6} bps² (bid_gap={:.2}bps, ask_gap={:.2}bps, threshold={:.2}bps²). Running Adam optimizer parameter tuning...", 
+                    current_loss, bid_gap, ask_gap, control_gap_threshold);
                 
                 // 2. Gradient Calculation Parameters
-                let nudge_amount = 0.001; // Small perturbation for finite difference
+                let nudge_percent = 0.01; // 1% relative perturbation for stability across different parameter scales
                 
                 // 3. Get current parameters
                 let original_params = tuning_params.read().unwrap().clone();
@@ -1211,6 +1300,29 @@ impl MarketMaker {
                 ];
                 
                 for (param_name, i) in param_indices.iter() {
+                    // Get current parameter value and calculate relative nudge
+                    let current_value = match *i {
+                        0 => original_params.skew_adjustment_factor,
+                        1 => original_params.adverse_selection_adjustment_factor,
+                        2 => original_params.adverse_selection_lambda,
+                        3 => original_params.inventory_urgency_threshold,
+                        4 => original_params.liquidation_rate_multiplier,
+                        5 => original_params.min_spread_base_ratio,
+                        6 => original_params.adverse_selection_spread_scale,
+                        _ => 0.0,
+                    };
+                    
+                    // Use relative perturbation: 1% of current value
+                    // This ensures gradients are on consistent scale regardless of parameter magnitude
+                    // e.g., for lambda=0.1, nudge=0.001; for spread_scale=100.0, nudge=1.0
+                    let nudge_amount = current_value.abs() * nudge_percent;
+                    
+                    // Skip if parameter is too close to zero (would make relative nudge unstable)
+                    if nudge_amount < 1e-8 {
+                        info!("Skipping {} - parameter too close to zero for relative nudge", param_name);
+                        continue;
+                    }
+                    
                     // Create nudged parameters
                     let mut nudged_params = original_params.clone();
                     match *i {
@@ -1246,32 +1358,95 @@ impl MarketMaker {
                     let nudged_loss = nudged_bid_gap.powi(2) + nudged_ask_gap.powi(2);
                     
                     // Calculate partial derivative (gradient component)
-                    // This is (change in loss) / (change in parameter)
+                    // dL/dθ = (L(θ + δθ) - L(θ)) / δθ
+                    // With relative nudge, this is automatically scaled correctly for each parameter
                     let gradient = (nudged_loss - current_loss) / nudge_amount;
                     gradient_vector[*i] = gradient;
                     
-                    info!("Gradient[{}] = {:.6}", param_name, gradient);
+                    info!("Gradient[{}] = {:.6} (value={:.6}, nudge={:.6})", param_name, gradient, current_value, nudge_amount);
                 }
                 
-                // 5. Apply Adam optimizer update
+                // 5. Gradient Clipping (prevent outlier gradients from poisoning v vector)
+                let max_gradient_norm = 10.0; // Clip individual gradients above this value
+                let mut clipped_gradient_vector = gradient_vector.clone();
+                let mut num_clipped = 0;
+                
+                for i in 0..7 {
+                    if clipped_gradient_vector[i].abs() > max_gradient_norm {
+                        clipped_gradient_vector[i] = clipped_gradient_vector[i].signum() * max_gradient_norm;
+                        num_clipped += 1;
+                    }
+                }
+                
+                // Calculate gradient norm for monitoring (L2 norm)
+                let gradient_norm: f64 = gradient_vector.iter().map(|g| g.powi(2)).sum::<f64>().sqrt();
+                let clipped_gradient_norm: f64 = clipped_gradient_vector.iter().map(|g| g.powi(2)).sum::<f64>().sqrt();
+                
+                info!("Gradient Statistics:");
+                info!("  Gradient L2 norm: {:.6}", gradient_norm);
+                if num_clipped > 0 {
+                    info!("  Clipped {} gradients (norm after clipping: {:.6})", num_clipped, clipped_gradient_norm);
+                }
+                
+                // 6. Apply Adam optimizer update with warmup
                 let updates = {
                     let mut optimizer = adam_optimizer.write().unwrap();
-                    optimizer.compute_update(&gradient_vector)
+                    
+                    // Learning rate warmup: gradually increase alpha over first N steps
+                    // This prevents divergence when optimizer's internal state is still initializing
+                    let warmup_steps = 10;
+                    let current_step = optimizer.t + 1; // +1 because compute_update increments t
+                    let warmup_factor = if current_step <= warmup_steps {
+                        current_step as f64 / warmup_steps as f64
+                    } else {
+                        1.0
+                    };
+                    
+                    // Temporarily apply warmup to learning rate
+                    let original_alpha = optimizer.alpha;
+                    optimizer.alpha *= warmup_factor;
+                    
+                    // Compute update with clipped gradients
+                    let updates = optimizer.compute_update(&clipped_gradient_vector);
+                    
+                    // Restore original alpha
+                    optimizer.alpha = original_alpha;
+                    
+                    updates
                 };
                 
-                // Log effective learning rates for monitoring
+                // 7. Log optimizer state and diagnostics
                 {
                     let optimizer = adam_optimizer.read().unwrap();
                     info!("Adam Optimizer State:");
                     info!("  Time step: {}", optimizer.t);
                     info!("  Base learning rate (α): {}", optimizer.alpha);
+                    
+                    // Calculate warmup factor for current step
+                    let warmup_steps = 10;
+                    let warmup_factor = if optimizer.t <= warmup_steps {
+                        optimizer.t as f64 / warmup_steps as f64
+                    } else {
+                        1.0
+                    };
+                    if warmup_factor < 1.0 {
+                        info!("  Warmup factor: {:.2}x (step {}/{})", warmup_factor, optimizer.t, warmup_steps);
+                    }
+                    
+                    // Log effective learning rates per parameter
                     for (param_name, i) in param_indices.iter() {
                         let eff_lr = optimizer.get_effective_learning_rate(*i);
                         info!("  Effective LR[{}]: {:.6}", param_name, eff_lr);
                     }
+                    
+                    // Log momentum (m) and velocity (v) statistics for health monitoring
+                    let m_norm: f64 = optimizer.m.iter().map(|x| x.powi(2)).sum::<f64>().sqrt();
+                    let v_norm: f64 = optimizer.v.iter().map(|x| x.powi(2)).sum::<f64>().sqrt();
+                    info!("  Momentum (m) L2 norm: {:.6}", m_norm);
+                    info!("  Velocity (v) L2 norm: {:.6}", v_norm);
                 }
                 
-                // 6. Apply updates: theta_new = theta_old - update
+                // 8. Apply updates: theta_new = theta_old - update
                 let mut updated_params = original_params.clone();
                 updated_params.skew_adjustment_factor -= updates[0];
                 updated_params.adverse_selection_adjustment_factor -= updates[1];
@@ -1281,7 +1456,15 @@ impl MarketMaker {
                 updated_params.min_spread_base_ratio -= updates[5];
                 updated_params.adverse_selection_spread_scale -= updates[6];
                 
-                // 7. Validate and apply the updated parameters
+                // Calculate update norm for monitoring
+                let update_norm: f64 = updates.iter().map(|u| u.powi(2)).sum::<f64>().sqrt();
+                info!("Update Statistics:");
+                info!("  Update L2 norm: {:.6}", update_norm);
+                info!("  Largest update: {:.6} (param index {})", 
+                    updates.iter().enumerate().map(|(i, u)| (u.abs(), i)).max_by(|a, b| a.0.partial_cmp(&b.0).unwrap()).unwrap().0,
+                    updates.iter().enumerate().map(|(i, u)| (u.abs(), i)).max_by(|a, b| a.0.partial_cmp(&b.0).unwrap()).unwrap().1);
+                
+                // 9. Validate and apply the updated parameters
                 match updated_params.validate() {
                     Ok(_) => {
                         // Parameters are valid, apply them
@@ -1357,7 +1540,8 @@ impl MarketMaker {
     /// Calculate optimal spread adjustment based on state vector
     /// This can be used to implement more sophisticated pricing strategies
     pub fn calculate_state_based_spread_adjustment(&self) -> f64 {
-        let base_spread_bps = self.half_spread as f64 * 2.0; // Convert half spread to full spread
+        // Use dynamic spread calculation
+        let base_spread_bps = (self.state_vector.volatility_ema_bps * self.spread_volatility_multiplier).max(5.0);
         let params = self.tuning_params.read().unwrap();
         
         // Get adverse selection adjustment
@@ -1376,7 +1560,9 @@ impl MarketMaker {
     /// Check if we should pause market making based on state vector
     pub fn should_pause_trading(&self) -> bool {
         // Pause if market conditions are unfavorable
-        let max_spread_threshold = self.half_spread as f64 * 10.0; // 5x normal spread
+        // Use dynamic spread: threshold = 10x current volatility-based spread
+        let base_spread_bps = (self.state_vector.volatility_ema_bps * self.spread_volatility_multiplier).max(5.0);
+        let max_spread_threshold = base_spread_bps * 10.0;
         !self.state_vector.is_market_favorable(max_spread_threshold)
     }
     
@@ -1464,8 +1650,8 @@ impl MarketMaker {
         Ok(MarketMaker {
             asset: input.asset,
             target_liquidity: input.target_liquidity,
-            half_spread: input.half_spread,
-            max_bps_diff: input.max_bps_diff,
+            half_spread: input.half_spread, // Kept for backward compatibility
+            reprice_threshold_ratio: input.reprice_threshold_ratio,
             max_absolute_position_size: input.max_absolute_position_size,
             tick_lot_validator,
             lower_resting: MarketMakerRestingOrder {
@@ -1487,11 +1673,12 @@ impl MarketMaker {
             latest_book: None,
             latest_book_analysis: None,
             state_vector: StateVector::new(),
-            control_vector: ControlVector::symmetric(input.half_spread as f64),
+            control_vector: ControlVector::symmetric(input.half_spread as f64), // Initial control, will be recalculated dynamically
             hjb_components: HJBComponents::new(),
             value_function: ValueFunction::new(0.01, 86400.0), // φ=0.01, T=24h
             tuning_params: Arc::new(RwLock::new(initial_params)),
             adam_optimizer: Arc::new(RwLock::new(AdamOptimizerState::default())),
+            spread_volatility_multiplier: input.spread_volatility_multiplier,
         })
     }
 
@@ -1997,6 +2184,17 @@ impl MarketMaker {
         // Calculate optimal control based on current state
         self.calculate_optimal_control();
         
+        // Calculate dynamic reprice threshold based on current volatility-adjusted spread
+        let dynamic_base_spread = (self.state_vector.volatility_ema_bps * self.spread_volatility_multiplier).max(5.0);
+        let dynamic_max_bps_diff = (dynamic_base_spread * self.reprice_threshold_ratio) as u16;
+        
+        info!(
+            "Reprice threshold: {} bps ({}% of {} bps spread)",
+            dynamic_max_bps_diff,
+            self.reprice_threshold_ratio * 100.0,
+            dynamic_base_spread
+        );
+        
         // Execute taker orders if the control vector signals urgency
         // Taker sell: liquidate long position by hitting bids with market orders
         if self.control_vector.taker_sell_rate > EPSILON {
@@ -2027,9 +2225,8 @@ impl MarketMaker {
                 ).await;
                 
                 if filled > EPSILON {
-                    // Update position immediately (will be confirmed by fill event)
-                    self.cur_position -= filled;
-                    info!("Market sell executed: {} filled, new position: {}", filled, self.cur_position);
+                    // Position will be updated by Message::User fill event (single source of truth)
+                    info!("Market sell executed: {} filled, position will update via fill event", filled);
                 }
             }
         }
@@ -2063,9 +2260,8 @@ impl MarketMaker {
                 ).await;
                 
                 if filled > EPSILON {
-                    // Update position immediately (will be confirmed by fill event)
-                    self.cur_position += filled;
-                    info!("Market buy executed: {} filled, new position: {}", filled, self.cur_position);
+                    // Position will be updated by Message::User fill event (single source of truth)
+                    info!("Market buy executed: {} filled, position will update via fill event", filled);
                 }
             }
         }
@@ -2100,10 +2296,11 @@ impl MarketMaker {
         );
 
         // Determine if we need to cancel the resting order and put a new order up due to deviation
+        // Use the dynamic reprice threshold calculated above
         let lower_change = (lower_order_amount - self.lower_resting.position).abs() > EPSILON
-            || bps_diff(lower_price, self.lower_resting.price) > self.max_bps_diff;
+            || bps_diff(lower_price, self.lower_resting.price) > dynamic_max_bps_diff;
         let upper_change = (upper_order_amount - self.upper_resting.position).abs() > EPSILON
-            || bps_diff(upper_price, self.upper_resting.price) > self.max_bps_diff;
+            || bps_diff(upper_price, self.upper_resting.price) > dynamic_max_bps_diff;
 
         // Parallelize order cancellations when both need to be cancelled
         let (lower_cancelled, upper_cancelled) = if (self.lower_resting.oid != 0 && self.lower_resting.position > EPSILON && lower_change)
@@ -2254,6 +2451,25 @@ mod tests {
         (book, analysis)
     }
 
+    // Helper function to create test StateVector with all required fields
+    fn create_test_state_vector(
+        mid_price: f64,
+        inventory: f64,
+        adverse_selection: f64,
+        spread_bps: f64,
+        imbalance: f64,
+    ) -> StateVector {
+        StateVector {
+            mid_price,
+            inventory,
+            adverse_selection_estimate: adverse_selection,
+            market_spread_bps: spread_bps,
+            lob_imbalance: imbalance,
+            volatility_ema_bps: 10.0, // Default test volatility
+            previous_mid_price: mid_price, // Initialize to current price for tests
+        }
+    }
+
     #[test]
     fn test_state_vector_initialization() {
         let state = StateVector::new();
@@ -2310,13 +2526,7 @@ mod tests {
 
     #[test]
     fn test_inventory_risk_multiplier() {
-        let state = StateVector {
-            mid_price: 100.0,
-            inventory: 0.0,
-            adverse_selection_estimate: 0.0,
-            market_spread_bps: 10.0,
-            lob_imbalance: 0.5,
-        };
+        let state = create_test_state_vector(100.0, 0.0, 0.0, 10.0, 0.5);
         
         let multiplier = state.get_inventory_risk_multiplier(100.0);
         assert_eq!(multiplier, 1.0);
@@ -2329,13 +2539,7 @@ mod tests {
 
     #[test]
     fn test_inventory_urgency() {
-        let state = StateVector {
-            mid_price: 100.0,
-            inventory: 0.0,
-            adverse_selection_estimate: 0.0,
-            market_spread_bps: 10.0,
-            lob_imbalance: 0.5,
-        };
+        let state = create_test_state_vector(100.0, 0.0, 0.0, 10.0, 0.5);
         
         let urgency = state.get_inventory_urgency(100.0);
         assert_eq!(urgency, 0.0);
@@ -2348,13 +2552,7 @@ mod tests {
 
     #[test]
     fn test_market_favorable_conditions() {
-        let state = StateVector {
-            mid_price: 100.0,
-            inventory: 0.0,
-            adverse_selection_estimate: 0.0,
-            market_spread_bps: 10.0,
-            lob_imbalance: 0.5,
-        };
+        let state = create_test_state_vector(100.0, 0.0, 0.0, 10.0, 0.5);
         
         assert!(state.is_market_favorable(50.0));
         
@@ -2441,13 +2639,7 @@ mod tests {
         let mut control = ControlVector::symmetric(10.0);
         let params = TuningParams::default();
         
-        let state = StateVector {
-            mid_price: 100.0,
-            inventory: 0.0,
-            adverse_selection_estimate: 0.0,
-            market_spread_bps: 10.0,
-            lob_imbalance: 0.5,
-        };
+        let state = create_test_state_vector(100.0, 0.0, 0.0, 10.0, 0.5);
         
         control.apply_state_adjustments(&state, 10.0, 100.0, &params);
         
@@ -2463,13 +2655,7 @@ mod tests {
         let params = TuningParams::default();
         
         // Bullish state (positive adverse selection - expect price to rise)
-        let mut state = StateVector {
-            mid_price: 100.0,
-            inventory: 0.0,
-            adverse_selection_estimate: 0.2,
-            market_spread_bps: 10.0,
-            lob_imbalance: 0.7,
-        };
+        let mut state = create_test_state_vector(100.0, 0.0, 0.2, 10.0, 0.7);
         
         control.apply_state_adjustments(&state, 10.0, 100.0, &params);
         
@@ -2501,13 +2687,7 @@ mod tests {
         
         // Long position - should tighten ask, widen bid
         let mut control = ControlVector::symmetric(base_spread);
-        let state_long = StateVector {
-            mid_price: 100.0,
-            inventory: 80.0, // 80% long
-            adverse_selection_estimate: 0.0,
-            market_spread_bps: 10.0,
-            lob_imbalance: 0.5,
-        };
+        let state_long = create_test_state_vector(100.0, 80.0, 0.0, 10.0, 0.5); // 80% long
         
         control.apply_state_adjustments(&state_long, base_spread, max_inventory, &params);
         
@@ -2516,13 +2696,7 @@ mod tests {
         
         // Short position - should tighten bid, widen ask
         let mut control = ControlVector::symmetric(base_spread);
-        let state_short = StateVector {
-            mid_price: 100.0,
-            inventory: -80.0, // 80% short
-            adverse_selection_estimate: 0.0,
-            market_spread_bps: 10.0,
-            lob_imbalance: 0.5,
-        };
+        let state_short = create_test_state_vector(100.0, -80.0, 0.0, 10.0, 0.5); // 80% short
         
         control.apply_state_adjustments(&state_short, base_spread, max_inventory, &params);
         
@@ -2536,13 +2710,7 @@ mod tests {
         let params = TuningParams::default();
         
         // High urgency state (>0.7)
-        let state = StateVector {
-            mid_price: 100.0,
-            inventory: 95.0, // 95% of max = high urgency
-            adverse_selection_estimate: 0.0,
-            market_spread_bps: 10.0,
-            lob_imbalance: 0.5,
-        };
+        let state = create_test_state_vector(100.0, 95.0, 0.0, 10.0, 0.5); // 95% of max = high urgency
         
         control.apply_state_adjustments(&state, 10.0, 100.0, &params);
         
@@ -2560,26 +2728,14 @@ mod tests {
         
         // Zero inventory - minimal risk
         let mut control_zero = ControlVector::symmetric(base_spread);
-        let state_zero = StateVector {
-            mid_price: 100.0,
-            inventory: 0.0,
-            adverse_selection_estimate: 0.0,
-            market_spread_bps: 10.0,
-            lob_imbalance: 0.5,
-        };
+        let state_zero = create_test_state_vector(100.0, 0.0, 0.0, 10.0, 0.5);
         
         control_zero.apply_state_adjustments(&state_zero, base_spread, max_inventory, &params);
         let spread_zero = control_zero.total_spread_bps();
         
         // Max inventory - maximum risk
         let mut control_max = ControlVector::symmetric(base_spread);
-        let state_max = StateVector {
-            mid_price: 100.0,
-            inventory: 100.0,
-            adverse_selection_estimate: 0.0,
-            market_spread_bps: 10.0,
-            lob_imbalance: 0.5,
-        };
+        let state_max = create_test_state_vector(100.0, 100.0, 0.0, 10.0, 0.5);
         
         control_max.apply_state_adjustments(&state_max, base_spread, max_inventory, &params);
         let spread_max = control_max.total_spread_bps();
@@ -2628,13 +2784,7 @@ mod tests {
     fn test_value_function_time_decay() {
         let mut value_fn = ValueFunction::new(0.01, 100.0);
         
-        let state = StateVector {
-            mid_price: 100.0,
-            inventory: 50.0,
-            adverse_selection_estimate: 0.0,
-            market_spread_bps: 10.0,
-            lob_imbalance: 0.5,
-        };
+        let state = create_test_state_vector(100.0, 50.0, 0.0, 10.0, 0.5);
         
         // Early time (t=10)
         value_fn.set_time(10.0);
@@ -2670,13 +2820,7 @@ mod tests {
     fn test_hjb_maker_fill_rates() {
         let hjb = HJBComponents::new();
         
-        let state = StateVector {
-            mid_price: 100.0,
-            inventory: 0.0,
-            adverse_selection_estimate: 0.0,
-            market_spread_bps: 10.0, // Market half-spread = 5 bps
-            lob_imbalance: 0.5, // Balanced book
-        };
+        let state = create_test_state_vector(100.0, 0.0, 0.0, 10.0, 0.5); // Market half-spread = 5 bps, Balanced book
         
         // Quote at market (5 bps) should have high fill rate
         let rate_at_market = hjb.maker_bid_fill_rate(5.0, &state);
@@ -2694,22 +2838,10 @@ mod tests {
         let hjb = HJBComponents::new();
         
         // High bid imbalance (I_t = 0.9) - lots of buy orders
-        let state_high_bid = StateVector {
-            mid_price: 100.0,
-            inventory: 0.0,
-            adverse_selection_estimate: 0.0,
-            market_spread_bps: 10.0,
-            lob_imbalance: 0.9,
-        };
+        let state_high_bid = create_test_state_vector(100.0, 0.0, 0.0, 10.0, 0.9);
         
         // Low bid imbalance (I_t = 0.1) - lots of sell orders
-        let state_low_bid = StateVector {
-            mid_price: 100.0,
-            inventory: 0.0,
-            adverse_selection_estimate: 0.0,
-            market_spread_bps: 10.0,
-            lob_imbalance: 0.1,
-        };
+        let state_low_bid = create_test_state_vector(100.0, 0.0, 0.0, 10.0, 0.1);
         
         // When lots of buy orders exist (high I_t), our bid fill rate should be lower
         let bid_rate_high_imb = hjb.maker_bid_fill_rate(5.0, &state_high_bid);
@@ -2729,13 +2861,7 @@ mod tests {
         let hjb = HJBComponents::new();
         let value_fn = ValueFunction::new(0.01, 100.0);
         
-        let state = StateVector {
-            mid_price: 100.0,
-            inventory: 0.0,
-            adverse_selection_estimate: 0.0,
-            market_spread_bps: 10.0,
-            lob_imbalance: 0.5,
-        };
+        let state = create_test_state_vector(100.0, 0.0, 0.0, 10.0, 0.5);
         
         // Maker ask value should be positive (we receive S + δ^a)
         let ask_value = hjb.maker_ask_value(5.0, &state, &value_fn);
@@ -2753,13 +2879,7 @@ mod tests {
         let hjb = HJBComponents::new();
         let value_fn = ValueFunction::new(0.01, 100.0);
         
-        let state = StateVector {
-            mid_price: 100.0,
-            inventory: 0.0,
-            adverse_selection_estimate: 0.0,
-            market_spread_bps: 10.0,
-            lob_imbalance: 0.5,
-        };
+        let state = create_test_state_vector(100.0, 0.0, 0.0, 10.0, 0.5);
         
         // Maker bid at 5 bps: pay mid - 5bps
         let maker_bid = hjb.maker_bid_value(5.0, &state, &value_fn);
@@ -2778,22 +2898,10 @@ mod tests {
         let value_fn = ValueFunction::new(0.01, 100.0);
         
         // Zero inventory state
-        let state_zero = StateVector {
-            mid_price: 100.0,
-            inventory: 0.0,
-            adverse_selection_estimate: 0.0,
-            market_spread_bps: 10.0,
-            lob_imbalance: 0.5,
-        };
+        let state_zero = create_test_state_vector(100.0, 0.0, 0.0, 10.0, 0.5);
         
         // High inventory state
-        let state_high = StateVector {
-            mid_price: 100.0,
-            inventory: 50.0,
-            adverse_selection_estimate: 0.0,
-            market_spread_bps: 10.0,
-            lob_imbalance: 0.5,
-        };
+        let state_high = create_test_state_vector(100.0, 50.0, 0.0, 10.0, 0.5);
         
         let control = ControlVector::symmetric(10.0);
         
@@ -2809,13 +2917,7 @@ mod tests {
         let hjb = HJBComponents::new();
         let value_fn = ValueFunction::new(0.01, 100.0);
         
-        let state = StateVector {
-            mid_price: 100.0,
-            inventory: 0.0,
-            adverse_selection_estimate: 0.0,
-            market_spread_bps: 10.0,
-            lob_imbalance: 0.5,
-        };
+        let state = create_test_state_vector(100.0, 0.0, 0.0, 10.0, 0.5);
         
         let optimal_control = hjb.optimize_control(&state, &value_fn, 10.0);
         
@@ -2833,13 +2935,7 @@ mod tests {
         let value_fn = ValueFunction::new(0.01, 100.0);
         
         // High inventory state (95% of assumed max)
-        let state = StateVector {
-            mid_price: 100.0,
-            inventory: 95.0,
-            adverse_selection_estimate: 0.0,
-            market_spread_bps: 10.0,
-            lob_imbalance: 0.5,
-        };
+        let state = create_test_state_vector(100.0, 95.0, 0.0, 10.0, 0.5);
         
         let optimal_control = hjb.optimize_control(&state, &value_fn, 10.0);
         
@@ -2853,22 +2949,10 @@ mod tests {
         let value_fn = ValueFunction::new(0.01, 100.0);
         
         // Strong upward drift (μ̂ > 0)
-        let state_up = StateVector {
-            mid_price: 100.0,
-            inventory: 0.0,
-            adverse_selection_estimate: 2.0,
-            market_spread_bps: 10.0,
-            lob_imbalance: 0.5,
-        };
+        let state_up = create_test_state_vector(100.0, 0.0, 2.0, 10.0, 0.5);
         
         // Strong downward drift (μ̂ < 0)
-        let state_down = StateVector {
-            mid_price: 100.0,
-            inventory: 0.0,
-            adverse_selection_estimate: -2.0,
-            market_spread_bps: 10.0,
-            lob_imbalance: 0.5,
-        };
+        let state_down = create_test_state_vector(100.0, 0.0, -2.0, 10.0, 0.5);
         
         let control_up = hjb.optimize_control(&state_up, &value_fn, 10.0);
         let control_down = hjb.optimize_control(&state_down, &value_fn, 10.0);
@@ -2882,13 +2966,7 @@ mod tests {
     fn test_value_function_cache() {
         let mut value_fn = ValueFunction::new(0.01, 100.0);
 
-        let state = StateVector {
-            mid_price: 100.0,
-            inventory: 0.0,
-            adverse_selection_estimate: 0.0,
-            market_spread_bps: 10.0,
-            lob_imbalance: 0.5,
-        };
+        let state = create_test_state_vector(100.0, 0.0, 0.0, 10.0, 0.5);
 
         // Cache some values
         value_fn.cache_value(0, 100.0);

@@ -5,5 +5,6 @@
   "inventory_urgency_threshold": 0.7,
   "liquidation_rate_multiplier": 10.0,
   "min_spread_base_ratio": 0.2,
-  "adverse_selection_spread_scale": 100.0
+  "adverse_selection_spread_scale": 100.0,
+  "control_gap_threshold": 1.0
 }

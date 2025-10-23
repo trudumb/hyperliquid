@@ -41,12 +41,13 @@ async fn main() {
     let market_maker_input = MarketMakerInputV2 {
         asset: "HYPE".to_string(),
         target_liquidity: 0.3,  // Order size: 0.3 per side (allows ~10 fills to reach max position)
-        max_bps_diff: 10,
-        half_spread: 5,
+        reprice_threshold_ratio: 0.5,  // Reprice when mid moves 50% of current spread (dynamic threshold)
+        half_spread: 5,         // DEPRECATED: Ignored - using spread_volatility_multiplier instead
         max_absolute_position_size: 3.0,  // Max position: 3.0
         asset_type: AssetType::Perp, // HYPE is a perpetual
         wallet,
         inventory_skew_config: Some(skew_config),
+        spread_volatility_multiplier: 1.5,  // ACTIVE: Spread = volatility_ema × 1.5 (dynamic spread system)
     };
     
     let mut market_maker = MarketMakerV2::new(market_maker_input).await
@@ -55,10 +56,12 @@ async fn main() {
     info!("=== Market Maker V2 Initialized ===");
     info!("Asset: HYPE");
     info!("Target Liquidity: 0.3 per side");
-    info!("Half Spread: 5 bps");
+    info!("Dynamic Spread: volatility_ema × {:.2} (adaptive to market conditions)", 1.5);
+    info!("Dynamic Reprice: {:.0}% of current spread (adaptive threshold)", 0.5 * 100.0);
     info!("Max Position: 3.0");
-    info!("Features: State Vector, Control Vector, HJB Optimization");
+    info!("Features: Dynamic Spread, Dynamic Reprice, State Vector, Control Vector, HJB Optimization");
     info!("Hot-Reloading: tuning_params.json checked every 10 seconds");
+    info!("Adam Optimizer: Autonomous parameter tuning enabled");
     info!("====================================");
     
     // Set up shutdown signal channel
