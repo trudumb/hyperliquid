@@ -8,6 +8,7 @@ mod helpers;
 mod info;
 mod inventory_skew;
 mod market_maker;
+mod market_maker_v2;
 mod meta;
 mod prelude;
 mod req;
@@ -23,6 +24,11 @@ pub use helpers::{bps_diff, truncate_float, BaseUrl};
 pub use info::{info_client::*, *};
 pub use inventory_skew::{InventorySkewCalculator, InventorySkewConfig, SkewResult};
 pub use market_maker::{MarketMaker, MarketMakerInput, MarketMakerRestingOrder};
+pub use market_maker_v2::{
+    MarketMaker as MarketMakerV2, MarketMakerInput as MarketMakerInputV2, 
+    MarketMakerRestingOrder as MarketMakerRestingOrderV2, StateVector, ControlVector,
+    ValueFunction, HJBComponents, TuningParams
+};
 pub use meta::{AssetContext, AssetMeta, Meta, MetaAndAssetCtxs, SpotAssetMeta, SpotMeta};
 pub use tick_lot_size::{AssetType, TickLotValidator};
 pub use ws::*;
