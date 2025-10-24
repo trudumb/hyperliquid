@@ -1564,107 +1564,7 @@ impl MarketMaker {
         &self.state_vector
     }
     
-    /// Calculate gradient vector for current state snapshot
-    /// This is called frequently (every N AllMids messages) to accumulate gradients
-    /// over time, which stabilizes the Adam optimizer.
-    /// 
-    /// Returns None if gradient calculation fails, otherwise returns the 7-dimensional
-    /// gradient vector for all tuning parameters.
-    fn calculate_gradient_snapshot(&self) -> Option<Vec<f64>> {
-        // Use dynamic spread calculation - same as main strategy
-        let base_total_spread_bps = (self.state_vector.volatility_ema_bps * self.spread_volatility_multiplier).max(12.0);
-        let base_half_spread_bps = base_total_spread_bps / 2.0;
-        
-        // 1. Calculate optimal control via grid search
-        let optimal_control = self.hjb_components.optimize_control(
-            &self.state_vector,
-            &self.value_function,
-            base_half_spread_bps,
-        );
-        
-        // 2. Calculate heuristic control with current parameters
-        let constrained_params = self.tuning_params.read().unwrap().get_constrained();
-        let mut heuristic_control = ControlVector::symmetric(base_half_spread_bps);
-        heuristic_control.apply_state_adjustments(
-            &self.state_vector,
-            base_half_spread_bps,
-            self.max_absolute_position_size,
-            &constrained_params,
-            &self.hjb_components,
-        );
-        
-        // 3. Calculate control gap loss: L = (bid_gap)² + (ask_gap)²
-        let bid_gap = optimal_control.bid_offset_bps - heuristic_control.bid_offset_bps;
-        let ask_gap = optimal_control.ask_offset_bps - heuristic_control.ask_offset_bps;
-        let current_loss = bid_gap.powi(2) + ask_gap.powi(2);
-        
-        // Get configurable control gap threshold
-        let control_gap_threshold = constrained_params.control_gap_threshold;
-        
-        // Only calculate gradient if gap is above threshold
-        if current_loss <= control_gap_threshold {
-            return None;
-        }
-        
-        // 4. Get current unconstrained (phi) parameters
-        let original_params_phi = self.tuning_params.read().unwrap().clone();
-        
-        let mut gradient_vector: Vec<f64> = vec![0.0; 7];
-        
-        // 5. Calculate numerical gradient for each parameter
-        let param_indices = [
-            0, // skew_adjustment_factor
-            1, // adverse_selection_adjustment_factor
-            2, // adverse_selection_lambda
-            3, // inventory_urgency_threshold
-            4, // liquidation_rate_multiplier
-            5, // min_spread_base_ratio
-            6, // adverse_selection_spread_scale
-        ];
-        
-        for i in param_indices.iter() {
-            // Standardized nudge amount for all parameters
-            let nudge_amount = 0.001;
-            
-            // Create nudged unconstrained (phi) parameters
-            let mut nudged_params_phi = original_params_phi.clone();
-            match *i {
-                0 => nudged_params_phi.skew_adjustment_factor_phi += nudge_amount,
-                1 => nudged_params_phi.adverse_selection_adjustment_factor_phi += nudge_amount,
-                2 => nudged_params_phi.adverse_selection_lambda_phi += nudge_amount,
-                3 => nudged_params_phi.inventory_urgency_threshold_phi += nudge_amount,
-                4 => nudged_params_phi.liquidation_rate_multiplier_phi += nudge_amount,
-                5 => nudged_params_phi.min_spread_base_ratio_phi += nudge_amount,
-                6 => nudged_params_phi.adverse_selection_spread_scale_phi += nudge_amount,
-                _ => {}
-            }
-            
-            // Get constrained (theta) version of nudged params
-            let nudged_params_theta = nudged_params_phi.get_constrained();
-            
-            // Re-run heuristic with nudged params
-            let mut nudged_control = ControlVector::symmetric(base_half_spread_bps);
-            nudged_control.apply_state_adjustments(
-                &self.state_vector,
-                base_half_spread_bps,
-                self.max_absolute_position_size,
-                &nudged_params_theta,
-                &self.hjb_components,
-            );
-            
-            // Calculate control gap loss with nudged params
-            let nudged_bid_gap = optimal_control.bid_offset_bps - nudged_control.bid_offset_bps;
-            let nudged_ask_gap = optimal_control.ask_offset_bps - nudged_control.ask_offset_bps;
-            let nudged_loss = nudged_bid_gap.powi(2) + nudged_ask_gap.powi(2);
-            
-            // Calculate partial derivative: dL/d_phi
-            let gradient = (nudged_loss - current_loss) / nudge_amount;
-            gradient_vector[*i] = gradient;
-        }
-        
-        Some(gradient_vector)
-    }
-    
+
     /// Run HJB grid search optimization in background and compare with heuristic
     /// 
     /// This spawns a background task to run the expensive `optimize_control()` grid search
@@ -2414,26 +2314,111 @@ impl MarketMaker {
                             let sample_interval = 10; // Accumulate gradient every 10th message
                             
                             if *counter % sample_interval == 0 {
-                                // Calculate gradient for current state
-                                if let Some(gradient_vec) = self.calculate_gradient_snapshot() {
-                                    // Accumulate gradient
-                                    let mut accumulator = self.gradient_accumulator.write().unwrap();
-                                    let mut count = self.gradient_count.write().unwrap();
+                                
+                                // --- 1. CLONE ALL DATA NEEDED for the task ---
+                                // These clones are cheap (Arc/simple f64s)
+                                let state_vector_clone = self.state_vector.clone();
+                                let hjb_clone = self.hjb_components.clone();
+                                let value_fn_clone = self.value_function.clone();
+                                let vol_mult = self.spread_volatility_multiplier;
+                                let max_pos = self.max_absolute_position_size;
+                                let tuning_params_clone = Arc::clone(&self.tuning_params);
+                                let gradient_accumulator_clone = Arc::clone(&self.gradient_accumulator);
+                                let gradient_count_clone = Arc::clone(&self.gradient_count);
+
+                                // --- 2. SPAWN BLOCKING TASK ---
+                                tokio::task::spawn_blocking(move || {
+                                    // This closure now runs on a separate thread
+                                    // We've moved the logic from calculate_gradient_snapshot here
+                                    
+                                    let base_total_spread_bps = (state_vector_clone.volatility_ema_bps * vol_mult).max(12.0);
+                                    let base_half_spread_bps = base_total_spread_bps / 2.0;
+
+                                    // 1. Calculate optimal control
+                                    let optimal_control = hjb_clone.optimize_control(
+                                        &state_vector_clone,
+                                        &value_fn_clone,
+                                        base_half_spread_bps,
+                                    );
+                                    
+                                    // 2. Get unconstrained params
+                                    // We read() ONCE inside the task for consistency
+                                    let original_params_phi = tuning_params_clone.read().unwrap().clone();
+                                    let constrained_params = original_params_phi.get_constrained();
+
+                                    // 3. Calculate heuristic control
+                                    let mut heuristic_control = ControlVector::symmetric(base_half_spread_bps);
+                                    heuristic_control.apply_state_adjustments(
+                                        &state_vector_clone,
+                                        base_half_spread_bps,
+                                        max_pos,
+                                        &constrained_params,
+                                        &hjb_clone,
+                                    );
+
+                                    // 4. Calculate loss
+                                    let bid_gap = optimal_control.bid_offset_bps - heuristic_control.bid_offset_bps;
+                                    let ask_gap = optimal_control.ask_offset_bps - heuristic_control.ask_offset_bps;
+                                    let current_loss = bid_gap.powi(2) + ask_gap.powi(2);
+                                    let control_gap_threshold = constrained_params.control_gap_threshold;
+
+                                    if current_loss <= control_gap_threshold {
+                                        return; // No gradient to accumulate
+                                    }
+
+                                    // --- 5. Calculate numerical gradient ---
+                                    // (This is the heavy part)
+                                    let mut gradient_vector: Vec<f64> = vec![0.0; 7];
+                                    let nudge_amount = 0.001;
                                     
                                     for i in 0..7 {
-                                        accumulator[i] += gradient_vec[i];
+                                        let mut nudged_params_phi = original_params_phi.clone();
+                                        match i {
+                                            0 => nudged_params_phi.skew_adjustment_factor_phi += nudge_amount,
+                                            1 => nudged_params_phi.adverse_selection_adjustment_factor_phi += nudge_amount,
+                                            2 => nudged_params_phi.adverse_selection_lambda_phi += nudge_amount,
+                                            3 => nudged_params_phi.inventory_urgency_threshold_phi += nudge_amount,
+                                            4 => nudged_params_phi.liquidation_rate_multiplier_phi += nudge_amount,
+                                            5 => nudged_params_phi.min_spread_base_ratio_phi += nudge_amount,
+                                            6 => nudged_params_phi.adverse_selection_spread_scale_phi += nudge_amount,
+                                            _ => {}
+                                        }
+                                        
+                                        let nudged_params_theta = nudged_params_phi.get_constrained();
+                                        
+                                        let mut nudged_control = ControlVector::symmetric(base_half_spread_bps);
+                                        nudged_control.apply_state_adjustments(
+                                            &state_vector_clone,
+                                            base_half_spread_bps,
+                                            max_pos,
+                                            &nudged_params_theta,
+                                            &hjb_clone,
+                                        );
+                                        
+                                        let nudged_bid_gap = optimal_control.bid_offset_bps - nudged_control.bid_offset_bps;
+                                        let nudged_ask_gap = optimal_control.ask_offset_bps - nudged_control.ask_offset_bps;
+                                        let nudged_loss = nudged_bid_gap.powi(2) + nudged_ask_gap.powi(2);
+                                        
+                                        gradient_vector[i] = (nudged_loss - current_loss) / nudge_amount;
+                                    }
+
+                                    // --- 6. Accumulate the result ---
+                                    // Lock at the very end
+                                    let mut accumulator = gradient_accumulator_clone.write().unwrap();
+                                    let mut count = gradient_count_clone.write().unwrap();
+                                    
+                                    for i in 0..7 {
+                                        accumulator[i] += gradient_vector[i];
                                     }
                                     *count += 1;
                                     
                                     // Log accumulation progress every 10 gradients
                                     if *count % 10 == 0 {
-                                        let gradient_norm: f64 = gradient_vec.iter().map(|g| g.powi(2)).sum::<f64>().sqrt();
+                                        let gradient_norm: f64 = gradient_vector.iter().map(|g| g.powi(2)).sum::<f64>().sqrt();
                                         info!("Gradient accumulation: {}/60s window, current_norm={:.4}", *count, gradient_norm);
                                     }
-                                } else {
-                                    // Control gap below threshold, skip gradient calculation
-                                    // This is normal and expected when heuristic is performing well
-                                }
+
+                                }); // End of spawn_blocking
                             }
                         }
                         
