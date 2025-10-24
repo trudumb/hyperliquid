@@ -45,12 +45,11 @@ async fn main() {
         asset: "HYPE".to_string(),
         target_liquidity: 0.3,  // Order size: 0.3 per side (allows ~10 fills to reach max position)
         reprice_threshold_ratio: 0.5,  // Reprice when mid moves 50% of current spread (dynamic threshold)
-        half_spread: 5,         // DEPRECATED: Ignored - using spread_volatility_multiplier instead
+        half_spread: 5,         // DEPRECATED: Ignored - baseline spread now uses real-time market spread
         max_absolute_position_size: 3.0,  // Max position: 3.0
         asset_type: AssetType::Perp, // HYPE is a perpetual
         wallet,
         inventory_skew_config: Some(skew_config),
-        spread_volatility_multiplier: 1.5,  // ACTIVE: Spread = volatility_ema × 1.5 (dynamic spread system)
         enable_trading_gap_threshold_percent: 15.0,  // Enable trading when heuristic is within 15% of optimal
     };
     
@@ -60,11 +59,11 @@ async fn main() {
     info!("=== Market Maker V2 Initialized ===");
     info!("Asset: HYPE");
     info!("Target Liquidity: 0.3 per side");
-    info!("Dynamic Spread: volatility_ema × {:.2} (adaptive to market conditions)", 1.5);
+    info!("Baseline Spread: REAL-TIME MARKET SPREAD (fully market-driven, no arbitrary multipliers)");
     info!("Dynamic Reprice: {:.0}% of current spread (adaptive threshold)", 0.5 * 100.0);
     info!("Max Position: 3.0");
     info!("Trading Enablement: Starts disabled, enables when heuristic gap < {:.1}%", 15.0);
-    info!("Features: Dynamic Spread, Dynamic Reprice, State Vector, Control Vector, HJB Optimization");
+    info!("Features: Market-Driven Spread, Dynamic Reprice, State Vector, Control Vector, HJB Optimization");
     info!("Hot-Reloading: tuning_params.json checked every 10 seconds");
     info!("Adam Optimizer: Autonomous parameter tuning enabled");
     info!("====================================");

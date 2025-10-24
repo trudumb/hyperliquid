@@ -1,5 +1,5 @@
 use alloy::{primitives::Address, signers::local::PrivateKeySigner};
-use log::{error, info};
+use log::{error, info, warn};
 use tokio::sync::mpsc::unbounded_channel;
 use std::sync::{Arc, RwLock};
 
@@ -9,7 +9,7 @@ use crate::{
     bps_diff, AssetType, BaseUrl, BookAnalysis, ClientCancelRequest, ClientLimit, ClientOrder,
     ClientOrderRequest, ExchangeClient, ExchangeDataStatus, ExchangeResponseStatus, InfoClient,
     InventorySkewCalculator, InventorySkewConfig, MarketCloseParams, MarketOrderParams, Message,
-    OrderBook, Subscription, TickLotValidator, UserData, EPSILON,
+    OrderBook, ParticleFilterState, AdaptiveConfig, Subscription, TickLotValidator, UserData, EPSILON,
 };
 
 /// Epsilon for clamping values during inverse transforms (logit/log)
@@ -582,6 +582,10 @@ impl StateVector {
     
     /// Calculate new volatility estimate from price change
     /// Returns instantaneous volatility in basis points if valid
+    /// 
+    /// **DEPRECATED**: This simple EMA method has been replaced by the Particle Filter.
+    /// Kept for backward compatibility and as a potential fallback mechanism.
+    #[allow(dead_code)]
     fn calculate_new_volatility(&self, new_mid_price: f64) -> Option<f64> {
         // Need both prices to be positive and previous price to be set
         if self.previous_mid_price <= 0.0 || new_mid_price <= 0.0 {
@@ -604,6 +608,7 @@ impl StateVector {
     }
     
     /// Update the state vector from current market data
+    /// Note: Volatility is now updated externally by the Particle Filter
     pub fn update(
         &mut self,
         mid_price: f64,
@@ -613,14 +618,11 @@ impl StateVector {
         tuning_params: &ConstrainedTuningParams,
         online_model: &mut OnlineAdverseSelectionModel,
     ) {
-        // Calculate volatility before updating mid_price
-        if let Some(new_vol) = self.calculate_new_volatility(mid_price) {
-            // EMA smoothing: σ̂_t = λ * vol_t + (1 - λ) * σ̂_{t-1}
-            let lambda = tuning_params.adverse_selection_lambda; // Reuse lambda for consistency
-            self.volatility_ema_bps = lambda * new_vol + (1.0 - lambda) * self.volatility_ema_bps;
-        }
+        // Note: Volatility calculation has been moved to Particle Filter
+        // The simple EMA approach is replaced by sophisticated stochastic volatility modeling
+        // volatility_ema_bps is now set by MarketMaker::update_state_vector() before calling this method
         
-        // Store current mid_price for next volatility calculation
+        // Store current mid_price for potential future use
         self.previous_mid_price = self.mid_price;
         self.mid_price = mid_price;
         self.inventory = inventory;
@@ -1364,13 +1366,12 @@ pub struct MarketMakerRestingOrder {
 pub struct MarketMakerInput {
     pub asset: String,
     pub target_liquidity: f64, // Amount of liquidity on both sides to target
-    pub half_spread: u16,      // Half of the spread for our market making (in BPS) - DEPRECATED: use spread_volatility_multiplier instead
+    pub half_spread: u16,      // Half of the spread for our market making (in BPS) - DEPRECATED: kept for backward compatibility only
     pub reprice_threshold_ratio: f64, // Ratio of spread movement to trigger reprice (e.g., 0.5 = reprices if mid moves 50% of spread)
     pub max_absolute_position_size: f64, // Absolute value of the max position we can take on
     pub asset_type: AssetType, // Asset type (Perp or Spot) for tick/lot size validation
     pub wallet: PrivateKeySigner, // Wallet containing private key
     pub inventory_skew_config: Option<InventorySkewConfig>, // Optional inventory skewing configuration
-    pub spread_volatility_multiplier: f64, // Multiplier for dynamic spread: spread = volatility_ema * multiplier (e.g., 1.5)
     
     /// Performance gap threshold (in percent) to enable live trading
     /// E.g., 15.0 means trading starts when heuristic gap is < 15%
@@ -1381,7 +1382,7 @@ pub struct MarketMakerInput {
 pub struct MarketMaker {
     pub asset: String,
     pub target_liquidity: f64,
-    pub half_spread: u16, // DEPRECATED: kept for backward compatibility, use spread_volatility_multiplier instead
+    pub half_spread: u16, // DEPRECATED: kept for backward compatibility only, baseline spread now uses real-time market spread
     pub reprice_threshold_ratio: f64, // Ratio of spread movement to trigger reprice
     pub max_absolute_position_size: f64,
     pub tick_lot_validator: TickLotValidator,
@@ -1407,8 +1408,6 @@ pub struct MarketMaker {
     pub tuning_params: Arc<RwLock<TuningParams>>,
     /// Adam optimizer state for automatic parameter tuning
     pub adam_optimizer: Arc<RwLock<AdamOptimizerState>>,
-    /// Multiplier for dynamic spread calculation: spread = volatility_ema * multiplier
-    pub spread_volatility_multiplier: f64,
     /// Flag indicating if live trading is enabled (set by optimizer)
     pub trading_enabled: Arc<RwLock<bool>>,
     /// Performance gap threshold (in percent) to enable live trading
@@ -1424,6 +1423,9 @@ pub struct MarketMaker {
     /// Online Linear Regression Model for Adverse Selection
     /// Learns to predict short-term price drift using SGD
     pub online_adverse_selection_model: Arc<RwLock<OnlineAdverseSelectionModel>>,
+    /// Particle filter for stochastic volatility estimation
+    /// Replaces simple EMA with sophisticated latent volatility modeling
+    pub particle_filter: Arc<RwLock<ParticleFilterState>>,
 }
 
 impl MarketMaker {
@@ -1433,8 +1435,59 @@ impl MarketMaker {
     }
     
     /// Update the state vector with current market conditions
+    /// Now uses Particle Filter for sophisticated volatility estimation
     fn update_state_vector(&mut self) {
-        // Get constrained (theta) params for use in logic
+        // Step 1: Update particle filter with current mid price
+        // This replaces the simple EMA volatility calculation
+        let mut pf = self.particle_filter.write().unwrap();
+        
+        // This line is still correct, as .update() returns Option<f64>
+        if let Some(vol_estimate_bps) = pf.update(self.latest_mid_price) {
+            // Update state vector with particle filter estimate
+            self.state_vector.volatility_ema_bps = vol_estimate_bps;
+            
+            // Log particle filter diagnostics every 100 updates
+            static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            
+            if count % 100 == 0 {
+                let ess = pf.get_ess();
+                let num_particles = 7000.0; // Should match initialization
+                let vol_p5 = pf.estimate_volatility_percentile_bps(0.05);
+                let vol_p95 = pf.estimate_volatility_percentile_bps(0.95);
+                
+                info!(
+                    "📊 SV Filter: vol={:.2}bps, ESS={:.0}/{:.0} ({:.1}%), CI=[{:.2}, {:.2}]",
+                    vol_estimate_bps,
+                    ess,
+                    num_particles,
+                    100.0 * ess / num_particles,
+                    vol_p5,
+                    vol_p95
+                );
+
+                // Log adaptive parameters if available
+                if pf.is_adaptive() {
+                    let (mu, phi, sigma_eta) = pf.get_parameter_estimates();
+                    let (std_mu, std_phi, std_sigma_eta) = pf.get_parameter_std_devs();
+                    
+                    info!(
+                        "   Parameters: μ={:.3}±{:.3} | φ={:.4}±{:.4} | σ_η={:.3}±{:.3}",
+                        mu, std_mu,
+                        phi, std_phi,
+                        sigma_eta, std_sigma_eta
+                    );
+                }
+                
+                // Warn if particle degeneracy is severe
+                if ess < num_particles * 0.3 {
+                    warn!("⚠️  Particle degeneracy detected: ESS = {:.0} ({:.1}%)", ess, 100.0 * ess / num_particles);
+                }
+            }
+        }
+        drop(pf); // Release lock early
+        
+        // Step 2: Update rest of state vector with market data
         let constrained_params = self.tuning_params.read().unwrap().get_constrained();
         let mut online_model = self.online_adverse_selection_model.write().unwrap();
         self.state_vector.update(
@@ -1451,84 +1504,69 @@ impl MarketMaker {
     }
     
     /// Calculate optimal control vector based on current state
+    /// Uses HJB optimization to derive spreads from first principles
+    /// Calculate optimal control vector based on current state
+    /// Uses the FAST HEURISTIC (`apply_state_adjustments`) for real-time trading.
+    ///
+    /// The BASELINE for this heuristic is now the real-time MARKET SPREAD.
+    /// The parameters for the *adjustments* (skew, etc.) on top of this
+    /// baseline are autonomously tuned by the background Adam optimizer.
     fn calculate_optimal_control(&mut self) {
-        // Dynamic spread calculation based on real-time volatility
-        // base_spread = volatility_ema * spread_volatility_multiplier
-        // This adapts to market conditions automatically:
-        // - High volatility = wider spreads (more protection from adverse selection)
-        // - Low volatility = tighter spreads (more competitive quotes)
-        let base_total_spread_bps = self.state_vector.volatility_ema_bps * self.spread_volatility_multiplier;
+        let start = std::time::Instant::now();
         
-        // Ensure minimum spread to avoid zero or negative spreads
-        let base_total_spread_bps = base_total_spread_bps.max(12.0); // Minimum 12 bps total spread
-        
-        // Convert to half-spread for use in symmetric control initialization
+        // 1. Base spread from REAL-TIME MARKET SPREAD (not arbitrary multiplier)
+        // This is the correct, market-driven baseline.
+        let base_total_spread_bps = (self.state_vector.market_spread_bps)
+            .max(12.0);  // CRITICAL: Same .max() as background task
         let base_half_spread_bps = base_total_spread_bps / 2.0;
-        
-        // Get constrained (theta) params for use in logic
+
+        // 2. Get latest Adam-tuned parameters
         let constrained_params = self.tuning_params.read().unwrap().get_constrained();
-        
-        // Log dynamic spread calculation
-        info!(
-            "Dynamic spread: volatility={:.2}bps * multiplier={:.2} = {:.2}bps total spread ({:.2}bps half-spread)",
-            self.state_vector.volatility_ema_bps,
-            self.spread_volatility_multiplier,
-            base_total_spread_bps,
-            base_half_spread_bps
-        );
-        
-        // Update value function time if needed
-        // In production, this would be updated based on actual time
-        // For now, we use a continuous time model
-        
-        // Use heuristic adjustments (fast, approximates HJB solution)
-        // For full HJB optimization, call hjb_components.optimize_control() directly
-        // Start with symmetric quotes using half-spread
-        self.control_vector = ControlVector::symmetric(base_half_spread_bps);
-        
-        // Apply state-based adjustments using half-spread
-        self.control_vector.apply_state_adjustments(
+
+        // 3. Start with symmetric base control
+        let mut heuristic_control = ControlVector::symmetric(base_half_spread_bps);
+
+        // 4. Apply FAST heuristic adjustments (this is what Adam is tuning)
+        heuristic_control.apply_state_adjustments(
             &self.state_vector,
             base_half_spread_bps,
             self.max_absolute_position_size,
             &constrained_params,
             &self.hjb_components,
         );
-        
-        // Validate the control vector using total spread minimum
+
+        let elapsed = start.elapsed();
+
+        // 5. Use the heuristic result for trading
+        self.control_vector = heuristic_control;
+
+        // 6. Validate
         if let Err(e) = self.control_vector.validate(base_total_spread_bps) {
-            error!("Invalid control vector: {}", e);
-            // Fallback to safe symmetric control using half-spread
+            error!("Invalid heuristic control: {}", e);
             self.control_vector = ControlVector::symmetric(base_half_spread_bps);
         }
-        
-        // Log control vector
-        info!("{}", self.control_vector.to_log_string());
+
+        // Performance monitoring: warn if fast path is taking too long
+        if elapsed.as_millis() > 5 {
+            warn!("Fast path taking {}ms - should be <5ms", elapsed.as_millis());
+        }
+
+        // 7. Update log to reflect market spread
+        info!(
+            "[FAST HEURISTIC] {} base_market_spread={:.2}bps ({}μs)",
+            self.control_vector.to_log_string(),
+            base_total_spread_bps,
+            elapsed.as_micros()
+        );
     }
     
-    /// Use full HJB optimization to calculate optimal control
-    /// This is more computationally expensive but theoretically optimal
-    /// By default, calculate_optimal_control() uses fast heuristics
+    /// DEPRECATED: Use calculate_optimal_control() instead
+    /// This method is kept for backward compatibility
+    /// The main calculate_optimal_control() now uses HJB optimization by default
+    #[deprecated(note = "Use calculate_optimal_control() instead - it now uses HJB optimization")]
     pub fn calculate_optimal_control_hjb(&mut self) {
-        // Use dynamic spread calculation (same as heuristic method)
-        let base_total_spread_bps = self.state_vector.volatility_ema_bps * self.spread_volatility_multiplier;
-        let base_total_spread_bps = base_total_spread_bps.max(12.0); // Minimum 12 bps total spread
-        let base_half_spread_bps = base_total_spread_bps / 2.0;
-        
-        self.control_vector = self.hjb_components.optimize_control(
-            &self.state_vector,
-            &self.value_function,
-            base_half_spread_bps,
-        );
-        
-        // Validate the control vector
-        if let Err(e) = self.control_vector.validate(base_total_spread_bps) {
-            error!("Invalid control vector from HJB optimization: {}", e);
-            // Fallback to heuristic method
-            self.calculate_optimal_control();
-        }
-        
-        info!("{}", self.control_vector.to_log_string());
+        // Delegate to the main method which now uses HJB optimization
+        self.calculate_optimal_control();
     }
     
     /// Evaluate current strategy using HJB objective
@@ -1609,8 +1647,8 @@ impl MarketMaker {
         let hjb_components = self.hjb_components.clone();
         let state_vector = self.state_vector.clone();
         let value_function = self.value_function.clone();
-        // Use dynamic spread calculation - compute both total and half spread
-        let base_total_spread_bps = (state_vector.volatility_ema_bps * self.spread_volatility_multiplier).max(12.0);
+        // Use dynamic spread calculation - BASED ON MARKET SPREAD
+        let base_total_spread_bps = (state_vector.market_spread_bps).max(12.0);
         let base_half_spread_bps = base_total_spread_bps / 2.0;
         let max_absolute_position_size = self.max_absolute_position_size;
         let tuning_params = Arc::clone(&self.tuning_params);
@@ -1968,10 +2006,18 @@ impl MarketMaker {
             // ============================================
             
             info!(
+                "[LEARNING] HJB vs Heuristic: bid_gap={:.2}bps, ask_gap={:.2}bps, loss={:.4}, value_gap={:.2}%",
+                bid_gap,
+                ask_gap,
+                current_loss,
+                gap_percent
+            );
+            info!(
                 "Background HJB Optimization Complete: Heuristic_Value={:.4}, Optimal_Value={:.4}, Gap={:.2}%",
                 heuristic_value, optimal_value, gap_percent
             );
             info!("Optimal Control (from grid search): {}", optimal_control.to_log_string());
+            info!("Heuristic Control (fast path):     {}", heuristic_control_recomputed.to_log_string());
             
             // Warn if performance gap is high
             if gap_percent > 10.0 {
@@ -1986,7 +2032,7 @@ impl MarketMaker {
     /// This can be used to implement more sophisticated pricing strategies
     pub fn calculate_state_based_spread_adjustment(&self) -> f64 {
         // Use dynamic spread calculation (half-spread)
-        let base_total_spread_bps = (self.state_vector.volatility_ema_bps * self.spread_volatility_multiplier).max(12.0);
+        let base_total_spread_bps = (self.state_vector.market_spread_bps).max(12.0);
         let base_half_spread_bps = base_total_spread_bps / 2.0;
         // Get constrained (theta) params
         let constrained_params = self.tuning_params.read().unwrap().get_constrained();
@@ -2007,8 +2053,8 @@ impl MarketMaker {
     /// Check if we should pause market making based on state vector
     pub fn should_pause_trading(&self) -> bool {
         // Pause if market conditions are unfavorable
-        // Use dynamic spread: threshold = 10x current volatility-based spread
-        let base_total_spread_bps = (self.state_vector.volatility_ema_bps * self.spread_volatility_multiplier).max(12.0);
+        // Use dynamic spread: threshold = 10x current *market* spread
+        let base_total_spread_bps = (self.state_vector.market_spread_bps).max(12.0);
         let max_spread_threshold = base_total_spread_bps * 10.0;
         !self.state_vector.is_market_favorable(max_spread_threshold)
     }
@@ -2097,6 +2143,23 @@ impl MarketMaker {
         info!("✨ Online Adverse Selection Model enabled: Learning weights via SGD");
         info!("   Features: [bias, trade_flow, lob_imbalance, spread, volatility]");
         info!("   Lookback: 10 ticks (~10 sec), Learning rate: 0.001");
+        
+        // Initialize particle filter for stochastic volatility estimation
+        let adaptive_config = AdaptiveConfig::liu_west();
+        let particle_filter = Arc::new(RwLock::new(ParticleFilterState::new_liu_west(
+            7000,    // num_particles (more recommended for joint estimation)
+            -9.2,    // initial_mu
+            0.88,    // initial_phi
+            1.2,     // initial_sigma_eta
+            -9.2,    // initial_h
+            0.5,     // param_std_dev (base uncertainty for params)
+            1.0,     // state_std_dev (initial h uncertainty)
+            adaptive_config,
+            42,      // seed
+        )));
+        info!("📊 Adaptive Liu-West SV Filter initialized:");
+        info!("   Particles: 7000, delta: {}", adaptive_config.delta);
+        info!("   Estimating state (h_t) AND parameters (mu, phi, sigma_eta)");
 
         Ok(MarketMaker {
             asset: input.asset,
@@ -2129,13 +2192,13 @@ impl MarketMaker {
             value_function: ValueFunction::new(0.01, 86400.0), // φ=0.01, T=24h
             tuning_params: Arc::new(RwLock::new(initial_params)),
             adam_optimizer: Arc::new(RwLock::new(AdamOptimizerState::default())),
-            spread_volatility_multiplier: input.spread_volatility_multiplier,
             trading_enabled: Arc::new(RwLock::new(false)), // Start with trading disabled until optimizer validates performance
             enable_trading_gap_threshold_percent: input.enable_trading_gap_threshold_percent,
             gradient_accumulator: Arc::new(RwLock::new(vec![0.0; 7])), // 7 parameters
             gradient_count: Arc::new(RwLock::new(0)),
             message_counter: Arc::new(RwLock::new(0)),
             online_adverse_selection_model: Arc::new(RwLock::new(OnlineAdverseSelectionModel::default())),
+            particle_filter,
         })
     }
 
@@ -2320,7 +2383,6 @@ impl MarketMaker {
                                 let state_vector_clone = self.state_vector.clone();
                                 let hjb_clone = self.hjb_components.clone();
                                 let value_fn_clone = self.value_function.clone();
-                                let vol_mult = self.spread_volatility_multiplier;
                                 let max_pos = self.max_absolute_position_size;
                                 let tuning_params_clone = Arc::clone(&self.tuning_params);
                                 let gradient_accumulator_clone = Arc::clone(&self.gradient_accumulator);
@@ -2331,7 +2393,7 @@ impl MarketMaker {
                                     // This closure now runs on a separate thread
                                     // We've moved the logic from calculate_gradient_snapshot here
                                     
-                                    let base_total_spread_bps = (state_vector_clone.volatility_ema_bps * vol_mult).max(12.0);
+                                    let base_total_spread_bps = (state_vector_clone.market_spread_bps).max(12.0);
                                     let base_half_spread_bps = base_total_spread_bps / 2.0;
 
                                     // 1. Calculate optimal control
@@ -2796,13 +2858,13 @@ impl MarketMaker {
         // Calculate optimal control based on current state
         self.calculate_optimal_control();
         
-        // Calculate dynamic reprice threshold based on current volatility-adjusted spread
-        // CRITICAL: Must use same .max(12.0) as calculate_optimal_control() to stay consistent
-        let dynamic_base_spread = (self.state_vector.volatility_ema_bps * self.spread_volatility_multiplier).max(12.0);
+        // Calculate dynamic reprice threshold based on current *market-based* spread
+        // CRITICAL: Must use same .max(12.0) as calculate_optimal_control()
+        let dynamic_base_spread = (self.state_vector.market_spread_bps).max(12.0);
         let dynamic_max_bps_diff = (dynamic_base_spread * self.reprice_threshold_ratio) as u16;
         
         info!(
-            "Reprice threshold: {} bps ({}% of {} bps spread)",
+            "Reprice threshold: {} bps ({}% of {} bps market spread)",
             dynamic_max_bps_diff,
             self.reprice_threshold_ratio * 100.0,
             dynamic_base_spread

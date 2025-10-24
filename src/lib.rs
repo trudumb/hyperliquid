@@ -13,6 +13,7 @@ mod meta;
 mod prelude;
 mod req;
 mod signature;
+mod stochastic_volatility;
 mod tick_lot_size;
 mod ws;
 pub use book_analyzer::{BookAnalysis, OrderBook};
@@ -30,5 +31,6 @@ pub use market_maker_v2::{
     ValueFunction, HJBComponents, TuningParams
 };
 pub use meta::{AssetContext, AssetMeta, Meta, MetaAndAssetCtxs, SpotAssetMeta, SpotMeta};
+pub use stochastic_volatility::{AdaptiveConfig, Particle, ParticleFilterState};
 pub use tick_lot_size::{AssetType, TickLotValidator};
 pub use ws::*;
