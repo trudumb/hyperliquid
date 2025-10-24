@@ -188,7 +188,8 @@ impl RobustParameters {
     }
 }
 
-// Helper function for computing standard deviation
+// Helper function for computing standard deviation (currently unused but available for future use)
+#[allow(dead_code)]
 fn compute_std(values: &[f64]) -> f64 {
     if values.is_empty() {
         return 0.0;

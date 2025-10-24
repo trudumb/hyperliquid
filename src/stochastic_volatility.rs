@@ -648,6 +648,35 @@ impl ParticleFilterState {
     pub fn is_adaptive(&self) -> bool {
         self.adaptive_config.enabled
     }
+
+    /// Get standard deviation of current volatility estimate in BPS
+    /// Uses delta method approximation to propagate uncertainty from log-vol space to vol space
+    pub fn get_volatility_std_dev_bps(&self) -> f64 {
+        let h_particles: Vec<f64> = self.particles.iter()
+            .map(|p| p.log_vol)
+            .collect();
+
+        // Calculate std dev of h_t first
+        if h_particles.len() < 2 { 
+            return 0.0; 
+        }
+        
+        let h_mean: f64 = h_particles.iter().sum::<f64>() / h_particles.len() as f64;
+        let h_variance: f64 = h_particles.iter()
+            .map(|&h| (h - h_mean).powi(2))
+            .sum::<f64>() / (h_particles.len() - 1) as f64; // Use sample variance
+        let h_std = h_variance.sqrt();
+
+        // Approximate std dev of sigma_t using delta method:
+        // Var(f(X)) ≈ (f'(E[X]))² * Var(X)
+        // Here f(h) = sqrt(exp(h)) = exp(h/2)
+        // f'(h) = 0.5 * exp(h/2)
+        // StdDev(sigma_t) ≈ |f'(E[h])| * StdDev(h)
+        let sigma_mean_approx = (h_mean / 2.0).exp(); // Approx E[sigma_t]
+        let sigma_std_approx = (0.5 * sigma_mean_approx) * h_std;
+
+        sigma_std_approx * 10000.0 // Convert to BPS
+    }
 }
 
 #[cfg(test)]

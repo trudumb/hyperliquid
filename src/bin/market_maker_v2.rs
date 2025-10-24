@@ -51,6 +51,10 @@ async fn main() {
         wallet,
         inventory_skew_config: Some(skew_config),
         enable_trading_gap_threshold_percent: 15.0,  // Enable trading when heuristic is within 15% of optimal
+        enable_multi_level: false,  // Disable multi-level market making
+        multi_level_config: None,   // No multi-level configuration
+        enable_robust_control: false,  // Disable robust control
+        robust_config: None,        // No robust control configuration
     };
     
     let mut market_maker = MarketMaker::new(market_maker_input).await

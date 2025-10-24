@@ -6,10 +6,12 @@ use std::sync::{Arc, RwLock};
 //RUST_LOG=info cargo run --bin market_maker_v2
 
 use crate::{
-    bps_diff, AssetType, BaseUrl, BookAnalysis, ClientCancelRequest, ClientLimit, ClientOrder,
+    AssetType, BaseUrl, BookAnalysis, ClientCancelRequest, ClientLimit, ClientOrder,
     ClientOrderRequest, ExchangeClient, ExchangeDataStatus, ExchangeResponseStatus, InfoClient,
-    InventorySkewCalculator, InventorySkewConfig, MarketCloseParams, MarketOrderParams, Message,
+    InventorySkewConfig, MarketCloseParams, MarketOrderParams, Message,
     OrderBook, ParticleFilterState, AdaptiveConfig, Subscription, TickLotValidator, UserData, EPSILON,
+    HawkesFillModel, MultiLevelConfig, MultiLevelOptimizer, OptimizationState,
+    ParameterUncertainty, RobustConfig, RobustParameters,
 };
 
 /// Epsilon for clamping values during inverse transforms (logit/log)
@@ -380,8 +382,8 @@ pub struct AdamOptimizerState {
 impl Default for AdamOptimizerState {
     fn default() -> Self {
         Self {
-            m: vec![0.0; 7], // 7 parameters
-            v: vec![0.0; 7],
+            m: vec![0.0; 8], // 8 parameters in TuningParams
+            v: vec![0.0; 8],
             t: 0,
             alpha: 0.1,    // Increased from 0.01 -> 10x faster convergence
             beta1: 0.9,
@@ -395,8 +397,8 @@ impl AdamOptimizerState {
     /// Create a new Adam optimizer with custom parameters
     pub fn new(alpha: f64, beta1: f64, beta2: f64) -> Self {
         Self {
-            m: vec![0.0; 7],
-            v: vec![0.0; 7],
+            m: vec![0.0; 8],
+            v: vec![0.0; 8],
             t: 0,
             alpha,
             beta1,
@@ -408,15 +410,15 @@ impl AdamOptimizerState {
     /// Apply Adam update rule to compute parameter updates
     /// Returns the update vector (delta) to be subtracted from parameters
     pub fn compute_update(&mut self, gradient_vector: &[f64]) -> Vec<f64> {
-        assert_eq!(gradient_vector.len(), 7, "Gradient vector must have 7 elements");
+        assert_eq!(gradient_vector.len(), 8, "Gradient vector must have 8 elements");
         
         // Increment time step
         self.t += 1;
         let t = self.t as f64;
         
-        let mut updates = Vec::with_capacity(7);
+        let mut updates = Vec::with_capacity(8);
         
-        for i in 0..7 {
+        for i in 0..8 {
             let g_t = gradient_vector[i];
             
             // Update biased first moment estimate
@@ -441,15 +443,15 @@ impl AdamOptimizerState {
     
     /// Reset optimizer state (call when changing market regimes)
     pub fn reset(&mut self) {
-        self.m = vec![0.0; 7];
-        self.v = vec![0.0; 7];
+        self.m = vec![0.0; 8];
+        self.v = vec![0.0; 8];
         self.t = 0;
     }
     
     /// Get effective learning rate for a specific parameter
     /// Useful for monitoring how much each parameter is being adjusted
     pub fn get_effective_learning_rate(&self, param_index: usize) -> f64 {
-        if self.t == 0 || param_index >= 7 {
+        if self.t == 0 || param_index >= 8 {
             return 0.0;
         }
         
@@ -1355,77 +1357,182 @@ impl Default for HJBComponents {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MarketMakerRestingOrder {
     pub oid: u64,
     pub position: f64,
     pub price: f64,
+    pub level: usize,  // NEW: Track which level this is (0 = L1, 1 = L2, etc.)
 }
 
 #[derive(Debug)]
 pub struct MarketMakerInput {
     pub asset: String,
-    pub target_liquidity: f64, // Amount of liquidity on both sides to target
-    pub half_spread: u16,      // Half of the spread for our market making (in BPS) - DEPRECATED: kept for backward compatibility only
-    pub reprice_threshold_ratio: f64, // Ratio of spread movement to trigger reprice (e.g., 0.5 = reprices if mid moves 50% of spread)
+    pub target_liquidity: f64, // DEPRECATED: Replaced by multi_level_config.level_sizes - kept for backward compatibility only
+    
+    /// DEPRECATED: Removed in multi-level refactor - baseline spread now uses real-time market spread
+    /// Kept for backward compatibility only. Value is ignored.
+    #[deprecated(note = "Use multi_level_config instead - baseline spread is now dynamic")]
+    pub half_spread: u16,
+    
+    /// DEPRECATED: Removed in multi-level refactor - reprice logic replaced by multi-level reconciliation
+    /// Kept for backward compatibility only. Value is ignored.
+    #[deprecated(note = "Reprice logic now handled by multi-level reconciliation")]
+    pub reprice_threshold_ratio: f64,
+    
     pub max_absolute_position_size: f64, // Absolute value of the max position we can take on
     pub asset_type: AssetType, // Asset type (Perp or Spot) for tick/lot size validation
     pub wallet: PrivateKeySigner, // Wallet containing private key
-    pub inventory_skew_config: Option<InventorySkewConfig>, // Optional inventory skewing configuration
+    
+    /// DEPRECATED: Removed in multi-level refactor - skew logic integrated into multi_level_optimizer
+    /// Kept for backward compatibility only. Value is ignored.
+    #[deprecated(note = "Skew logic now integrated into multi_level_optimizer")]
+    pub inventory_skew_config: Option<InventorySkewConfig>,
     
     /// Performance gap threshold (in percent) to enable live trading
     /// E.g., 15.0 means trading starts when heuristic gap is < 15%
     pub enable_trading_gap_threshold_percent: f64,
+    
+    /// Multi-level market making configuration
+    pub enable_multi_level: bool,
+    pub multi_level_config: Option<MultiLevelConfig>,
+    
+    /// Robust control configuration (uncertainty handling)
+    pub enable_robust_control: bool,
+    pub robust_config: Option<RobustConfig>,
 }
 
+/// Refactored MarketMaker struct with unified multi-level optimization
+/// Removes obsolete single-level fields and integrates new components
 #[derive(Debug)]
 pub struct MarketMaker {
+    // ===== Core Configuration =====
+    /// Trading asset symbol (e.g., "BTC", "ETH")
     pub asset: String,
-    pub target_liquidity: f64,
-    pub half_spread: u16, // DEPRECATED: kept for backward compatibility only, baseline spread now uses real-time market spread
-    pub reprice_threshold_ratio: f64, // Ratio of spread movement to trigger reprice
-    pub max_absolute_position_size: f64,
+    
+    /// Tick/lot size validator for order price/size validation
     pub tick_lot_validator: TickLotValidator,
-    pub lower_resting: MarketMakerRestingOrder,
-    pub upper_resting: MarketMakerRestingOrder,
-    pub cur_position: f64,
-    pub latest_mid_price: f64,
+    
+    /// Maximum absolute position size (inventory limit)
+    pub max_absolute_position_size: f64,
+    
+    // ===== Exchange Clients =====
+    /// Info client for market data queries
     pub info_client: InfoClient,
+    
+    /// Exchange client for order management
     pub exchange_client: ExchangeClient,
+    
+    /// User wallet address
     pub user_address: Address,
-    pub inventory_skew_calculator: Option<InventorySkewCalculator>,
+    
+    // ===== Real-Time State =====
+    /// Current position (positive = long, negative = short)
+    pub cur_position: f64,
+    
+    /// Latest mid price from market data
+    pub latest_mid_price: f64,
+    
+    /// Latest order book snapshot (needed for BBO and imbalance)
     pub latest_book: Option<OrderBook>,
-    pub latest_book_analysis: Option<BookAnalysis>,
-    /// State Vector (Z_t) for optimal decision making
+    
+    /// State Vector (Z_t) - holds μ̂, σ̂, I, trade flow, etc.
     pub state_vector: StateVector,
-    /// Control Vector (u_t) for algorithm actions
-    pub control_vector: ControlVector,
-    /// HJB equation components for optimal control
-    pub hjb_components: HJBComponents,
-    /// Value function V(Q, Z, t)
-    pub value_function: ValueFunction,
-    /// Tunable parameters wrapped in Arc<RwLock> for live updates
-    pub tuning_params: Arc<RwLock<TuningParams>>,
-    /// Adam optimizer state for automatic parameter tuning
-    pub adam_optimizer: Arc<RwLock<AdamOptimizerState>>,
-    /// Flag indicating if live trading is enabled (set by optimizer)
-    pub trading_enabled: Arc<RwLock<bool>>,
-    /// Performance gap threshold (in percent) to enable live trading
-    /// E.g., 15.0 means trading starts when heuristic gap is < 15%
-    pub enable_trading_gap_threshold_percent: f64,
-    /// Gradient accumulator for stable Adam updates
-    /// Accumulates gradients over multiple AllMids messages (default: 60 seconds)
-    pub gradient_accumulator: Arc<RwLock<Vec<f64>>>,
-    /// Count of gradients accumulated in current window
-    pub gradient_count: Arc<RwLock<usize>>,
-    /// Message counter for sampling (accumulate every Nth message to save CPU)
-    pub message_counter: Arc<RwLock<usize>>,
-    /// Online Linear Regression Model for Adverse Selection
-    /// Learns to predict short-term price drift using SGD
-    pub online_adverse_selection_model: Arc<RwLock<OnlineAdverseSelectionModel>>,
+    
+    // ===== Advanced Models =====
     /// Particle filter for stochastic volatility estimation
     /// Replaces simple EMA with sophisticated latent volatility modeling
     pub particle_filter: Arc<RwLock<ParticleFilterState>>,
+    
+    /// Online Linear Regression Model for Adverse Selection
+    /// Learns to predict short-term price drift using SGD
+    pub online_adverse_selection_model: Arc<RwLock<OnlineAdverseSelectionModel>>,
+    
+    // ===== Multi-Level Optimizer & Components =====
+    /// Unified multi-level optimizer (contains config, logic for levels/sizes)
+    /// Replaces old single-level HJB components and value function
+    pub multi_level_optimizer: MultiLevelOptimizer,
+    
+    /// Hawkes process model for fill rate estimation
+    /// Needs RwLock for fill updates from trade stream
+    pub hawkes_model: Arc<RwLock<HawkesFillModel>>,
+    
+    /// Robust control configuration (uncertainty sets, robustness parameters)
+    pub robust_config: RobustConfig,
+    
+    /// Current parameter uncertainty estimates from particle filter
+    pub current_uncertainty: ParameterUncertainty,
+    
+    // ===== Resting Order State (Multi-Level) =====
+    /// Resting bid orders by level (replaces old lower_resting)
+    /// bid_levels[0] = L1 (tightest), bid_levels[1] = L2, etc.
+    pub bid_levels: Vec<MarketMakerRestingOrder>,
+    
+    /// Resting ask orders by level (replaces old upper_resting)
+    /// ask_levels[0] = L1 (tightest), ask_levels[1] = L2, etc.
+    pub ask_levels: Vec<MarketMakerRestingOrder>,
+    
+    // ===== Adam Self-Tuning System =====
+    /// Tunable parameters wrapped in Arc<RwLock> for live updates
+    /// These are the meta-parameters that Adam optimizes (skew factors, etc.)
+    pub tuning_params: Arc<RwLock<TuningParams>>,
+    
+    /// Adam optimizer state for automatic parameter tuning
+    pub adam_optimizer: Arc<RwLock<AdamOptimizerState>>,
+    
+    /// Gradient accumulator for stable Adam updates
+    /// Accumulates gradients over multiple AllMids messages (default: 60 seconds)
+    pub gradient_accumulator: Arc<RwLock<Vec<f64>>>,
+    
+    /// Count of gradients accumulated in current window
+    pub gradient_count: Arc<RwLock<usize>>,
+    
+    /// Message counter for sampling (accumulate every Nth message to save CPU)
+    pub message_counter: Arc<RwLock<usize>>,
+    
+    // ===== Trading Control =====
+    /// Flag indicating if live trading is enabled (set by optimizer)
+    pub trading_enabled: Arc<RwLock<bool>>,
+    
+    /// Performance gap threshold (in percent) to enable live trading
+    /// E.g., 15.0 means trading starts when heuristic gap is < 15%
+    pub enable_trading_gap_threshold_percent: f64,
+    
+    // ===== REMOVED/DEPRECATED Fields (Documented for Reference) =====
+    // The following fields have been removed in this refactor:
+    //
+    // - target_liquidity: f64
+    //   → Replaced by multi_level_optimizer.config.level_sizes
+    //
+    // - half_spread: u16
+    //   → Baseline spread now uses real-time market spread from latest_book
+    //
+    // - reprice_threshold_ratio: f64
+    //   → Reprice logic replaced by multi-level reconciliation
+    //
+    // - lower_resting: MarketMakerRestingOrder
+    // - upper_resting: MarketMakerRestingOrder
+    //   → Replaced by bid_levels and ask_levels (multi-level)
+    //
+    // - inventory_skew_calculator: Option<InventorySkewCalculator>
+    //   → Skew logic integrated into multi_level_optimizer
+    //
+    // - latest_book_analysis: Option<BookAnalysis>
+    //   → Analysis now done inline or within optimizer
+    //
+    // - control_vector: ControlVector
+    //   → Replaced by MultiLevelControl generated dynamically
+    //
+    // - hjb_components: HJBComponents
+    // - value_function: ValueFunction
+    //   → Logic now within MultiLevelOptimizer (or RobustHJBComponents)
+    //
+    // - multi_level_control: Option<MultiLevelControl>
+    //   → Generated on-the-fly by optimizer, not stored
+    //
+    // - multi_level_enabled: bool
+    // - robust_control_enabled: bool
+    //   → Configuration is implicit (non-optional optimizer/config)
 }
 
 impl MarketMaker {
@@ -1493,7 +1600,7 @@ impl MarketMaker {
         self.state_vector.update(
             self.latest_mid_price,
             self.cur_position,
-            self.latest_book_analysis.as_ref(),
+            None, // book_analysis removed - analysis done inline now
             self.latest_book.as_ref(),
             &constrained_params,
             &mut *online_model,
@@ -1503,6 +1610,7 @@ impl MarketMaker {
         info!("{}", self.state_vector.to_log_string());
     }
     
+    /* DEPRECATED: Old HJB-based control calculation - replaced by calculate_multi_level_targets()
     /// Calculate optimal control vector based on current state
     /// Uses HJB optimization to derive spreads from first principles
     /// Calculate optimal control vector based on current state
@@ -1559,7 +1667,9 @@ impl MarketMaker {
             elapsed.as_micros()
         );
     }
+    */
     
+    /* DEPRECATED: Use calculate_multi_level_targets() instead
     /// DEPRECATED: Use calculate_optimal_control() instead
     /// This method is kept for backward compatibility
     /// The main calculate_optimal_control() now uses HJB optimization by default
@@ -1568,7 +1678,9 @@ impl MarketMaker {
         // Delegate to the main method which now uses HJB optimization
         self.calculate_optimal_control();
     }
+    */
     
+    /* DEPRECATED: Old HJB-based evaluation - replaced by MultiLevelOptimizer
     /// Evaluate current strategy using HJB objective
     /// Returns the instantaneous expected value rate
     pub fn evaluate_current_strategy(&self) -> f64 {
@@ -1578,7 +1690,126 @@ impl MarketMaker {
             &self.value_function,
         )
     }
+    */
     
+    /// Calculate optimal multi-level targets using Hawkes, Robust HJB, and sizing logic.
+    /// This is the NEW core quoting logic that replaces calculate_optimal_control.
+    /// Returns: (Vec<(price, size)>, Vec<(price, size)>) for bids and asks.
+    fn calculate_multi_level_targets(&mut self) -> (Vec<(f64, f64)>, Vec<(f64, f64)>) {
+        let start = std::time::Instant::now();
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+
+        // --- 1. Get Current State & Uncertainty ---
+        let state = &self.state_vector;
+        let pf_lock = self.particle_filter.read().unwrap();
+
+        // Get parameter uncertainty from particle filter
+        let (mu_std, _, _) = pf_lock.get_parameter_std_devs();
+        let sigma_std = pf_lock.get_volatility_std_dev_bps();
+
+        // Use adverse selection model estimate as nominal mu, PF uncertainty if available
+        let nominal_mu = state.adverse_selection_estimate;
+        // Use particle filter vol estimate as nominal sigma
+        let nominal_sigma = state.volatility_ema_bps;
+
+        self.current_uncertainty = ParameterUncertainty::from_particle_filter_stats(
+            mu_std, // Or use a fixed value/MAE from online_model if PF doesn't estimate drift directly
+            sigma_std,
+            0.95, // Example confidence level
+        );
+        drop(pf_lock); // Release lock
+
+        // --- 2. Compute Robust Parameters ---
+        let robust_params = RobustParameters::compute(
+            nominal_mu,
+            nominal_sigma,
+            state.inventory,
+            &self.current_uncertainty,
+            &self.robust_config,
+        );
+
+        // --- 3. Prepare Optimization State ---
+        let hawkes_lock = self.hawkes_model.read().unwrap(); // Read lock needed
+        let opt_state = OptimizationState {
+            mid_price: state.mid_price,
+            inventory: state.inventory,
+            max_position: self.max_absolute_position_size,
+            // Use ROBUST drift estimate for optimization
+            adverse_selection_bps: robust_params.mu_worst_case,
+            lob_imbalance: state.lob_imbalance,
+            // Use ROBUST vol estimate
+            volatility_bps: robust_params.sigma_worst_case,
+            current_time,
+            hawkes_model: &hawkes_lock, // Pass reference to locked model
+        };
+
+        // --- 4. Run Multi-Level Optimizer ---
+        // Calculate base half-spread using robust vol & multiplier, bounded by floor
+        let min_profitable_half_spread = self.multi_level_optimizer.config().min_profitable_spread_bps / 2.0;
+        let robust_base_half_spread = (robust_params.sigma_worst_case * 0.1) // Example: 10% of vol as base spread heuristic
+                                         .max(min_profitable_half_spread)
+                                         * robust_params.spread_multiplier; // Apply robustness widening
+
+        let multi_level_control = self.multi_level_optimizer.optimize(
+            &opt_state,
+            robust_base_half_spread, // Pass the calculated robust base
+        );
+        drop(hawkes_lock); // Release lock
+
+        // --- 5. Convert Control Offsets to Prices ---
+        let mut target_bids: Vec<(f64, f64)> = Vec::new();
+        let mut target_asks: Vec<(f64, f64)> = Vec::new();
+
+        for (offset_bps, size) in multi_level_control.bid_levels {
+            if size < EPSILON { 
+                continue; 
+            } // Skip dust
+            let price_raw = state.mid_price * (1.0 - offset_bps / 10000.0);
+            let price = self.tick_lot_validator.round_price(price_raw, false); // Round bid down
+            if price > 0.0 {
+                target_bids.push((price, size));
+            }
+        }
+
+        for (offset_bps, size) in multi_level_control.ask_levels {
+            if size < EPSILON { 
+                continue; 
+            }
+            let price_raw = state.mid_price * (1.0 + offset_bps / 10000.0);
+            let price = self.tick_lot_validator.round_price(price_raw, true); // Round ask up
+            if price > 0.0 {
+                target_asks.push((price, size));
+            }
+        }
+
+        // --- 6. Final Processing & Logging ---
+        // Sort bids descending, asks ascending by price
+        target_bids.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        target_asks.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+        // Optional: Implement logic to merge orders at the same price tick
+        // (This could be added later if needed)
+
+        let elapsed = start.elapsed();
+        info!(
+            "[MULTI-LEVEL OPTIMIZE] Targets ({}μs): Bids({}): {:?}, Asks({}): {:?}",
+            elapsed.as_micros(), target_bids.len(), target_bids, target_asks.len(), target_asks
+        );
+        if multi_level_control.liquidate {
+            warn!("Liquidation mode triggered by optimizer!");
+            // Taker logic will be handled in potentially_update based on rates
+        }
+
+        // TODO: Store multi_level_control rates if needed for taker logic
+        // self.multi_level_control = Some(multi_level_control); // Store if needed later
+
+        (target_bids, target_asks)
+    }
+    
+    /* DEPRECATED: Old HJB-based fill rate calculation - replaced by Hawkes model
     /// Get expected maker fill rates for current control
     pub fn get_expected_fill_rates(&self) -> (f64, f64) {
         let lambda_bid = self.hjb_components.maker_bid_fill_rate(
@@ -1596,6 +1827,7 @@ impl MarketMaker {
     pub fn get_control_vector(&self) -> &ControlVector {
         &self.control_vector
     }
+    */
     
     /// Get the current state vector (read-only access)
     pub fn get_state_vector(&self) -> &StateVector {
@@ -1603,6 +1835,7 @@ impl MarketMaker {
     }
     
 
+    /* DEPRECATED: Old Adam optimizer method using HJBComponents - needs refactoring for MultiLevelOptimizer
     /// Run HJB grid search optimization in background and compare with heuristic
     /// 
     /// This spawns a background task to run the expensive `optimize_control()` grid search
@@ -1643,390 +1876,11 @@ impl MarketMaker {
     /// }
     /// ```
     pub fn optimize_control_background(&self) -> tokio::task::JoinHandle<(ControlVector, f64, f64)> {
-        // Clone all necessary data for background thread
-        let hjb_components = self.hjb_components.clone();
-        let state_vector = self.state_vector.clone();
-        let value_function = self.value_function.clone();
-        // Use dynamic spread calculation - BASED ON MARKET SPREAD
-        let base_total_spread_bps = (state_vector.market_spread_bps).max(12.0);
-        let base_half_spread_bps = base_total_spread_bps / 2.0;
-        let max_absolute_position_size = self.max_absolute_position_size;
-        let tuning_params = Arc::clone(&self.tuning_params);
-        let adam_optimizer = Arc::clone(&self.adam_optimizer);
-        let trading_enabled = Arc::clone(&self.trading_enabled);
-        let enable_trading_gap_threshold_percent = self.enable_trading_gap_threshold_percent;
-        let gradient_accumulator = Arc::clone(&self.gradient_accumulator);
-        let gradient_count = Arc::clone(&self.gradient_count);
-        
-        tokio::task::spawn_blocking(move || {
-            // Run expensive grid search optimization using half-spread
-            let optimal_control = hjb_components.optimize_control(
-                &state_vector,
-                &value_function,
-                base_half_spread_bps,
-            );
-            
-            // Recompute heuristic fresh using the SAME state_vector as optimal control
-            // This ensures apples-to-apples comparison at State_t0
-            let constrained_params = tuning_params.read().unwrap().get_constrained();
-            let mut heuristic_control_recomputed = ControlVector::symmetric(base_half_spread_bps);
-            heuristic_control_recomputed.apply_state_adjustments(
-                &state_vector,
-                base_half_spread_bps,
-                max_absolute_position_size,
-                &constrained_params,
-                &hjb_components,
-            );
-            
-            // Evaluate both controls for comparison (both based on same state_vector)
-            let heuristic_value = hjb_components.evaluate_control(
-                &heuristic_control_recomputed,
-                &state_vector,
-                &value_function,
-            );
-            
-            let optimal_value = hjb_components.evaluate_control(
-                &optimal_control,
-                &state_vector,
-                &value_function,
-            );
-            
-            // ============================================
-            // PERFORMANCE GAP CALCULATION AND TRADING ENABLEMENT
-            // ============================================
-            
-            // Calculate performance gap as percentage
-            let perf_gap = (optimal_value - heuristic_value).abs();
-            let gap_percent = if optimal_value.abs() > EPSILON {
-                (perf_gap / optimal_value.abs()) * 100.0
-            } else {
-                0.0
-            };
-            
-            // Check if trading should be enabled based on performance gap
-            // Only enable if currently disabled AND gap is below threshold
-            if !*trading_enabled.read().unwrap() && gap_percent <= enable_trading_gap_threshold_percent {
-                // Acquire write lock and enable trading
-                let mut enabled = trading_enabled.write().unwrap();
-                *enabled = true;
-                // Log the transition
-                info!(
-                    "✅ Performance gap ({:.2}%) is below threshold ({:.2}%). ENABLING LIVE TRADING.",
-                    gap_percent, enable_trading_gap_threshold_percent
-                );
-            }
-            
-            // ============================================
-            // ADAM OPTIMIZER-BASED AUTOMATIC PARAMETER TUNING
-            // ============================================
-            
-            // 1. Define Loss: Control Gap (squared difference in quote offsets)
-            // L = (bid_optimal - bid_heuristic)² + (ask_optimal - ask_heuristic)²
-            // This measures how different our quotes are from optimal, which produces
-            // stable, interpretable gradients compared to the value gap.
-            let bid_gap = optimal_control.bid_offset_bps - heuristic_control_recomputed.bid_offset_bps;
-            let ask_gap = optimal_control.ask_offset_bps - heuristic_control_recomputed.ask_offset_bps;
-            let current_loss = bid_gap.powi(2) + ask_gap.powi(2);
-            
-            // Get configurable control gap threshold from tuning params
-            // This allows adaptive tuning based on market conditions:
-            // - Volatile/noisy markets: higher threshold (5.0-20.0) prevents chasing noise
-            // - Stable/quiet markets: lower threshold (0.5-2.0) allows fine-tuning
-            let control_gap_threshold = {
-                // Get the constrained (theta) value of the threshold
-                tuning_params.read().unwrap().get_constrained().control_gap_threshold
-            };
-            
-            if current_loss > control_gap_threshold {
-                info!("Control gap detected: {:.6} bps² (bid_gap={:.2}bps, ask_gap={:.2}bps, threshold={:.2}bps²). Running Adam optimizer parameter tuning...", 
-                    current_loss, bid_gap, ask_gap, control_gap_threshold);
-                
-                // 2. Get current parameters
-                // These are the *unconstrained* (phi) parameters
-                let original_params_phi = tuning_params.read().unwrap().clone();
-                
-                // Get the constrained (theta) params for logging purposes
-                let original_params_theta = original_params_phi.get_constrained();
-                
-                // 3. Use ACCUMULATED GRADIENTS instead of single snapshot
-                // This is the key stability improvement - we average gradients
-                // over the entire 60-second window instead of using one noisy sample
-                let gradient_vector: Vec<f64> = {
-                    let accumulator = gradient_accumulator.read().unwrap();
-                    let count = gradient_count.read().unwrap();
-                    
-                    if *count > 0 {
-                        // Average the accumulated gradients
-                        let mut avg_gradient = vec![0.0; 7];
-                        for i in 0..7 {
-                            avg_gradient[i] = accumulator[i] / (*count as f64);
-                        }
-                        
-                        info!("Using accumulated gradients: {} samples over 60s window", *count);
-                        info!("Accumulated gradient statistics:");
-                        let param_names = [
-                            "skew_adjustment_factor",
-                            "adverse_selection_adjustment_factor",
-                            "adverse_selection_lambda",
-                            "inventory_urgency_threshold",
-                            "liquidation_rate_multiplier",
-                            "min_spread_base_ratio",
-                            "adverse_selection_spread_scale",
-                        ];
-                        for i in 0..7 {
-                            let current_theta_value = match i {
-                                0 => original_params_theta.skew_adjustment_factor,
-                                1 => original_params_theta.adverse_selection_adjustment_factor,
-                                2 => original_params_theta.adverse_selection_lambda,
-                                3 => original_params_theta.inventory_urgency_threshold,
-                                4 => original_params_theta.liquidation_rate_multiplier,
-                                5 => original_params_theta.min_spread_base_ratio,
-                                6 => original_params_theta.adverse_selection_spread_scale,
-                                _ => 0.0,
-                            };
-                            info!("  Avg Gradient[{}] = {:.6} (theta_value={:.6}, samples={})", 
-                                param_names[i], avg_gradient[i], current_theta_value, *count);
-                        }
-                        
-                        avg_gradient
-                    } else {
-                        // No gradients accumulated yet (first 60s window or all below threshold)
-                        // Skip this update cycle
-                        info!("No gradients accumulated in this window, skipping Adam update");
-                        vec![0.0; 7]
-                    }
-                };
-                
-                // Check if we have valid gradients to work with
-                let gradient_count_value = *gradient_count.read().unwrap();
-                if gradient_count_value == 0 {
-                    // Skip Adam update if no gradients were accumulated
-                    info!("Skipping Adam update - no valid gradients accumulated in this window");
-                } else {
-                    // 5. Gradient Clipping (relax thresholds due to normalization)
-                    let max_individual_norm = 100.0; // Relaxed individual clipping
-                    let max_global_norm = 50.0;      // Added global norm clipping
-
-                    let mut clipped_gradient_vector = gradient_vector.clone();
-                    let mut num_clipped = 0;
-
-                    // Clip individual gradients
-                    for i in 0..7 {
-                        if clipped_gradient_vector[i].abs() > max_individual_norm {
-                            clipped_gradient_vector[i] = clipped_gradient_vector[i].signum() * max_individual_norm;
-                            num_clipped += 1;
-                        }
-                    }
-
-                    // Also clip by global norm (prevents extreme cases even after individual clipping)
-                    let gradient_norm_after_individual: f64 = clipped_gradient_vector.iter().map(|g| g.powi(2)).sum::<f64>().sqrt();
-                    if gradient_norm_after_individual > max_global_norm {
-                        let scale = max_global_norm / (gradient_norm_after_individual + 1e-8); // Add epsilon for stability
-                        for i in 0..7 {
-                            clipped_gradient_vector[i] *= scale;
-                        }
-                        info!("  Applied global norm scaling: {:.3}x", scale);
-                        // Ensure num_clipped reflects that clipping occurred, even if only global
-                        if num_clipped == 0 { num_clipped = 1; }
-                    }
-                    
-                    // Calculate gradient norm for monitoring (L2 norm)
-                    let gradient_norm: f64 = gradient_vector.iter().map(|g| g.powi(2)).sum::<f64>().sqrt();
-                    let clipped_gradient_norm: f64 = clipped_gradient_vector.iter().map(|g| g.powi(2)).sum::<f64>().sqrt();
-                    
-                    info!("Gradient Statistics:");
-                    info!("  Gradient L2 norm: {:.6}", gradient_norm);
-                    if num_clipped > 0 {
-                        info!("  Clipped {} gradients (norm after clipping: {:.6})", num_clipped, clipped_gradient_norm);
-                    }
-                    
-                    // 6. Apply Adam optimizer update with warmup
-                    let updates = {
-                        let mut optimizer = adam_optimizer.write().unwrap();
-                        
-                        // Learning rate warmup: gradually increase alpha over first N steps
-                        // This prevents divergence when optimizer's internal state is still initializing
-                        let warmup_steps = 3; // Changed from 10: faster warmup with normalized gradients
-                        let current_step = optimizer.t + 1; // +1 because compute_update increments t
-                        let warmup_factor = if current_step <= warmup_steps {
-                            current_step as f64 / warmup_steps as f64
-                        } else {
-                            1.0
-                        };
-                        
-                        // Temporarily apply warmup to learning rate
-                        let original_alpha = optimizer.alpha;
-                        optimizer.alpha *= warmup_factor;
-                        
-                        // Compute update with clipped gradients
-                        let updates = optimizer.compute_update(&clipped_gradient_vector);
-                        
-                        // Restore original alpha
-                        optimizer.alpha = original_alpha;
-                        
-                        updates
-                    };
-                    
-                    // 7. Log optimizer state and diagnostics
-                    {
-                        let optimizer = adam_optimizer.read().unwrap();
-                        info!("Adam Optimizer State:");
-                        info!("  Time step: {}", optimizer.t);
-                        info!("  Base learning rate (α): {}", optimizer.alpha);
-                        
-                        // Calculate warmup factor for current step
-                        let warmup_steps = 3; // Changed from 10: faster warmup with normalized gradients
-                        let warmup_factor = if optimizer.t <= warmup_steps {
-                            optimizer.t as f64 / warmup_steps as f64
-                        } else {
-                            1.0
-                        };
-                        if warmup_factor < 1.0 {
-                            info!("  Warmup factor: {:.2}x (step {}/{})", warmup_factor, optimizer.t, warmup_steps);
-                        }
-                        
-                        // Log effective learning rates per parameter
-                        let param_names = [
-                            "skew_adjustment_factor",
-                            "adverse_selection_adjustment_factor",
-                            "adverse_selection_lambda",
-                            "inventory_urgency_threshold",
-                            "liquidation_rate_multiplier",
-                            "min_spread_base_ratio",
-                            "adverse_selection_spread_scale",
-                        ];
-                        for i in 0..7 {
-                            let eff_lr = optimizer.get_effective_learning_rate(i);
-                            info!("  Effective LR[{}]: {:.6}", param_names[i], eff_lr);
-                        }
-                        
-                        // Log momentum (m) and velocity (v) statistics for health monitoring
-                        let m_norm: f64 = optimizer.m.iter().map(|x| x.powi(2)).sum::<f64>().sqrt();
-                        let v_norm: f64 = optimizer.v.iter().map(|x| x.powi(2)).sum::<f64>().sqrt();
-                        info!("  Momentum (m) L2 norm: {:.6}", m_norm);
-                        info!("  Velocity (v) L2 norm: {:.6}", v_norm);
-                    }
-                    
-                    // 8. Apply updates: theta_new = theta_old - update
-                    // This updates the *unconstrained* (phi) parameters
-                    let mut updated_params_phi = original_params_phi.clone();
-                    updated_params_phi.skew_adjustment_factor_phi -= updates[0];
-                    updated_params_phi.adverse_selection_adjustment_factor_phi -= updates[1];
-                    updated_params_phi.adverse_selection_lambda_phi -= updates[2];
-                    updated_params_phi.inventory_urgency_threshold_phi -= updates[3];
-                    updated_params_phi.liquidation_rate_multiplier_phi -= updates[4];
-                    updated_params_phi.min_spread_base_ratio_phi -= updates[5];
-                    updated_params_phi.adverse_selection_spread_scale_phi -= updates[6];
-                    
-                    // Calculate update norm for monitoring
-                    let update_norm: f64 = updates.iter().map(|u| u.powi(2)).sum::<f64>().sqrt();
-                    info!("Update Statistics:");
-                    info!("  Update L2 norm: {:.6}", update_norm);
-                    info!("  Largest update: {:.6} (param index {})", 
-                        updates.iter().enumerate().map(|(i, u)| (u.abs(), i)).max_by(|a, b| a.0.partial_cmp(&b.0).unwrap()).unwrap().0,
-                        updates.iter().enumerate().map(|(i, u)| (u.abs(), i)).max_by(|a, b| a.0.partial_cmp(&b.0).unwrap()).unwrap().1);
-                    
-                    // 9. Apply the updated parameters
-                    // Validation is no longer needed as parameters are valid by construction
-                            // Parameters are valid, apply them
-                            {
-                                let mut params = tuning_params.write().unwrap();
-                                *params = updated_params_phi.clone();
-                            }
-                            info!("Adam Update Applied (unconstrained phi): {:?}", updated_params_phi);
-                            
-                            // Log the changes for each parameter
-                            info!("Parameter Changes:");
-                            
-                            // Get *constrained* (theta) values for logging
-                            let updated_params_theta = updated_params_phi.get_constrained();
-                            info!("  skew_adjustment_factor (theta): {:.6} -> {:.6} (Δ={:.6})",
-                                original_params_theta.skew_adjustment_factor,
-                                updated_params_theta.skew_adjustment_factor,
-                                updated_params_theta.skew_adjustment_factor - original_params_theta.skew_adjustment_factor);
-                            info!("  adverse_selection_adjustment_factor (theta): {:.6} -> {:.6} (Δ={:.6})",
-                                original_params_theta.adverse_selection_adjustment_factor,
-                                updated_params_theta.adverse_selection_adjustment_factor,
-                                updated_params_theta.adverse_selection_adjustment_factor - original_params_theta.adverse_selection_adjustment_factor);
-                            info!("  adverse_selection_lambda (theta): {:.6} -> {:.6} (Δ={:.6})",
-                                original_params_theta.adverse_selection_lambda,
-                                updated_params_theta.adverse_selection_lambda,
-                                updated_params_theta.adverse_selection_lambda - original_params_theta.adverse_selection_lambda);
-                            info!("  inventory_urgency_threshold (theta): {:.6} -> {:.6} (Δ={:.6})",
-                                original_params_theta.inventory_urgency_threshold,
-                                updated_params_theta.inventory_urgency_threshold,
-                                updated_params_theta.inventory_urgency_threshold - original_params_theta.inventory_urgency_threshold);
-                            info!("  liquidation_rate_multiplier (theta): {:.6} -> {:.6} (Δ={:.6})",
-                                original_params_theta.liquidation_rate_multiplier,
-                                updated_params_theta.liquidation_rate_multiplier,
-                                updated_params_theta.liquidation_rate_multiplier - original_params_theta.liquidation_rate_multiplier);
-                            info!("  min_spread_base_ratio (theta): {:.6} -> {:.6} (Δ={:.6})",
-                                original_params_theta.min_spread_base_ratio,
-                                updated_params_theta.min_spread_base_ratio,
-                                updated_params_theta.min_spread_base_ratio - original_params_theta.min_spread_base_ratio);
-                            info!("  adverse_selection_spread_scale (theta): {:.6} -> {:.6} (Δ={:.6})",
-                                original_params_theta.adverse_selection_spread_scale,
-                                updated_params_theta.adverse_selection_spread_scale,
-                                updated_params_theta.adverse_selection_spread_scale - original_params_theta.adverse_selection_spread_scale);
-                            
-                            // Save to JSON file for persistence
-                            // This saves the *constrained* (theta) values
-                            if let Err(e) = updated_params_phi.to_json_file("tuning_params.json") {
-                                error!("Failed to save updated tuning params to JSON: {}", e);
-                            } else {
-                                info!("Updated tuning parameters saved to tuning_params.json");
-                            }
-                }
-                
-                // ============================================
-                // RESET GRADIENT ACCUMULATOR FOR NEXT WINDOW
-                // ============================================
-                // Always reset after 60s timer, regardless of whether we applied an update
-                {
-                    let mut accumulator = gradient_accumulator.write().unwrap();
-                    let mut count = gradient_count.write().unwrap();
-                    
-                    // Reset to zeros for next accumulation window
-                    for i in 0..7 {
-                        accumulator[i] = 0.0;
-                    }
-                    *count = 0;
-                    
-                    info!("Gradient accumulator reset for next 60-second window");
-                }
-            } else {
-                info!("Control gap {:.6} bps² is below threshold {:.6} bps², skipping Adam tuning", 
-                    current_loss, control_gap_threshold);
-                info!("Heuristic quotes close to optimal (bid_gap={:.2}bps, ask_gap={:.2}bps)", 
-                    bid_gap, ask_gap);
-            }
-            
-            // ============================================
-            // LOG OPTIMIZATION RESULTS
-            // ============================================
-            
-            info!(
-                "[LEARNING] HJB vs Heuristic: bid_gap={:.2}bps, ask_gap={:.2}bps, loss={:.4}, value_gap={:.2}%",
-                bid_gap,
-                ask_gap,
-                current_loss,
-                gap_percent
-            );
-            info!(
-                "Background HJB Optimization Complete: Heuristic_Value={:.4}, Optimal_Value={:.4}, Gap={:.2}%",
-                heuristic_value, optimal_value, gap_percent
-            );
-            info!("Optimal Control (from grid search): {}", optimal_control.to_log_string());
-            info!("Heuristic Control (fast path):     {}", heuristic_control_recomputed.to_log_string());
-            
-            // Warn if performance gap is high
-            if gap_percent > 10.0 {
-                log::warn!("Heuristic performance gap is high (>{:.2}%)! Consider tuning.", gap_percent);
-            }
-            
-            (optimal_control, heuristic_value, optimal_value)
-        })
+        // This method used old HJBComponents and needs refactoring for MultiLevelOptimizer
+        // Temporarily disabled until refactored
+        todo!("Refactor optimize_control_background for MultiLevelOptimizer")
     }
+    */
     
     /// Calculate optimal spread adjustment based on state vector
     /// This can be used to implement more sophisticated pricing strategies
@@ -2060,29 +1914,27 @@ impl MarketMaker {
     }
     
     /// Reset a resting order to default state
-    fn reset_resting_order(&mut self, is_lower: bool) {
-        let resting_order = if is_lower {
-            &mut self.lower_resting
+    #[allow(dead_code)]
+    fn reset_resting_order(&mut self, is_bid: bool) {
+        // For multi-level system, clear the appropriate level vec
+        if is_bid {
+            self.bid_levels.clear();
         } else {
-            &mut self.upper_resting
-        };
-        
-        *resting_order = MarketMakerRestingOrder {
-            oid: 0,
-            position: 0.0,
-            price: -1.0,
-        };
+            self.ask_levels.clear();
+        }
     }
 
-    /// Clean up any invalid resting orders (e.g., negative positions)
+    /// Clean up any invalid resting orders (e.g., negative positions, zero OIDs)
     fn cleanup_invalid_resting_orders(&mut self) {
-        if self.lower_resting.position < 0.0 {
-            info!("Lower resting order has negative position, resetting");
-            self.reset_resting_order(true);
+        self.bid_levels.retain(|o| o.position >= EPSILON && o.oid != 0);
+        self.ask_levels.retain(|o| o.position >= EPSILON && o.oid != 0);
+        
+        // Re-assign levels after potentially removing items
+        for (i, order) in self.bid_levels.iter_mut().enumerate() { 
+            order.level = i; 
         }
-        if self.upper_resting.position < 0.0 {
-            info!("Upper resting order has negative position, resetting");
-            self.reset_resting_order(false);
+        for (i, order) in self.ask_levels.iter_mut().enumerate() { 
+            order.level = i; 
         }
     }
 
@@ -2121,9 +1973,11 @@ impl MarketMaker {
             sz_decimals,
         );
 
-        let inventory_skew_calculator = input
-            .inventory_skew_config
-            .map(|config| InventorySkewCalculator::new(config));
+        // Note: inventory_skew_calculator is deprecated - skew logic now integrated into multi_level_optimizer
+        // Kept here to avoid breaking MarketMakerInput, but not used in refactored struct
+        if input.inventory_skew_config.is_some() {
+            info!("⚠️  inventory_skew_config provided but deprecated - skew logic now in multi_level_optimizer");
+        }
 
         // Load initial tuning parameters from JSON file if it exists
         // After this, Adam optimizer takes full control of parameter tuning
@@ -2160,45 +2014,105 @@ impl MarketMaker {
         info!("📊 Adaptive Liu-West SV Filter initialized:");
         info!("   Particles: 7000, delta: {}", adaptive_config.delta);
         info!("   Estimating state (h_t) AND parameters (mu, phi, sigma_eta)");
+        
+        // ===== Multi-Level Market Making Initialization =====
+        
+        // Get multi_level_config from input, with proper validation and defaults
+        let multi_level_config = if input.enable_multi_level {
+            if let Some(config) = input.multi_level_config.clone() {
+                config
+            } else {
+                warn!("⚠️  enable_multi_level=true but multi_level_config is None!");
+                warn!("   Using default MultiLevelConfig - this may not match your requirements");
+                warn!("   Recommended: Explicitly provide multi_level_config in MarketMakerInput");
+                MultiLevelConfig::default()
+            }
+        } else {
+            // Single-level mode: Use default config with 1 level
+            // WARNING: Single-level mode is largely untested with new framework
+            warn!("⚠️  Single-level mode enabled (multi_level_config not provided)");
+            warn!("   This mode is UNTESTED with the new multi-level framework!");
+            warn!("   Recommended: Use multi-level with max_levels=1 instead");
+            MultiLevelConfig::default()
+        };
+        
+        // Extract max_levels from config for component initialization
+        let max_levels = multi_level_config.max_levels;
+        
+        // Initialize Hawkes fill model with the configured number of levels
+        let hawkes_model = Arc::new(RwLock::new(HawkesFillModel::new(max_levels)));
+        
+        // Initialize multi-level optimizer with the configuration
+        let multi_level_optimizer = MultiLevelOptimizer::new(multi_level_config.clone());
+        
+        // Initialize robust control configuration
+        // Ensure robust_config.enabled matches input.enable_robust_control
+        let mut robust_config = input.robust_config.unwrap_or_default();
+        robust_config.enabled = input.enable_robust_control;
+        
+        // Log initialization status for multi-level market making
+        if input.enable_multi_level {
+            info!("🎯 Multi-level market making ENABLED");
+            info!("   Levels: {}", max_levels);
+            info!("   Total size per side: {}", multi_level_config.total_size_per_side);
+            info!("   Level spacing: {} bps", multi_level_config.level_spacing_bps);
+            info!("   Min profitable spread: {} bps", multi_level_config.min_profitable_spread_bps);
+        } else {
+            info!("📌 Single-level mode (max_levels={})", max_levels);
+            warn!("   Note: Single-level mode uses default config and may not be optimal");
+        }
+        
+        // Log initialization status for robust control
+        if input.enable_robust_control {
+            info!("🛡️  Robust control ENABLED");
+            info!("   Robustness level: {:.1}%", robust_config.robustness_level * 100.0);
+            info!("   Confidence level: {:.1}%", robust_config.confidence_level * 100.0);
+            info!("   Uncertainty bounds will be applied to drift, volatility, and spreads");
+        } else {
+            info!("📊 Robust control DISABLED (using nominal parameters without uncertainty bounds)");
+        }
 
         Ok(MarketMaker {
+            // ===== Core Configuration =====
             asset: input.asset,
-            target_liquidity: input.target_liquidity,
-            half_spread: input.half_spread, // Kept for backward compatibility
-            reprice_threshold_ratio: input.reprice_threshold_ratio,
-            max_absolute_position_size: input.max_absolute_position_size,
             tick_lot_validator,
-            lower_resting: MarketMakerRestingOrder {
-                oid: 0,
-                position: 0.0,
-                price: -1.0,
-            },
-            upper_resting: MarketMakerRestingOrder {
-                oid: 0,
-                position: 0.0,
-                price: -1.0,
-            },
-            cur_position: 0.0,
-            latest_mid_price: -1.0,
+            max_absolute_position_size: input.max_absolute_position_size,
+            
+            // ===== Exchange Clients =====
             info_client,
             exchange_client,
             user_address,
-            inventory_skew_calculator,
+            
+            // ===== Real-Time State =====
+            cur_position: 0.0,
+            latest_mid_price: -1.0,
             latest_book: None,
-            latest_book_analysis: None,
-            state_vector: StateVector::new(),
-            control_vector: ControlVector::symmetric(input.half_spread as f64), // Initial control, will be recalculated dynamically
-            hjb_components: HJBComponents::new(),
-            value_function: ValueFunction::new(0.01, 86400.0), // φ=0.01, T=24h
-            tuning_params: Arc::new(RwLock::new(initial_params)),
-            adam_optimizer: Arc::new(RwLock::new(AdamOptimizerState::default())),
-            trading_enabled: Arc::new(RwLock::new(false)), // Start with trading disabled until optimizer validates performance
-            enable_trading_gap_threshold_percent: input.enable_trading_gap_threshold_percent,
-            gradient_accumulator: Arc::new(RwLock::new(vec![0.0; 7])), // 7 parameters
-            gradient_count: Arc::new(RwLock::new(0)),
-            message_counter: Arc::new(RwLock::new(0)),
+            state_vector: StateVector::new(),  // Initialized with defaults, updated on first AllMids message
+            
+            // ===== Advanced Models =====
+            particle_filter,  // Liu-West adaptive filter for stochastic volatility
             online_adverse_selection_model: Arc::new(RwLock::new(OnlineAdverseSelectionModel::default())),
-            particle_filter,
+            
+            // ===== Multi-Level Optimizer & Components =====
+            multi_level_optimizer,  // Contains config, HJB logic, level sizing
+            hawkes_model,           // Fill rate estimation with self-excitation
+            robust_config,          // Uncertainty sets and robustness parameters
+            current_uncertainty: ParameterUncertainty::default(),  // Updated by particle filter each tick
+            
+            // ===== Resting Order State (Multi-Level) =====
+            bid_levels: Vec::with_capacity(max_levels),  // Initialize empty, will be populated on first quote
+            ask_levels: Vec::with_capacity(max_levels),  // Initialize empty, will be populated on first quote
+            
+            // ===== Adam Self-Tuning System =====
+            tuning_params: Arc::new(RwLock::new(initial_params)),  // Meta-parameters for heuristic adjustments
+            adam_optimizer: Arc::new(RwLock::new(AdamOptimizerState::default())),  // Adaptive moment estimation
+            gradient_accumulator: Arc::new(RwLock::new(vec![0.0; 8])),  // 8 parameters (updated from 7)
+            gradient_count: Arc::new(RwLock::new(0)),  // Reset after each Adam update
+            message_counter: Arc::new(RwLock::new(0)),  // For gradient sampling (every Nth message)
+            
+            // ===== Trading Control =====
+            trading_enabled: Arc::new(RwLock::new(false)),  // Start disabled, enabled when optimizer validates performance
+            enable_trading_gap_threshold_percent: input.enable_trading_gap_threshold_percent,
         })
     }
 
@@ -2226,19 +2140,17 @@ impl MarketMaker {
             .await
             .unwrap();
 
-        // Subscribe to L2Book if inventory skewing is enabled
-        if self.inventory_skew_calculator.is_some() {
-            info!("Subscribing to L2 book data for inventory skewing");
-            self.info_client
-                .subscribe(
-                    Subscription::L2Book {
-                        coin: self.asset.clone(),
-                    },
-                    sender.clone(),
-                )
-                .await
-                .unwrap();
-        }
+        // Subscribe to L2Book for market data
+        info!("Subscribing to L2 book data");
+        self.info_client
+            .subscribe(
+                Subscription::L2Book {
+                    coin: self.asset.clone(),
+                },
+                sender.clone(),
+            )
+            .await
+            .unwrap();
 
         // Subscribe to Trades data for trade flow analysis
         info!("Subscribing to Trades data for trade flow analysis");
@@ -2252,14 +2164,18 @@ impl MarketMaker {
             .await
             .unwrap();
 
+        /* DEPRECATED: Background optimization using old HJBComponents
         // Initialize background optimization loop timer
         let mut last_optimization_time = std::time::Instant::now();
         let optimization_interval = std::time::Duration::from_secs(60);
         info!("Background HJB optimization with Adam tuning enabled: will run every {} seconds", optimization_interval.as_secs());
         info!("Parameter tuning is now fully autonomous via Adam optimizer");
         info!("To override: stop bot, edit tuning_params.json, restart bot");
+        */
 
         loop {
+            /* DEPRECATED: Background optimization using old HJBComponents
+            // This needs to be refactored for the new MultiLevelOptimizer approach
             // Check if it's time to run background optimization
             if last_optimization_time.elapsed() >= optimization_interval {
                 info!("Spawning background HJB optimization task...");
@@ -2295,6 +2211,7 @@ impl MarketMaker {
                 
                 last_optimization_time = std::time::Instant::now();
             }
+            */ // End of deprecated background optimization block
 
             tokio::select! {
                 // Check for shutdown signal
@@ -2317,15 +2234,6 @@ impl MarketMaker {
                 Message::L2Book(l2_book) => {
                     // Update our order book state
                     if let Some(book) = OrderBook::from_l2_data(&l2_book.data) {
-                        // Analyze the book if we have a skew calculator
-                        if let Some(calculator) = &self.inventory_skew_calculator {
-                            let depth_levels = calculator.config.depth_analysis_levels;
-                            if let Some(analysis) = book.analyze(depth_levels) {
-                                // Optionally log book stats (can be disabled for performance)
-                                // book.log_stats(&analysis);
-                                self.latest_book_analysis = Some(analysis);
-                            }
-                        }
                         self.latest_book = Some(book);
                         
                         // Update state vector with new book data
@@ -2368,6 +2276,10 @@ impl MarketMaker {
                         // ============================================
                         // GRADIENT ACCUMULATION FOR STABLE ADAM OPTIMIZER
                         // ============================================
+                        /* DEPRECATED: Old gradient accumulation for Adam optimizer
+                        // This used HJBComponents which has been replaced by MultiLevelOptimizer
+                        // TODO: Implement new gradient-based tuning for MultiLevelOptimizer if needed
+                        
                         // Sample every 10th AllMids message to balance CPU usage with gradient quality
                         // This provides ~6 gradient samples per minute (assuming ~1 AllMids/second)
                         // Over 60 seconds, this accumulates ~60 gradients for stable averaging
@@ -2377,112 +2289,10 @@ impl MarketMaker {
                             let sample_interval = 10; // Accumulate gradient every 10th message
                             
                             if *counter % sample_interval == 0 {
-                                
-                                // --- 1. CLONE ALL DATA NEEDED for the task ---
-                                // These clones are cheap (Arc/simple f64s)
-                                let state_vector_clone = self.state_vector.clone();
-                                let hjb_clone = self.hjb_components.clone();
-                                let value_fn_clone = self.value_function.clone();
-                                let max_pos = self.max_absolute_position_size;
-                                let tuning_params_clone = Arc::clone(&self.tuning_params);
-                                let gradient_accumulator_clone = Arc::clone(&self.gradient_accumulator);
-                                let gradient_count_clone = Arc::clone(&self.gradient_count);
-
-                                // --- 2. SPAWN BLOCKING TASK ---
-                                tokio::task::spawn_blocking(move || {
-                                    // This closure now runs on a separate thread
-                                    // We've moved the logic from calculate_gradient_snapshot here
-                                    
-                                    let base_total_spread_bps = (state_vector_clone.market_spread_bps).max(12.0);
-                                    let base_half_spread_bps = base_total_spread_bps / 2.0;
-
-                                    // 1. Calculate optimal control
-                                    let optimal_control = hjb_clone.optimize_control(
-                                        &state_vector_clone,
-                                        &value_fn_clone,
-                                        base_half_spread_bps,
-                                    );
-                                    
-                                    // 2. Get unconstrained params
-                                    // We read() ONCE inside the task for consistency
-                                    let original_params_phi = tuning_params_clone.read().unwrap().clone();
-                                    let constrained_params = original_params_phi.get_constrained();
-
-                                    // 3. Calculate heuristic control
-                                    let mut heuristic_control = ControlVector::symmetric(base_half_spread_bps);
-                                    heuristic_control.apply_state_adjustments(
-                                        &state_vector_clone,
-                                        base_half_spread_bps,
-                                        max_pos,
-                                        &constrained_params,
-                                        &hjb_clone,
-                                    );
-
-                                    // 4. Calculate loss
-                                    let bid_gap = optimal_control.bid_offset_bps - heuristic_control.bid_offset_bps;
-                                    let ask_gap = optimal_control.ask_offset_bps - heuristic_control.ask_offset_bps;
-                                    let current_loss = bid_gap.powi(2) + ask_gap.powi(2);
-                                    let control_gap_threshold = constrained_params.control_gap_threshold;
-
-                                    if current_loss <= control_gap_threshold {
-                                        return; // No gradient to accumulate
-                                    }
-
-                                    // --- 5. Calculate numerical gradient ---
-                                    // (This is the heavy part)
-                                    let mut gradient_vector: Vec<f64> = vec![0.0; 7];
-                                    let nudge_amount = 0.001;
-                                    
-                                    for i in 0..7 {
-                                        let mut nudged_params_phi = original_params_phi.clone();
-                                        match i {
-                                            0 => nudged_params_phi.skew_adjustment_factor_phi += nudge_amount,
-                                            1 => nudged_params_phi.adverse_selection_adjustment_factor_phi += nudge_amount,
-                                            2 => nudged_params_phi.adverse_selection_lambda_phi += nudge_amount,
-                                            3 => nudged_params_phi.inventory_urgency_threshold_phi += nudge_amount,
-                                            4 => nudged_params_phi.liquidation_rate_multiplier_phi += nudge_amount,
-                                            5 => nudged_params_phi.min_spread_base_ratio_phi += nudge_amount,
-                                            6 => nudged_params_phi.adverse_selection_spread_scale_phi += nudge_amount,
-                                            _ => {}
-                                        }
-                                        
-                                        let nudged_params_theta = nudged_params_phi.get_constrained();
-                                        
-                                        let mut nudged_control = ControlVector::symmetric(base_half_spread_bps);
-                                        nudged_control.apply_state_adjustments(
-                                            &state_vector_clone,
-                                            base_half_spread_bps,
-                                            max_pos,
-                                            &nudged_params_theta,
-                                            &hjb_clone,
-                                        );
-                                        
-                                        let nudged_bid_gap = optimal_control.bid_offset_bps - nudged_control.bid_offset_bps;
-                                        let nudged_ask_gap = optimal_control.ask_offset_bps - nudged_control.ask_offset_bps;
-                                        let nudged_loss = nudged_bid_gap.powi(2) + nudged_ask_gap.powi(2);
-                                        
-                                        gradient_vector[i] = (nudged_loss - current_loss) / nudge_amount;
-                                    }
-
-                                    // --- 6. Accumulate the result ---
-                                    // Lock at the very end
-                                    let mut accumulator = gradient_accumulator_clone.write().unwrap();
-                                    let mut count = gradient_count_clone.write().unwrap();
-                                    
-                                    for i in 0..7 {
-                                        accumulator[i] += gradient_vector[i];
-                                    }
-                                    *count += 1;
-                                    
-                                    // Log accumulation progress every 10 gradients
-                                    if *count % 10 == 0 {
-                                        let gradient_norm: f64 = gradient_vector.iter().map(|g| g.powi(2)).sum::<f64>().sqrt();
-                                        info!("Gradient accumulation: {}/60s window, current_norm={:.4}", *count, gradient_norm);
-                                    }
-
-                                }); // End of spawn_blocking
+                                // Gradient calculation code removed - needs refactoring for MultiLevelOptimizer
                             }
                         }
+                        */
                         
                         // Check to see if we need to cancel or place any new orders
                         self.potentially_update().await;
@@ -2498,48 +2308,89 @@ impl MarketMaker {
                     if self.latest_mid_price < 0.0 {
                         continue;
                     }
+                    
                     let user_events = user_events.data;
                     if let UserData::Fills(fills) = user_events {
+                        let mut position_changed = false;
+                        let mut hawkes_needs_update = false;
+                        let current_time = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs_f64();
+
                         for fill in fills {
-                            let amount: f64 = fill.sz.parse().unwrap();
-                            // Update our resting positions whenever we see a fill
-                            if fill.side.eq("B") {
+                            let amount: f64 = fill.sz.parse().unwrap_or(0.0);
+                            if amount < EPSILON { 
+                                continue; 
+                            }
+
+                            position_changed = true;
+                            let is_bid_fill = fill.side == "B";
+                            let filled_oid = fill.oid;
+                            let mut filled_level: Option<usize> = None;
+
+                            if is_bid_fill {
+                                // Our Bid was filled (we bought)
                                 self.cur_position += amount;
-                                
-                                // Check if this fill corresponds to our tracked lower resting order
-                                if self.lower_resting.oid == fill.oid {
-                                    self.lower_resting.position -= amount;
-                                    // If the order is fully filled, reset it
-                                    if self.lower_resting.position <= EPSILON {
-                                        info!("Lower resting order fully filled, resetting");
-                                        self.reset_resting_order(true);
+                                info!("Fill: bought {} {} (oid: {})", amount, self.asset.clone(), filled_oid);
+
+                                // Find and update the specific resting bid
+                                if let Some(index) = self.bid_levels.iter().position(|o| o.oid == filled_oid) {
+                                    filled_level = Some(self.bid_levels[index].level); // Get level before modifying/removing
+                                    self.bid_levels[index].position -= amount;
+                                    
+                                    if self.bid_levels[index].position < EPSILON {
+                                        info!("Resting bid oid {} (L{}) fully filled, removing.", filled_oid, filled_level.unwrap_or(99) + 1);
+                                        self.bid_levels.remove(index);
+                                    } else {
+                                        info!("Resting bid oid {} (L{}) partially filled, remaining: {}", filled_oid, filled_level.unwrap_or(99) + 1, self.bid_levels[index].position);
                                     }
+                                } else {
+                                    warn!("Received fill for untracked bid oid: {}", filled_oid);
                                 }
-                                
-                                info!("Fill: bought {amount} {} (oid: {})", self.asset.clone(), fill.oid);
                             } else {
+                                // Our Ask was filled (we sold)
                                 self.cur_position -= amount;
-                                
-                                // Check if this fill corresponds to our tracked upper resting order
-                                if self.upper_resting.oid == fill.oid {
-                                    self.upper_resting.position -= amount;
-                                    // If the order is fully filled, reset it
-                                    if self.upper_resting.position <= EPSILON {
-                                        info!("Upper resting order fully filled, resetting");
-                                        self.reset_resting_order(false);
+                                info!("Fill: sold {} {} (oid: {})", amount, self.asset.clone(), filled_oid);
+
+                                // Find and update the specific resting ask
+                                if let Some(index) = self.ask_levels.iter().position(|o| o.oid == filled_oid) {
+                                    filled_level = Some(self.ask_levels[index].level);
+                                    self.ask_levels[index].position -= amount;
+                                    
+                                    if self.ask_levels[index].position < EPSILON {
+                                        info!("Resting ask oid {} (L{}) fully filled, removing.", filled_oid, filled_level.unwrap_or(99) + 1);
+                                        self.ask_levels.remove(index);
+                                    } else {
+                                        info!("Resting ask oid {} (L{}) partially filled, remaining: {}", filled_oid, filled_level.unwrap_or(99) + 1, self.ask_levels[index].position);
                                     }
+                                } else {
+                                    warn!("Received fill for untracked ask oid: {}", filled_oid);
                                 }
-                                
-                                info!("Fill: sold {amount} {} (oid: {})", self.asset.clone(), fill.oid);
+                            }
+
+                            // Update Hawkes model state IF we identified the level
+                            if let Some(level) = filled_level {
+                                self.hawkes_model.write().unwrap().record_fill(level, is_bid_fill, current_time);
+                                hawkes_needs_update = true; // Signal that quotes might need recalculation
+                                info!("Updated Hawkes model: fill L{}, side {}", level + 1, if is_bid_fill {"BID"} else {"ASK"});
                             }
                         }
+
+                        // Re-assign levels after potential removals
+                        for (i, order) in self.bid_levels.iter_mut().enumerate() { 
+                            order.level = i; 
+                        }
+                        for (i, order) in self.ask_levels.iter_mut().enumerate() { 
+                            order.level = i; 
+                        }
+
+                        // Trigger state update and potentially new quotes if needed
+                        if position_changed || hawkes_needs_update {
+                            self.update_state_vector(); // Update inventory, etc.
+                            self.potentially_update().await; // Re-evaluate multi-level quotes
+                        }
                     }
-                    
-                    // Update state vector with new inventory
-                    self.update_state_vector();
-                    
-                    // Check to see if we need to cancel or place any new orders
-                    self.potentially_update().await;
                 }
                 _ => {
                     panic!("Unsupported message type");
@@ -2661,6 +2512,7 @@ impl MarketMaker {
     /// Place a market order using the SDK's market_open function with slippage protection
     /// This is safer than a pure IOC limit order as it handles slippage properly
     /// Returns the filled amount
+    #[allow(dead_code)]
     async fn place_taker_order(
         &self,
         asset: String,
@@ -2731,41 +2583,35 @@ impl MarketMaker {
     pub async fn shutdown(&mut self) {
         info!("Shutting down market maker, cancelling all open orders and closing position...");
         
-        // Parallelize order cancellations
-        let cancel_lower = async {
-            if self.lower_resting.oid != 0 && self.lower_resting.position > EPSILON {
-                info!("Cancelling lower resting order (oid: {})", self.lower_resting.oid);
-                self.attempt_cancel(self.asset.clone(), self.lower_resting.oid).await
-            } else {
-                false
+        // Collect all OIDs that need to be cancelled
+        let mut total_orders = 0;
+        let mut successful_cancels = 0;
+        
+        for order in &self.bid_levels {
+            if order.oid != 0 && order.position > EPSILON {
+                info!("Cancelling bid level {} (oid: {})", order.level, order.oid);
+                if self.attempt_cancel(self.asset.clone(), order.oid).await {
+                    successful_cancels += 1;
+                }
+                total_orders += 1;
             }
-        };
-
-        let cancel_upper = async {
-            if self.upper_resting.oid != 0 && self.upper_resting.position > EPSILON {
-                info!("Cancelling upper resting order (oid: {})", self.upper_resting.oid);
-                self.attempt_cancel(self.asset.clone(), self.upper_resting.oid).await
-            } else {
-                false
+        }
+        
+        for order in &self.ask_levels {
+            if order.oid != 0 && order.position > EPSILON {
+                info!("Cancelling ask level {} (oid: {})", order.level, order.oid);
+                if self.attempt_cancel(self.asset.clone(), order.oid).await {
+                    successful_cancels += 1;
+                }
+                total_orders += 1;
             }
-        };
-
-        let (lower_cancelled, upper_cancelled) = tokio::join!(cancel_lower, cancel_upper);
-
-        if lower_cancelled {
-            info!("Successfully cancelled lower resting order");
-        } else if self.lower_resting.oid != 0 && self.lower_resting.position > EPSILON {
-            info!("Lower resting order was already filled or cancelled");
         }
-
-        if upper_cancelled {
-            info!("Successfully cancelled upper resting order");
-        } else if self.upper_resting.oid != 0 && self.upper_resting.position > EPSILON {
-            info!("Upper resting order was already filled or cancelled");
-        }
-
-        self.reset_resting_order(true);
-        self.reset_resting_order(false);
+        
+        info!("Successfully cancelled {}/{} orders", successful_cancels, total_orders);
+        
+        // Clear all resting orders
+        self.bid_levels.clear();
+        self.ask_levels.clear();
         
         // Close any existing position
         if self.cur_position.abs() > EPSILON {
@@ -2851,243 +2697,484 @@ impl MarketMaker {
         }
     }
 
+    /// Main logic loop: calculate multi-level targets and reconcile orders.
     async fn potentially_update(&mut self) {
-        // Clean up any invalid resting orders first
+        // --- 0. Pre-checks ---
         self.cleanup_invalid_resting_orders();
-        
-        // Calculate optimal control based on current state
-        self.calculate_optimal_control();
-        
-        // Calculate dynamic reprice threshold based on current *market-based* spread
-        // CRITICAL: Must use same .max(12.0) as calculate_optimal_control()
-        let dynamic_base_spread = (self.state_vector.market_spread_bps).max(12.0);
-        let dynamic_max_bps_diff = (dynamic_base_spread * self.reprice_threshold_ratio) as u16;
-        
-        info!(
-            "Reprice threshold: {} bps ({}% of {} bps market spread)",
-            dynamic_max_bps_diff,
-            self.reprice_threshold_ratio * 100.0,
-            dynamic_base_spread
-        );
-        
-        // ============================================
-        // CHECK IF TRADING IS ENABLED
-        // ============================================
-        
+
         if !*self.trading_enabled.read().unwrap() {
-            info!(
-                "⏳ Trading disabled: Waiting for performance gap to close below {:.1}%. Skipping order placement/cancellation.",
-                self.enable_trading_gap_threshold_percent
-            );
-            // CRITICAL: Do NOT return here. We still need state updates to happen.
-            // Just skip the order management block below.
+            info!("⏳ Trading disabled (performance gap). Skipping order management.");
             return;
         }
-        
-        // ============================================
-        // ORDER MANAGEMENT (only executed if trading is enabled)
-        // ============================================
-        
-        // Execute taker orders if the control vector signals urgency
-        // Taker sell: liquidate long position by hitting bids with market orders
-        if self.control_vector.taker_sell_rate > EPSILON {
-            let taker_size = self.tick_lot_validator.round_size(
-                self.control_vector.taker_sell_rate.min(self.cur_position.max(0.0)),
-                false,
-            );
+        if self.latest_mid_price <= 0.0 {
+            warn!("Mid price not available. Skipping order management.");
+            return;
+        }
+
+        // --- 1. Calculate Target Quotes (Multi-Level) ---
+        // This now returns Vec<(price, size)> using the new framework
+        let (target_bids, target_asks) = self.calculate_multi_level_targets();
+
+        // --- 2. Reconcile Existing Orders ---
+        let mut orders_to_cancel: Vec<u64> = Vec::new();
+        let mut bids_to_place = target_bids.clone();
+        let mut asks_to_place = target_asks.clone();
+
+        // Check existing bids against targets
+        let mut remaining_bids: Vec<MarketMakerRestingOrder> = Vec::new();
+        for order in self.bid_levels.drain(..) { // Drain to consume old list
+            if order.oid == 0 || order.position < EPSILON { 
+                continue; 
+            }
+
+            // Try to find a matching target (price & size within tolerance)
+            if let Some(target_idx) = bids_to_place.iter().position(|(p, s)| {
+                (p - order.price).abs() < EPSILON && (s - order.position).abs() < EPSILON * 0.1
+            }) {
+                // Match found! Keep this resting order, remove from placement list.
+                remaining_bids.push(order);
+                bids_to_place.remove(target_idx);
+            } else {
+                // No match, or price/size is wrong. Cancel it.
+                orders_to_cancel.push(order.oid);
+            }
+        }
+        self.bid_levels = remaining_bids;
+
+        // Check existing asks against targets (similar logic)
+        let mut remaining_asks: Vec<MarketMakerRestingOrder> = Vec::new();
+        for order in self.ask_levels.drain(..) {
+            if order.oid == 0 || order.position < EPSILON { 
+                continue; 
+            }
             
-            if taker_size > EPSILON {
-                // Note: price is provided for logging but place_taker_order uses market_open
-                // which fetches current market price and applies slippage automatically
-                let reference_price = if let Some(book) = &self.latest_book {
-                    book.best_bid().unwrap_or(self.latest_mid_price)
-                } else {
-                    self.latest_mid_price
-                };
-                
-                info!(
-                    "🔴 TAKER SELL triggered: rate={:.4}, size={}, ref_price={} (position={})",
-                    self.control_vector.taker_sell_rate, taker_size, reference_price, self.cur_position
-                );
-                
-                let filled = self.place_taker_order(
-                    self.asset.clone(),
-                    taker_size,
-                    reference_price, // Not used, just for logging
-                    false, // sell
-                ).await;
-                
-                if filled > EPSILON {
-                    // Position will be updated by Message::User fill event (single source of truth)
-                    info!("Market sell executed: {} filled, position will update via fill event", filled);
-                }
+            if let Some(target_idx) = asks_to_place.iter().position(|(p, s)| {
+                (p - order.price).abs() < EPSILON && (s - order.position).abs() < EPSILON * 0.1
+            }) {
+                remaining_asks.push(order);
+                asks_to_place.remove(target_idx);
+            } else {
+                orders_to_cancel.push(order.oid);
+            }
+        }
+        self.ask_levels = remaining_asks;
+
+        // --- 3. Execute Cancellations ---
+        if !orders_to_cancel.is_empty() {
+            info!("Cancelling {} orders: {:?}", orders_to_cancel.len(), orders_to_cancel);
+            
+            // Execute cancellations sequentially (tokio doesn't have join_all directly)
+            for oid in orders_to_cancel {
+                self.attempt_cancel(self.asset.clone(), oid).await;
+            }
+            // Important: Don't remove from self.bid/ask_levels here, wait for confirmation or fill event
+        }
+
+        // --- 4. Execute Placements ---
+        let mut placed_orders: Vec<(bool, usize, f64, f64, f64, u64)> = Vec::new(); // (is_bid, level, price, size, placed_size, oid)
+
+        // Place new bids (assign level based on order in sorted list)
+        for (level, (price, size)) in bids_to_place.iter().enumerate() {
+            if *size >= EPSILON && *price > 0.0 {
+                info!("Placing L{} Bid: {} @ {}", level + 1, size, price); // L1 is tightest
+                let (placed_size, oid) = self.place_order(self.asset.clone(), *size, *price, true).await;
+                placed_orders.push((true, level, *price, *size, placed_size, oid));
             }
         }
         
-        // Taker buy: liquidate short position by lifting asks with market orders
-        if self.control_vector.taker_buy_rate > EPSILON {
-            let taker_size = self.tick_lot_validator.round_size(
-                self.control_vector.taker_buy_rate.min((-self.cur_position).max(0.0)),
-                false,
-            );
-            
-            if taker_size > EPSILON {
-                // Note: price is provided for logging but place_taker_order uses market_open
-                // which fetches current market price and applies slippage automatically
-                let reference_price = if let Some(book) = &self.latest_book {
-                    book.best_ask().unwrap_or(self.latest_mid_price)
-                } else {
-                    self.latest_mid_price
-                };
-                
-                info!(
-                    "🔵 TAKER BUY triggered: rate={:.4}, size={}, ref_price={} (position={})",
-                    self.control_vector.taker_buy_rate, taker_size, reference_price, self.cur_position
-                );
-                
-                let filled = self.place_taker_order(
-                    self.asset.clone(),
-                    taker_size,
-                    reference_price, // Not used, just for logging
-                    true, // buy
-                ).await;
-                
-                if filled > EPSILON {
-                    // Position will be updated by Message::User fill event (single source of truth)
-                    info!("Market buy executed: {} filled, position will update via fill event", filled);
-                }
+        // Place new asks (assign level)
+        for (level, (price, size)) in asks_to_place.iter().enumerate() {
+            if *size >= EPSILON && *price > 0.0 {
+                info!("Placing L{} Ask: {} @ {}", level + 1, size, price);
+                let (placed_size, oid) = self.place_order(self.asset.clone(), *size, *price, false).await;
+                placed_orders.push((false, level, *price, *size, placed_size, oid));
             }
         }
-        
-        // Get the optimal quote prices directly from the ControlVector
-        let (lower_price, upper_price) = 
-            self.control_vector.calculate_quote_prices(self.latest_mid_price);
-        
-        // Round the prices using your validator
-        let mut lower_price = self.tick_lot_validator.round_price(lower_price, false); // Round down for buy
-        let mut upper_price = self.tick_lot_validator.round_price(upper_price, true);  // Round up for sell
 
-        // Rounding optimistically to make our market tighter might cause a weird edge case, so account for that
-        if (lower_price - upper_price).abs() < EPSILON {
-            lower_price = self.tick_lot_validator.round_price(lower_price, true);
-            upper_price = self.tick_lot_validator.round_price(upper_price, false);
+        // --- 5. Update Local Resting Order State ---
+        for (is_bid, level, price, _original_size, placed_size, oid) in placed_orders {
+            if oid != 0 && placed_size > EPSILON {
+                let new_order = MarketMakerRestingOrder { oid, position: placed_size, price, level };
+                if is_bid {
+                    self.bid_levels.push(new_order);
+                } else {
+                    self.ask_levels.push(new_order);
+                }
+            } else if oid != 0 {
+                // Placed but size is zero? Log warning.
+                warn!("Placed order oid {} resulted in zero size.", oid);
+            }
+            // If oid is 0, placement failed, already logged in place_order
         }
 
-        // Determine amounts we can put on the book without exceeding the max absolute position size
-        let lower_order_amount = self.tick_lot_validator.round_size(
-            (self.max_absolute_position_size - self.cur_position)
-                .min(self.target_liquidity)
-                .max(0.0),
-            false, // Round down for size
-        );
+        // Re-sort just in case (important for level assignment consistency)
+        self.bid_levels.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap());
+        self.ask_levels.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap());
 
-        let upper_order_amount = self.tick_lot_validator.round_size(
-            (self.max_absolute_position_size + self.cur_position)
-                .min(self.target_liquidity)
-                .max(0.0),
-            false, // Round down for size
-        );
+        // Update levels after sorting (Level 0 = best price)
+        for (i, order) in self.bid_levels.iter_mut().enumerate() { 
+            order.level = i; 
+        }
+        for (i, order) in self.ask_levels.iter_mut().enumerate() { 
+            order.level = i; 
+        }
 
-        // Determine if we need to cancel the resting order and put a new order up due to deviation
-        // Use the dynamic reprice threshold calculated above
-        let lower_change = (lower_order_amount - self.lower_resting.position).abs() > EPSILON
-            || bps_diff(lower_price, self.lower_resting.price) > dynamic_max_bps_diff;
-        let upper_change = (upper_order_amount - self.upper_resting.position).abs() > EPSILON
-            || bps_diff(upper_price, self.upper_resting.price) > dynamic_max_bps_diff;
+        info!("Current Resting Bids: {} orders", self.bid_levels.len());
+        info!("Current Resting Asks: {} orders", self.ask_levels.len());
 
-        // Parallelize order cancellations when both need to be cancelled
-        let (lower_cancelled, upper_cancelled) = if (self.lower_resting.oid != 0 && self.lower_resting.position > EPSILON && lower_change)
-            && (self.upper_resting.oid != 0 && self.upper_resting.position > EPSILON && upper_change)
-        {
-            // Both need cancelling - parallelize
-            let lower_oid = self.lower_resting.oid;
-            let upper_oid = self.upper_resting.oid;
-            let asset = self.asset.clone();
-            
-            let cancel_lower_fut = self.attempt_cancel(asset.clone(), lower_oid);
-            let cancel_upper_fut = self.attempt_cancel(asset.clone(), upper_oid);
-            
-            let (lower_result, upper_result) = tokio::join!(cancel_lower_fut, cancel_upper_fut);
-            
-            if lower_result {
-                info!("Cancelled buy order: {:?}", self.lower_resting);
-            } else {
-                info!("Cancel failed for buy order (oid: {}) - treating as filled", lower_oid);
-                self.reset_resting_order(true);
-            }
-            
-            if upper_result {
-                info!("Cancelled sell order: {:?}", self.upper_resting);
-            } else {
-                info!("Cancel failed for sell order (oid: {}) - treating as filled", upper_oid);
-                self.reset_resting_order(false);
-            }
-            
-            (lower_result || !lower_result, upper_result || !upper_result) // Both treated as cancelled
-        } else {
-            // Only one or neither needs cancelling - handle sequentially
-            let lower_cancelled = if self.lower_resting.oid != 0 && self.lower_resting.position > EPSILON && lower_change {
-                if self.attempt_cancel(self.asset.clone(), self.lower_resting.oid).await {
-                    info!("Cancelled buy order: {:?}", self.lower_resting);
-                    true
+        // --- 6. Handle Taker Logic (If needed based on optimizer output) ---
+        // TODO: Implement taker logic based on multi_level_control rates
+        // This requires storing the MultiLevelControl output from calculate_multi_level_targets
+        // Example:
+        // let control = self.multi_level_control.as_ref().unwrap();
+        // if control.taker_sell_rate > EPSILON { ... }
+        // if control.taker_buy_rate > EPSILON { ... }
+    }
+
+    /// **ADAM UPDATE TASK (Called every 60 seconds)**
+    ///
+    /// Applies the Adam optimizer update using gradients accumulated by the
+    /// `accumulate_gradient_snapshot` task. Also handles trading enablement logic.
+    /// Spawns a blocking task for the computation.
+    pub fn run_adam_update_and_enablement_check(&self) -> tokio::task::JoinHandle<Option<f64>> { // Returns Option<value_gap_percent>
+        // Clone Arcs needed for the background task
+        let tuning_params_arc = Arc::clone(&self.tuning_params);
+        let adam_optimizer_arc = Arc::clone(&self.adam_optimizer);
+        let gradient_accumulator_arc = Arc::clone(&self.gradient_accumulator);
+        let gradient_count_arc = Arc::clone(&self.gradient_count);
+        let trading_enabled_arc = Arc::clone(&self.trading_enabled);
+        let enable_trading_gap_threshold = self.enable_trading_gap_threshold_percent; // Copy f64
+
+        // --- HACK/TODO: Value Gap Calculation ---
+        // Need to pass necessary state snapshots for approximate value calculation
+        // This requires capturing state during gradient accumulation or re-running parts.
+        // For now, we'll use a placeholder/simplified gap based on control loss.
+        // let state_vector_snapshot = self.state_vector.clone(); // Capture state *now*
+        // let multi_level_optimizer_config = self.multi_level_optimizer.config.clone(); // Capture config
+        // let hawkes_snapshot = self.hawkes_model.read().unwrap().clone(); // Capture Hawkes state
+        // let uncertainty_snapshot = self.current_uncertainty; // Capture uncertainty
+
+        tokio::task::spawn_blocking(move || {
+            let mut final_value_gap_percent: Option<f64> = None;
+
+            // --- 1. Get Accumulated Gradients ---
+            let (avg_gradient_vector, num_samples) = {
+                let accumulator = gradient_accumulator_arc.read().unwrap();
+                let count = *gradient_count_arc.read().unwrap();
+                if count > 0 {
+                    let avg_grad = accumulator.iter().map(|g| g / count as f64).collect();
+                    (avg_grad, count)
                 } else {
-                    info!("Cancel failed for buy order (oid: {}) - treating as filled", self.lower_resting.oid);
-                    self.reset_resting_order(true);
-                    true
+                    (vec![0.0; 8], 0) // No gradients accumulated (8 parameters)
                 }
-            } else {
-                false
             };
 
-            let upper_cancelled = if self.upper_resting.oid != 0 && self.upper_resting.position > EPSILON && upper_change {
-                if self.attempt_cancel(self.asset.clone(), self.upper_resting.oid).await {
-                    info!("Cancelled sell order: {:?}", self.upper_resting);
-                    true
-                } else {
-                    info!("Cancel failed for sell order (oid: {}) - treating as filled", self.upper_resting.oid);
-                    self.reset_resting_order(false);
-                    true
+            // --- 2. Apply Adam Update (if gradients exist) ---
+            if num_samples > 0 {
+                info!("Applying Adam update based on {} accumulated gradient samples.", num_samples);
+                let original_params_phi = tuning_params_arc.read().unwrap().clone(); // Read locked value
+                let original_params_theta = original_params_phi.get_constrained();
+
+                // a) Clipping
+                let max_individual_norm = 100.0;
+                let max_global_norm = 50.0;
+                let mut clipped_gradient_vector = avg_gradient_vector.clone();
+                
+                // Individual clipping
+                for g in clipped_gradient_vector.iter_mut() {
+                    if g.abs() > max_individual_norm {
+                        *g = g.signum() * max_individual_norm;
+                    }
                 }
+                
+                // Global norm clipping
+                let global_norm: f64 = clipped_gradient_vector.iter().map(|g| g.powi(2)).sum::<f64>().sqrt();
+                if global_norm > max_global_norm {
+                    let scale_factor = max_global_norm / global_norm;
+                    for g in clipped_gradient_vector.iter_mut() {
+                        *g *= scale_factor;
+                    }
+                }
+                
+                let clipped_gradient_norm: f64 = clipped_gradient_vector.iter().map(|g| g.powi(2)).sum::<f64>().sqrt();
+
+                // b) Compute Adam Update (with warmup)
+                let updates = {
+                    let mut optimizer_state = adam_optimizer_arc.write().unwrap(); // Lock for update
+                    let warmup_steps = 3;
+                    let current_step = optimizer_state.t + 1;
+                    let warmup_factor = if current_step <= warmup_steps {
+                        (current_step as f64) / (warmup_steps as f64)
+                    } else { 1.0 };
+
+                    let original_alpha = optimizer_state.alpha;
+                    optimizer_state.alpha *= warmup_factor; // Apply warmup
+
+                    let updates = optimizer_state.compute_update(&clipped_gradient_vector);
+
+                    optimizer_state.alpha = original_alpha; // Restore alpha
+                    updates // Return the computed updates
+                }; // Optimizer lock released here
+
+                // c) Apply Updates to Parameters
+                let mut updated_params_phi = original_params_phi.clone();
+                updated_params_phi.skew_adjustment_factor_phi -= updates[0];
+                updated_params_phi.adverse_selection_adjustment_factor_phi -= updates[1];
+                updated_params_phi.adverse_selection_lambda_phi -= updates[2];
+                updated_params_phi.inventory_urgency_threshold_phi -= updates[3];
+                updated_params_phi.liquidation_rate_multiplier_phi -= updates[4];
+                updated_params_phi.min_spread_base_ratio_phi -= updates[5];
+                updated_params_phi.adverse_selection_spread_scale_phi -= updates[6]; // Added 7th parameter
+                updated_params_phi.control_gap_threshold_phi -= updates[7]; // Moved to index 7
+
+                // d) Store Updated Parameters & Save
+                {
+                    let mut params_w = tuning_params_arc.write().unwrap(); // Lock for writing
+                    *params_w = updated_params_phi.clone();
+                } // Lock released
+
+                if let Err(e) = updated_params_phi.to_json_file("tuning_params.json") {
+                    error!("Failed to save updated tuning params: {}", e);
+                } else {
+                    info!("Updated tuning parameters saved.");
+                }
+
+                // e) Logging (Parameter changes)
+                let updated_params_theta = updated_params_phi.get_constrained();
+                info!("Parameter Changes Applied. Clipped Grad Norm: {:.4}", clipped_gradient_norm);
+                info!("  skew_adjustment_factor: {:.4} -> {:.4}", 
+                    original_params_theta.skew_adjustment_factor, 
+                    updated_params_theta.skew_adjustment_factor);
+                info!("  adverse_selection_adjustment_factor: {:.4} -> {:.4}", 
+                    original_params_theta.adverse_selection_adjustment_factor, 
+                    updated_params_theta.adverse_selection_adjustment_factor);
+                info!("  adverse_selection_lambda: {:.4} -> {:.4}", 
+                    original_params_theta.adverse_selection_lambda, 
+                    updated_params_theta.adverse_selection_lambda);
+                info!("  inventory_urgency_threshold: {:.4} -> {:.4}", 
+                    original_params_theta.inventory_urgency_threshold, 
+                    updated_params_theta.inventory_urgency_threshold);
+                info!("  liquidation_rate_multiplier: {:.4} -> {:.4}", 
+                    original_params_theta.liquidation_rate_multiplier, 
+                    updated_params_theta.liquidation_rate_multiplier);
+                info!("  min_spread_base_ratio: {:.4} -> {:.4}", 
+                    original_params_theta.min_spread_base_ratio, 
+                    updated_params_theta.min_spread_base_ratio);
+                info!("  adverse_selection_spread_scale: {:.4} -> {:.4}", 
+                    original_params_theta.adverse_selection_spread_scale, 
+                    updated_params_theta.adverse_selection_spread_scale);
+                info!("  control_gap_threshold: {:.4} -> {:.4}", 
+                    original_params_theta.control_gap_threshold, 
+                    updated_params_theta.control_gap_threshold);
+
             } else {
-                false
+                info!("No gradients accumulated in the last window. Skipping Adam update.");
+            }
+
+            // --- 3. Reset Gradient Accumulator ---
+            {
+                let mut accumulator = gradient_accumulator_arc.write().unwrap();
+                let mut count = gradient_count_arc.write().unwrap();
+                *accumulator = vec![0.0; 8]; // 8 parameters in TuningParams
+                *count = 0;
+                info!("Gradient accumulator reset for next window.");
+            }
+
+            // --- 4. Trading Enablement Check (Using Control Gap as Proxy for Value Gap) ---
+            // A pragmatic approach: If the average control gap (loss) used for gradient
+            // calculation was consistently low, we enable trading.
+            // TODO: Modify gradient accumulation to also store/average the loss value.
+            let avg_loss_snapshot = 0.0; // Placeholder - fetch actual average loss
+            let loss_threshold_for_enablement = (enable_trading_gap_threshold / 10.0).powi(2); // Example: 15% -> threshold 2.25 bps^2
+
+            if !*trading_enabled_arc.read().unwrap() && num_samples > 0 && avg_loss_snapshot <= loss_threshold_for_enablement {
+                let mut enabled_w = trading_enabled_arc.write().unwrap();
+                *enabled_w = true;
+                info!("✅ Control gap consistently low (avg_loss={:.2} <= {:.2}). ENABLING LIVE TRADING.", avg_loss_snapshot, loss_threshold_for_enablement);
+                final_value_gap_percent = Some(avg_loss_snapshot.sqrt() * 10.0); // Use control gap as proxy %
+            } else if !*trading_enabled_arc.read().unwrap() {
+                info!("⏳ Trading remains disabled. Avg control gap ({:.2}) > threshold ({:.2}) or insufficient samples ({}).", avg_loss_snapshot, loss_threshold_for_enablement, num_samples);
+            }
+
+            // TODO: Implement proper Value Gap calculation if needed for more accurate logging/enablement.
+
+            final_value_gap_percent // Return the approximate gap % if calculated
+        })
+    }
+
+    /// **GRADIENT ACCUMULATION TASK (Called every ~10 AllMids)**
+    ///
+    /// Calculates the gradient of the control gap loss w.r.t tuning parameters
+    /// for a snapshot in time and accumulates it. Spawns a blocking task.
+    #[allow(dead_code)]
+    fn accumulate_gradient_snapshot(&self) {
+        // --- 1. Clone data needed ---
+        // Cheap clones (Arc, f64, small vecs, structs)
+        let state_vector_snapshot = self.state_vector.clone();
+        let particle_filter_arc = Arc::clone(&self.particle_filter); // Need Arc for background task
+        let hawkes_model_snapshot = self.hawkes_model.read().unwrap().clone(); // Clone Hawkes state
+        let tuning_params_arc = Arc::clone(&self.tuning_params);
+        let multi_level_optimizer_config = self.multi_level_optimizer.config().clone(); // Clone config
+        let robust_config_snapshot = self.robust_config.clone();
+        let max_pos = self.max_absolute_position_size;
+        let gradient_accumulator_arc = Arc::clone(&self.gradient_accumulator);
+        let gradient_count_arc = Arc::clone(&self.gradient_count);
+        // TODO: Pass Arc<RwLock<ValueFunction>> if needed, or reconstruct
+
+        // --- 2. Spawn Blocking Task ---
+        tokio::task::spawn_blocking(move || {
+            let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+
+            // --- Inside Blocking Task ---
+
+            // a) Get Uncertainty Snapshot
+            let uncertainty_snapshot = {
+                let pf_lock = particle_filter_arc.read().unwrap();
+                let (mu_std, _, _) = pf_lock.get_parameter_std_devs();
+                let sigma_std = pf_lock.get_volatility_std_dev_bps();
+                ParameterUncertainty::from_particle_filter_stats(mu_std, sigma_std, 0.95)
             };
-            
-            (lower_cancelled, upper_cancelled)
-        };
 
-        // Consider putting a new order up
-        if lower_order_amount > EPSILON && (lower_cancelled || (lower_change && self.lower_resting.oid == 0)) {
-            let (amount_resting, oid) = self
-                .place_order(self.asset.clone(), lower_order_amount, lower_price, true)
-                .await;
+            // b) Define Baseline Params (Read ONCE)
+            let baseline_params_phi = tuning_params_arc.read().unwrap().clone();
+            let baseline_params_theta = baseline_params_phi.get_constrained();
 
-            self.lower_resting.oid = oid;
-            self.lower_resting.position = amount_resting;
-            self.lower_resting.price = lower_price;
-
-            if amount_resting > EPSILON {
-                info!(
-                    "Buy for {amount_resting} {} resting at {lower_price}",
-                    self.asset.clone()
+            // c) Calculate "Optimal" Multi-Level Control (using baseline params)
+            //    Represents the stable target for the current state snapshot
+            let optimal_multi_control = {
+                let robust_params = RobustParameters::compute(
+                    state_vector_snapshot.adverse_selection_estimate, // Use nominal estimates for baseline
+                    state_vector_snapshot.volatility_ema_bps,
+                    state_vector_snapshot.inventory,
+                    &uncertainty_snapshot, // Use current uncertainty
+                    &robust_config_snapshot, // Use current robust config
                 );
-            }
-        }
+                let opt_state = OptimizationState {
+                    mid_price: state_vector_snapshot.mid_price,
+                    inventory: state_vector_snapshot.inventory,
+                    max_position: max_pos,
+                    adverse_selection_bps: robust_params.mu_worst_case, // Use robust params
+                    lob_imbalance: state_vector_snapshot.lob_imbalance,
+                    volatility_bps: robust_params.sigma_worst_case,     // Use robust params
+                    current_time,
+                    hawkes_model: &hawkes_model_snapshot, // Use snapshot
+                };
+                let base_spread = (robust_params.sigma_worst_case * 0.1) // Heuristic base
+                                    .max(multi_level_optimizer_config.min_profitable_spread_bps / 2.0)
+                                    * robust_params.spread_multiplier;
+                // NOTE: Need MultiLevelOptimizer instance - reconstruct
+                let optimizer = MultiLevelOptimizer::new(multi_level_optimizer_config.clone());
+                optimizer.optimize(&opt_state, base_spread)
+            };
 
-        if upper_order_amount > EPSILON && (upper_cancelled || (upper_change && self.upper_resting.oid == 0)) {
-            let (amount_resting, oid) = self
-                .place_order(self.asset.clone(), upper_order_amount, upper_price, false)
-                .await;
-            self.upper_resting.oid = oid;
-            self.upper_resting.position = amount_resting;
-            self.upper_resting.price = upper_price;
+            // d) Calculate "Heuristic" Multi-Level Control (using baseline params - should be same as optimal here)
+            //    This serves as the baseline for calculating the gradient numerically
+            let heuristic_multi_control = optimal_multi_control.clone(); // Re-use calculation
 
-            if amount_resting > EPSILON {
-                info!(
-                    "Sell for {amount_resting} {} resting at {upper_price}",
-                    self.asset.clone()
-                );
+            // e) Calculate Loss (Control Gap)
+            //    Focus on the primary optimal level (e.g., L1 = index 0) offsets
+            let optimal_l1_bid = optimal_multi_control.bid_levels.get(0).map(|(o, _)| *o).unwrap_or(0.0);
+            let optimal_l1_ask = optimal_multi_control.ask_levels.get(0).map(|(o, _)| *o).unwrap_or(0.0);
+            let heuristic_l1_bid = heuristic_multi_control.bid_levels.get(0).map(|(o, _)| *o).unwrap_or(0.0);
+            let heuristic_l1_ask = heuristic_multi_control.ask_levels.get(0).map(|(o, _)| *o).unwrap_or(0.0);
+
+            let bid_gap = optimal_l1_bid - heuristic_l1_bid;
+            let ask_gap = optimal_l1_ask - heuristic_l1_ask;
+            let current_loss = bid_gap.powi(2) + ask_gap.powi(2);
+
+            // f) Check Loss Threshold
+            if current_loss <= baseline_params_theta.control_gap_threshold {
+                // info!("Gradient snapshot skipped: Loss {:.4} <= threshold {:.4}", current_loss, baseline_params_theta.control_gap_threshold);
+                return; // Loss too small, no gradient needed for this snapshot
             }
-        }
+
+            // g) Calculate Numerical Gradient
+            let mut gradient_vector: Vec<f64> = vec![0.0; 8]; // 8 parameters in TuningParams
+            let nudge_amount = 0.001; // Small nudge for finite difference
+
+            for i in 0..8 { // For each parameter in TuningParams
+                let mut nudged_params_phi = baseline_params_phi.clone();
+                match i {
+                    0 => nudged_params_phi.skew_adjustment_factor_phi += nudge_amount,
+                    1 => nudged_params_phi.adverse_selection_adjustment_factor_phi += nudge_amount,
+                    2 => nudged_params_phi.adverse_selection_lambda_phi += nudge_amount, // Affects StateVector update
+                    3 => nudged_params_phi.inventory_urgency_threshold_phi += nudge_amount, // Affects taker logic in optimize
+                    4 => nudged_params_phi.liquidation_rate_multiplier_phi += nudge_amount, // Affects taker logic in optimize
+                    5 => nudged_params_phi.min_spread_base_ratio_phi += nudge_amount, // Affects offset clamping in optimize
+                    6 => nudged_params_phi.adverse_selection_spread_scale_phi += nudge_amount, // Affects adverse selection scaling
+                    7 => nudged_params_phi.control_gap_threshold_phi += nudge_amount, // Doesn't affect control, skip gradient
+                    _ => {}
+                }
+
+                // Recalculate heuristic control with nudged params
+                // Note: Need to handle how param 'i' affects the inputs or logic of optimize()
+                let nudged_heuristic_control = {
+                    // 1. Get nudged constrained params (needed if optimize uses them)
+                    let _nudged_params_theta = nudged_params_phi.get_constrained();
+
+                    // 2. Potentially update state if param affects it (e.g., lambda)
+                    // For now, we'll use the same state for simplicity
+                    // In a more sophisticated implementation, you'd recalculate adverse_selection_estimate
+                    // with the new lambda value
+
+                    // 3. Recalculate robust params using nudged state/params
+                    let robust_params_nudged = RobustParameters::compute(
+                        state_vector_snapshot.adverse_selection_estimate,
+                        state_vector_snapshot.volatility_ema_bps,
+                        state_vector_snapshot.inventory,
+                        &uncertainty_snapshot,
+                        &robust_config_snapshot,
+                    );
+
+                    // 4. Create nudged opt state
+                    let opt_state_nudged = OptimizationState {
+                        adverse_selection_bps: robust_params_nudged.mu_worst_case,
+                        volatility_bps: robust_params_nudged.sigma_worst_case,
+                        mid_price: state_vector_snapshot.mid_price,
+                        inventory: state_vector_snapshot.inventory,
+                        max_position: max_pos,
+                        lob_imbalance: state_vector_snapshot.lob_imbalance,
+                        current_time,
+                        hawkes_model: &hawkes_model_snapshot,
+                    };
+
+                    // 5. Rerun optimizer logic
+                    let base_spread_nudged = (robust_params_nudged.sigma_worst_case * 0.1)
+                                                .max(multi_level_optimizer_config.min_profitable_spread_bps / 2.0)
+                                                * robust_params_nudged.spread_multiplier;
+                    let optimizer = MultiLevelOptimizer::new(multi_level_optimizer_config.clone());
+                    optimizer.optimize(&opt_state_nudged, base_spread_nudged)
+                };
+
+                let nudged_l1_bid = nudged_heuristic_control.bid_levels.get(0).map(|(o, _)| *o).unwrap_or(0.0);
+                let nudged_l1_ask = nudged_heuristic_control.ask_levels.get(0).map(|(o, _)| *o).unwrap_or(0.0);
+                let nudged_loss = (optimal_l1_bid - nudged_l1_bid).powi(2) + (optimal_l1_ask - nudged_l1_ask).powi(2);
+
+                // Finite difference gradient
+                if i != 7 { // Skip gradient for control_gap_threshold itself (parameter 7)
+                    gradient_vector[i] = (nudged_loss - current_loss) / nudge_amount;
+                }
+            }
+
+            // h) Accumulate Gradient
+            { // Lock scope
+                let mut accumulator = gradient_accumulator_arc.write().unwrap();
+                let mut count = gradient_count_arc.write().unwrap();
+                for i in 0..8 { // 8 parameters in TuningParams
+                    // Clamp individual gradient components to prevent explosions
+                    let clamped_grad = gradient_vector[i].clamp(-1000.0, 1000.0); // Generous clamp
+                    if gradient_vector[i].abs() > 1000.0 {
+                        warn!("Clamping large gradient component [{}]: {:.4}", i, gradient_vector[i]);
+                    }
+                    accumulator[i] += clamped_grad;
+                }
+                *count += 1;
+                // Optional: Log accumulation progress
+                if *count % 10 == 0 { 
+                    info!("Gradient accumulated (#{})", *count); 
+                }
+            } // Lock released
+        }); // End spawn_blocking
     }
 }
 

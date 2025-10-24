@@ -414,6 +414,7 @@ pub struct OptimizationState<'a> {
 }
 
 /// Multi-level optimizer
+#[derive(Debug)]
 pub struct MultiLevelOptimizer {
     config: MultiLevelConfig,
 }
@@ -421,6 +422,11 @@ pub struct MultiLevelOptimizer {
 impl MultiLevelOptimizer {
     pub fn new(config: MultiLevelConfig) -> Self {
         Self { config }
+    }
+    
+    /// Get a reference to the config
+    pub fn config(&self) -> &MultiLevelConfig {
+        &self.config
     }
     
     /// Optimize multi-level quotes
@@ -527,7 +533,7 @@ impl MultiLevelOptimizer {
     fn allocate_sizes(
         &self,
         state: &OptimizationState,
-        inventory_ratio: f64,
+        _inventory_ratio: f64,  // Reserved for future use
         num_levels: usize,
     ) -> (Vec<f64>, Vec<f64>) {
         // Base allocation (more size on inner levels)
