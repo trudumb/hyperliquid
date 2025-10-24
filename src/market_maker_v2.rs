@@ -84,6 +84,11 @@ pub struct OnlineAdverseSelectionModel {
     
     /// Decay factor for MAE averaging (0.99 = slow decay)
     pub mae_decay: f64,
+    
+    /// Welford's algorithm for online mean/variance
+    /// [ (count, mean, M2), (count, mean, M2), ... ]
+    /// We skip the bias term (index 0) - only normalize the 4 actual features
+    pub feature_stats: Vec<(f64, f64, f64)>,
 }
 
 impl Default for OnlineAdverseSelectionModel {
@@ -100,41 +105,86 @@ impl Default for OnlineAdverseSelectionModel {
             update_count: 0,
             mean_absolute_error: 0.0,
             mae_decay: 0.99,
+            // 4 features (bias term is not normalized)
+            feature_stats: vec![(0.0, 0.0, 0.0); 4],
         }
     }
 }
 
 impl OnlineAdverseSelectionModel {
-    /// Extract feature vector from current state: X_t = [1.0, trade_flow, lob_imb, spread, vol]
-    fn extract_features(state: &StateVector) -> Vec<f64> {
-        vec![
-            1.0, // Bias term
+    /// Update running feature statistics using Welford's online algorithm
+    /// This should be called once per tick BEFORE predict/record_observation
+    pub fn update_feature_stats(&mut self, state: &StateVector) {
+        let raw_features = vec![
             state.trade_flow_ema,
-            state.lob_imbalance - 0.5, // Center around 0: [-0.5, 0.5]
+            state.lob_imbalance - 0.5,
             state.market_spread_bps,
             state.volatility_ema_bps,
-        ]
+        ];
+
+        for i in 0..raw_features.len() {
+            let x = raw_features[i];
+
+            // Welford's online algorithm
+            let (count, mean, m2) = &mut self.feature_stats[i];
+            *count += 1.0;
+            let delta = x - *mean;
+            *mean += delta / *count;
+            let delta2 = x - *mean; // New mean
+            *m2 += delta * delta2;
+        }
+    }
+
+    /// Get normalized features using current statistics
+    /// Does NOT update stats - use update_feature_stats() first
+    fn get_normalized_features(&self, state: &StateVector) -> Vec<f64> {
+        let raw_features = vec![
+            state.trade_flow_ema,
+            state.lob_imbalance - 0.5,
+            state.market_spread_bps,
+            state.volatility_ema_bps,
+        ];
+
+        let mut normalized_features = vec![1.0]; // Start with bias term
+
+        for i in 0..raw_features.len() {
+            let x = raw_features[i];
+            let (count, mean, m2) = &self.feature_stats[i];
+
+            // Get variance and std_dev from current stats
+            let (mean, std_dev) = if *count < 2.0 {
+                (0.0, 1.0) // Not enough data, just pass through (or return 0.0)
+            } else {
+                let variance = *m2 / (*count - 1.0);
+                let std_dev = variance.sqrt().max(1e-6); // Avoid div by zero
+                (*mean, std_dev)
+            };
+
+            // Standardize: z = (x - mean) / std_dev
+            normalized_features.push((x - mean) / std_dev);
+        }
+
+        normalized_features // Returns [1.0, z_flow, z_imb, z_spread, z_vol]
     }
     
     /// Predict short-term price drift: μ_hat = W · X_t
     /// Returns prediction in basis points (positive = bullish, negative = bearish)
+    /// NOTE: Call update_feature_stats() first to ensure stats are current
     pub fn predict(&self, state: &StateVector) -> f64 {
-        let features = Self::extract_features(state);
+        let features = self.get_normalized_features(state);
         
         // Dot product: prediction = sum(w_i * x_i)
-        let prediction: f64 = self.weights.iter()
+        self.weights.iter()
             .zip(features.iter())
             .map(|(w, x)| w * x)
-            .sum();
-        
-        prediction
+            .sum()
     }
     
     /// Record observation for delayed SGD update
     /// Stores (features, mid_price) in circular buffer
-    pub fn record_observation(&mut self, state: &StateVector) {
-        let features = Self::extract_features(state);
-        let mid_price = state.mid_price;
+    /// NOTE: Call update_feature_stats() first to ensure stats are current
+    pub fn record_observation(&mut self, state: &StateVector, mid_price: f64) {
+        let features = self.get_normalized_features(state);
         
         // Add to buffer
         self.observation_buffer.push_back((features, mid_price));
@@ -561,7 +611,7 @@ impl StateVector {
         book_analysis: Option<&BookAnalysis>,
         order_book: Option<&OrderBook>,
         tuning_params: &ConstrainedTuningParams,
-        online_model: &OnlineAdverseSelectionModel,
+        online_model: &mut OnlineAdverseSelectionModel,
     ) {
         // Calculate volatility before updating mid_price
         if let Some(new_vol) = self.calculate_new_volatility(mid_price) {
@@ -600,9 +650,15 @@ impl StateVector {
     /// 
     /// The model predicts short-term price drift using learned feature weights:
     /// μ_hat = W · X_t where X_t = [1.0, trade_flow, lob_imbalance, spread, volatility]
-    fn update_adverse_selection(&mut self, tuning_params: &ConstrainedTuningParams, online_model: &OnlineAdverseSelectionModel) {
-        // Use the online model to predict adverse selection
+    fn update_adverse_selection(&mut self, tuning_params: &ConstrainedTuningParams, online_model: &mut OnlineAdverseSelectionModel) {
+        // Step 1: Update feature statistics (once per tick)
+        online_model.update_feature_stats(self);
+        
+        // Step 2: Get prediction using updated stats
         let raw_prediction = online_model.predict(self);
+        
+        // Step 3: Record observation for later SGD training
+        online_model.record_observation(self, self.mid_price);
         
         // Apply EMA smoothing to the prediction for stability
         // This provides a "second layer" of smoothing on the model output
@@ -1380,14 +1436,14 @@ impl MarketMaker {
     fn update_state_vector(&mut self) {
         // Get constrained (theta) params for use in logic
         let constrained_params = self.tuning_params.read().unwrap().get_constrained();
-        let online_model = self.online_adverse_selection_model.read().unwrap();
+        let mut online_model = self.online_adverse_selection_model.write().unwrap();
         self.state_vector.update(
             self.latest_mid_price,
             self.cur_position,
             self.latest_book_analysis.as_ref(),
             self.latest_book.as_ref(),
             &constrained_params,
-            &*online_model,
+            &mut *online_model,
         );
         
         // Log state vector for monitoring (can be disabled for performance)
@@ -2332,12 +2388,10 @@ impl MarketMaker {
                         // ============================================
                         // ONLINE ADVERSE SELECTION MODEL TRAINING
                         // ============================================
-                        // Record observation and perform SGD update if enough history is available
+                        // Perform SGD update if enough history is available
+                        // NOTE: record_observation is now called inside StateVector::update_adverse_selection
                         {
                             let mut model = self.online_adverse_selection_model.write().unwrap();
-                            
-                            // Record current state for future SGD update
-                            model.record_observation(&self.state_vector);
                             
                             // Perform SGD update using delayed label (actual price change)
                             model.update(mid);
@@ -3079,9 +3133,9 @@ mod tests {
         let mut state = StateVector::new();
         let (book, analysis) = create_balanced_book();
         let params = TuningParams::default().get_constrained();
-        let model = OnlineAdverseSelectionModel::default();
+        let mut model = OnlineAdverseSelectionModel::default();
         
-        state.update(100.5, 0.0, Some(&analysis), Some(&book), &params, &model);
+        state.update(100.5, 0.0, Some(&analysis), Some(&book), &params, &mut model);
         
         assert_eq!(state.mid_price, 100.5);
         assert_eq!(state.inventory, 0.0);
@@ -3092,15 +3146,15 @@ mod tests {
     fn test_lob_imbalance_calculation() {
         let mut state = StateVector::new();
         let params = TuningParams::default().get_constrained();
-        let model = OnlineAdverseSelectionModel::default();
+        let mut model = OnlineAdverseSelectionModel::default();
         
         let (book, analysis) = create_balanced_book();
-        state.update(100.5, 0.0, Some(&analysis), Some(&book), &params, &model);
+        state.update(100.5, 0.0, Some(&analysis), Some(&book), &params, &mut model);
         
         assert!((state.lob_imbalance - 0.5).abs() < 0.1);
         
         let (book, analysis) = create_imbalanced_book_bid_heavy();
-        state.update(100.5, 0.0, Some(&analysis), Some(&book), &params, &model);
+        state.update(100.5, 0.0, Some(&analysis), Some(&book), &params, &mut model);
         
         assert!(state.lob_imbalance > 0.5);
     }
