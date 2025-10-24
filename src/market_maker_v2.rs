@@ -48,6 +48,176 @@ fn inv_exp_transform(theta: f64) -> f64 {
     theta.clamp(PARAM_EPSILON, f64::MAX).ln()
 }
 
+/// Online Linear Regression Model for Adverse Selection Estimation
+/// Uses Stochastic Gradient Descent (SGD) to learn feature weights from observed price changes
+/// This replaces the fixed 80/20 heuristic with a data-driven model that adapts to market conditions
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OnlineAdverseSelectionModel {
+    /// Regression weights: W = [w_bias, w_trade_flow, w_lob_imb, w_spread, w_vol]
+    /// These weights are learned via SGD to predict short-term price drift
+    pub weights: Vec<f64>,
+    
+    /// Learning rate for SGD updates (default: 0.001)
+    /// Controls how quickly the model adapts to new observations
+    pub learning_rate: f64,
+    
+    /// Number of ticks to wait before computing actual price change for training
+    /// E.g., lookback_ticks=10 means we predict S_{t+10} - S_t
+    pub lookback_ticks: usize,
+    
+    /// Observation buffer: stores (features, mid_price) for delayed label computation
+    /// Implemented as circular buffer with fixed capacity
+    pub observation_buffer: std::collections::VecDeque<(Vec<f64>, f64)>,
+    
+    /// Maximum buffer capacity (should be >= lookback_ticks)
+    pub buffer_capacity: usize,
+    
+    /// Enable/disable online learning (default: true)
+    /// When false, model uses fixed weights without updates
+    pub enable_learning: bool,
+    
+    /// Count of SGD updates performed (for monitoring)
+    pub update_count: usize,
+    
+    /// Running average of prediction error (MAE) for monitoring
+    pub mean_absolute_error: f64,
+    
+    /// Decay factor for MAE averaging (0.99 = slow decay)
+    pub mae_decay: f64,
+}
+
+impl Default for OnlineAdverseSelectionModel {
+    fn default() -> Self {
+        Self {
+            // Initialize weights to small random values to break symmetry
+            // [bias, trade_flow, lob_imbalance, market_spread, volatility]
+            weights: vec![0.0, 0.4, 0.1, -0.05, 0.02], // Reasonable starting point based on 80/20 heuristic
+            learning_rate: 0.001,
+            lookback_ticks: 10, // Predict 10 ticks ahead (~10 seconds)
+            observation_buffer: std::collections::VecDeque::with_capacity(100),
+            buffer_capacity: 100,
+            enable_learning: true,
+            update_count: 0,
+            mean_absolute_error: 0.0,
+            mae_decay: 0.99,
+        }
+    }
+}
+
+impl OnlineAdverseSelectionModel {
+    /// Extract feature vector from current state: X_t = [1.0, trade_flow, lob_imb, spread, vol]
+    fn extract_features(state: &StateVector) -> Vec<f64> {
+        vec![
+            1.0, // Bias term
+            state.trade_flow_ema,
+            state.lob_imbalance - 0.5, // Center around 0: [-0.5, 0.5]
+            state.market_spread_bps,
+            state.volatility_ema_bps,
+        ]
+    }
+    
+    /// Predict short-term price drift: μ_hat = W · X_t
+    /// Returns prediction in basis points (positive = bullish, negative = bearish)
+    pub fn predict(&self, state: &StateVector) -> f64 {
+        let features = Self::extract_features(state);
+        
+        // Dot product: prediction = sum(w_i * x_i)
+        let prediction: f64 = self.weights.iter()
+            .zip(features.iter())
+            .map(|(w, x)| w * x)
+            .sum();
+        
+        prediction
+    }
+    
+    /// Record observation for delayed SGD update
+    /// Stores (features, mid_price) in circular buffer
+    pub fn record_observation(&mut self, state: &StateVector) {
+        let features = Self::extract_features(state);
+        let mid_price = state.mid_price;
+        
+        // Add to buffer
+        self.observation_buffer.push_back((features, mid_price));
+        
+        // Maintain buffer capacity (remove oldest if full)
+        if self.observation_buffer.len() > self.buffer_capacity {
+            self.observation_buffer.pop_front();
+        }
+    }
+    
+    /// Perform SGD update if enough observations are available
+    /// Computes actual price change from lookback_ticks ago and updates weights
+    pub fn update(&mut self, current_mid_price: f64) {
+        if !self.enable_learning {
+            return;
+        }
+        
+        // Need at least lookback_ticks observations to compute actual price change
+        if self.observation_buffer.len() <= self.lookback_ticks {
+            return;
+        }
+        
+        // Get observation from lookback_ticks ago
+        let lookback_idx = self.observation_buffer.len() - self.lookback_ticks - 1;
+        if let Some((features, old_mid_price)) = self.observation_buffer.get(lookback_idx) {
+            // Compute actual price change in basis points
+            let actual_change_bps = if *old_mid_price > 0.0 {
+                ((current_mid_price - old_mid_price) / old_mid_price) * 10000.0
+            } else {
+                0.0
+            };
+            
+            // Compute prediction from old features
+            let predicted_change_bps: f64 = self.weights.iter()
+                .zip(features.iter())
+                .map(|(w, x)| w * x)
+                .sum();
+            
+            // Compute prediction error
+            let error = predicted_change_bps - actual_change_bps;
+            
+            // Update MAE for monitoring
+            let abs_error = error.abs();
+            if self.update_count == 0 {
+                self.mean_absolute_error = abs_error;
+            } else {
+                self.mean_absolute_error = self.mae_decay * self.mean_absolute_error 
+                    + (1.0 - self.mae_decay) * abs_error;
+            }
+            
+            // SGD update: W = W - learning_rate * error * X
+            // This is gradient descent on squared error: L = (y_pred - y_actual)^2
+            // ∇L = 2 * (y_pred - y_actual) * X, but we absorb the 2 into learning_rate
+            for i in 0..self.weights.len() {
+                self.weights[i] -= self.learning_rate * error * features[i];
+            }
+            
+            self.update_count += 1;
+            
+            // Log update every 100 iterations for monitoring
+            if self.update_count % 100 == 0 {
+                info!(
+                    "Online Adverse Selection Model Update #{}: MAE={:.4}bps, Weights={:?}",
+                    self.update_count, self.mean_absolute_error, self.weights
+                );
+            }
+        }
+    }
+    
+    /// Get current model statistics for logging/monitoring
+    pub fn get_stats(&self) -> String {
+        format!(
+            "OnlineModel[updates={}, MAE={:.4}bps, lr={:.6}, enabled={}]",
+            self.update_count, self.mean_absolute_error, self.learning_rate, self.enable_learning
+        )
+    }
+    
+    /// Reset model to initial state (useful for regime changes)
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// Tunable parameters for live adjustment of market making strategy
 /// These parameters control various aspects of the algorithm and can be
 /// reloaded at runtime without restarting the bot
@@ -391,6 +561,7 @@ impl StateVector {
         book_analysis: Option<&BookAnalysis>,
         order_book: Option<&OrderBook>,
         tuning_params: &ConstrainedTuningParams,
+        online_model: &OnlineAdverseSelectionModel,
     ) {
         // Calculate volatility before updating mid_price
         if let Some(new_vol) = self.calculate_new_volatility(mid_price) {
@@ -418,45 +589,26 @@ impl StateVector {
             // Where 0 = all ask volume, 1 = all bid volume, 0.5 = balanced
             self.lob_imbalance = (analysis.imbalance + 1.0) / 2.0;
             
-            // Update adverse selection estimate (μ̂_t) using LOB imbalance
+            // Update adverse selection estimate (μ̂_t) using online linear regression model
             // This is a filtered estimate of short-term price drift
-            self.update_adverse_selection(tuning_params);
+            self.update_adverse_selection(tuning_params, online_model);
         }
     }
     
-    /// Update the adverse selection estimate using a weighted average
+    /// Update the adverse selection estimate using online linear regression model
     /// This is called by `StateVector::update` (on AllMids)
-    fn update_adverse_selection(&mut self, tuning_params: &ConstrainedTuningParams) {
-        // Smoothing parameter (lambda) for the *combined* signal
+    /// 
+    /// The model predicts short-term price drift using learned feature weights:
+    /// μ_hat = W · X_t where X_t = [1.0, trade_flow, lob_imbalance, spread, volatility]
+    fn update_adverse_selection(&mut self, tuning_params: &ConstrainedTuningParams, online_model: &OnlineAdverseSelectionModel) {
+        // Use the online model to predict adverse selection
+        let raw_prediction = online_model.predict(self);
+        
+        // Apply EMA smoothing to the prediction for stability
+        // This provides a "second layer" of smoothing on the model output
         let lambda = tuning_params.adverse_selection_lambda;
-
-        // --- 1. Signal 1 (80%): Trade Flow (from our new EMA) ---
-        // We just read the value that is being updated by the Trades stream
-        let trade_flow_signal = self.trade_flow_ema;
-
-        // --- 2. Signal 2 (20%): LOB Imbalance (Corrected Logic) ---
-        // Corrected logic: (0.5 - I) -> thick ask (I < 0.5) is bullish
-        let lob_imbalance_signal = (0.5 - self.lob_imbalance) * 2.0; // Range: [-1, 1]
-
-        // --- 3. Combine Signals with 80/20 Weighting ---
-        let trade_flow_weight = 0.8;
-        let lob_weight = 0.2;
-        
-        let signal = (trade_flow_weight * trade_flow_signal) + (lob_weight * lob_imbalance_signal);
-
-        // Scale by market spread
-        let spread_scale = if self.market_spread_bps > 0.0 {
-            1.0 / (1.0 + self.market_spread_bps / tuning_params.adverse_selection_spread_scale)
-        } else {
-            1.0
-        };
-        
-        let scaled_signal = signal * spread_scale;
-        
-        // Update the final adverse_selection_estimate using an EMA
-        // This provides a "second layer" of smoothing on the combined signal
         self.adverse_selection_estimate = 
-            lambda * scaled_signal + (1.0 - lambda) * self.adverse_selection_estimate;
+            lambda * raw_prediction + (1.0 - lambda) * self.adverse_selection_estimate;
     }
     
     /// Get optimal spread adjustment based on adverse selection
@@ -1213,6 +1365,9 @@ pub struct MarketMaker {
     pub gradient_count: Arc<RwLock<usize>>,
     /// Message counter for sampling (accumulate every Nth message to save CPU)
     pub message_counter: Arc<RwLock<usize>>,
+    /// Online Linear Regression Model for Adverse Selection
+    /// Learns to predict short-term price drift using SGD
+    pub online_adverse_selection_model: Arc<RwLock<OnlineAdverseSelectionModel>>,
 }
 
 impl MarketMaker {
@@ -1225,12 +1380,14 @@ impl MarketMaker {
     fn update_state_vector(&mut self) {
         // Get constrained (theta) params for use in logic
         let constrained_params = self.tuning_params.read().unwrap().get_constrained();
+        let online_model = self.online_adverse_selection_model.read().unwrap();
         self.state_vector.update(
             self.latest_mid_price,
             self.cur_position,
             self.latest_book_analysis.as_ref(),
             self.latest_book.as_ref(),
             &constrained_params,
+            &*online_model,
         );
         
         // Log state vector for monitoring (can be disabled for performance)
@@ -1981,6 +2138,9 @@ impl MarketMaker {
         // Log the *constrained* (theta) values for readability
         info!("Initialized with tuning parameters (constrained): {:?}", initial_params.get_constrained());
         info!("Adam optimizer will now autonomously tune these parameters");
+        info!("✨ Online Adverse Selection Model enabled: Learning weights via SGD");
+        info!("   Features: [bias, trade_flow, lob_imbalance, spread, volatility]");
+        info!("   Lookback: 10 ticks (~10 sec), Learning rate: 0.001");
 
         Ok(MarketMaker {
             asset: input.asset,
@@ -2019,6 +2179,7 @@ impl MarketMaker {
             gradient_accumulator: Arc::new(RwLock::new(vec![0.0; 7])), // 7 parameters
             gradient_count: Arc::new(RwLock::new(0)),
             message_counter: Arc::new(RwLock::new(0)),
+            online_adverse_selection_model: Arc::new(RwLock::new(OnlineAdverseSelectionModel::default())),
         })
     }
 
@@ -2167,6 +2328,25 @@ impl MarketMaker {
                         
                         // Update state vector with new mid price
                         self.update_state_vector();
+                        
+                        // ============================================
+                        // ONLINE ADVERSE SELECTION MODEL TRAINING
+                        // ============================================
+                        // Record observation and perform SGD update if enough history is available
+                        {
+                            let mut model = self.online_adverse_selection_model.write().unwrap();
+                            
+                            // Record current state for future SGD update
+                            model.record_observation(&self.state_vector);
+                            
+                            // Perform SGD update using delayed label (actual price change)
+                            model.update(mid);
+                            
+                            // Log model stats every 100 updates for monitoring
+                            if model.update_count > 0 && model.update_count % 100 == 0 {
+                                info!("Online Adverse Selection Model: {}", model.get_stats());
+                            }
+                        }
                         
                         // ============================================
                         // GRADIENT ACCUMULATION FOR STABLE ADAM OPTIMIZER
@@ -2899,8 +3079,9 @@ mod tests {
         let mut state = StateVector::new();
         let (book, analysis) = create_balanced_book();
         let params = TuningParams::default().get_constrained();
+        let model = OnlineAdverseSelectionModel::default();
         
-        state.update(100.5, 0.0, Some(&analysis), Some(&book), &params);
+        state.update(100.5, 0.0, Some(&analysis), Some(&book), &params, &model);
         
         assert_eq!(state.mid_price, 100.5);
         assert_eq!(state.inventory, 0.0);
@@ -2911,14 +3092,15 @@ mod tests {
     fn test_lob_imbalance_calculation() {
         let mut state = StateVector::new();
         let params = TuningParams::default().get_constrained();
+        let model = OnlineAdverseSelectionModel::default();
         
         let (book, analysis) = create_balanced_book();
-        state.update(100.5, 0.0, Some(&analysis), Some(&book), &params);
+        state.update(100.5, 0.0, Some(&analysis), Some(&book), &params, &model);
         
         assert!((state.lob_imbalance - 0.5).abs() < 0.1);
         
         let (book, analysis) = create_imbalanced_book_bid_heavy();
-        state.update(100.5, 0.0, Some(&analysis), Some(&book), &params);
+        state.update(100.5, 0.0, Some(&analysis), Some(&book), &params, &model);
         
         assert!(state.lob_imbalance > 0.5);
     }
