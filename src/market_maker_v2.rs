@@ -1206,6 +1206,13 @@ pub struct MarketMaker {
     /// Performance gap threshold (in percent) to enable live trading
     /// E.g., 15.0 means trading starts when heuristic gap is < 15%
     pub enable_trading_gap_threshold_percent: f64,
+    /// Gradient accumulator for stable Adam updates
+    /// Accumulates gradients over multiple AllMids messages (default: 60 seconds)
+    pub gradient_accumulator: Arc<RwLock<Vec<f64>>>,
+    /// Count of gradients accumulated in current window
+    pub gradient_count: Arc<RwLock<usize>>,
+    /// Message counter for sampling (accumulate every Nth message to save CPU)
+    pub message_counter: Arc<RwLock<usize>>,
 }
 
 impl MarketMaker {
@@ -1344,6 +1351,107 @@ impl MarketMaker {
         &self.state_vector
     }
     
+    /// Calculate gradient vector for current state snapshot
+    /// This is called frequently (every N AllMids messages) to accumulate gradients
+    /// over time, which stabilizes the Adam optimizer.
+    /// 
+    /// Returns None if gradient calculation fails, otherwise returns the 7-dimensional
+    /// gradient vector for all tuning parameters.
+    fn calculate_gradient_snapshot(&self) -> Option<Vec<f64>> {
+        // Use dynamic spread calculation - same as main strategy
+        let base_total_spread_bps = (self.state_vector.volatility_ema_bps * self.spread_volatility_multiplier).max(12.0);
+        let base_half_spread_bps = base_total_spread_bps / 2.0;
+        
+        // 1. Calculate optimal control via grid search
+        let optimal_control = self.hjb_components.optimize_control(
+            &self.state_vector,
+            &self.value_function,
+            base_half_spread_bps,
+        );
+        
+        // 2. Calculate heuristic control with current parameters
+        let constrained_params = self.tuning_params.read().unwrap().get_constrained();
+        let mut heuristic_control = ControlVector::symmetric(base_half_spread_bps);
+        heuristic_control.apply_state_adjustments(
+            &self.state_vector,
+            base_half_spread_bps,
+            self.max_absolute_position_size,
+            &constrained_params,
+            &self.hjb_components,
+        );
+        
+        // 3. Calculate control gap loss: L = (bid_gap)² + (ask_gap)²
+        let bid_gap = optimal_control.bid_offset_bps - heuristic_control.bid_offset_bps;
+        let ask_gap = optimal_control.ask_offset_bps - heuristic_control.ask_offset_bps;
+        let current_loss = bid_gap.powi(2) + ask_gap.powi(2);
+        
+        // Get configurable control gap threshold
+        let control_gap_threshold = constrained_params.control_gap_threshold;
+        
+        // Only calculate gradient if gap is above threshold
+        if current_loss <= control_gap_threshold {
+            return None;
+        }
+        
+        // 4. Get current unconstrained (phi) parameters
+        let original_params_phi = self.tuning_params.read().unwrap().clone();
+        
+        let mut gradient_vector: Vec<f64> = vec![0.0; 7];
+        
+        // 5. Calculate numerical gradient for each parameter
+        let param_indices = [
+            0, // skew_adjustment_factor
+            1, // adverse_selection_adjustment_factor
+            2, // adverse_selection_lambda
+            3, // inventory_urgency_threshold
+            4, // liquidation_rate_multiplier
+            5, // min_spread_base_ratio
+            6, // adverse_selection_spread_scale
+        ];
+        
+        for i in param_indices.iter() {
+            // Standardized nudge amount for all parameters
+            let nudge_amount = 0.001;
+            
+            // Create nudged unconstrained (phi) parameters
+            let mut nudged_params_phi = original_params_phi.clone();
+            match *i {
+                0 => nudged_params_phi.skew_adjustment_factor_phi += nudge_amount,
+                1 => nudged_params_phi.adverse_selection_adjustment_factor_phi += nudge_amount,
+                2 => nudged_params_phi.adverse_selection_lambda_phi += nudge_amount,
+                3 => nudged_params_phi.inventory_urgency_threshold_phi += nudge_amount,
+                4 => nudged_params_phi.liquidation_rate_multiplier_phi += nudge_amount,
+                5 => nudged_params_phi.min_spread_base_ratio_phi += nudge_amount,
+                6 => nudged_params_phi.adverse_selection_spread_scale_phi += nudge_amount,
+                _ => {}
+            }
+            
+            // Get constrained (theta) version of nudged params
+            let nudged_params_theta = nudged_params_phi.get_constrained();
+            
+            // Re-run heuristic with nudged params
+            let mut nudged_control = ControlVector::symmetric(base_half_spread_bps);
+            nudged_control.apply_state_adjustments(
+                &self.state_vector,
+                base_half_spread_bps,
+                self.max_absolute_position_size,
+                &nudged_params_theta,
+                &self.hjb_components,
+            );
+            
+            // Calculate control gap loss with nudged params
+            let nudged_bid_gap = optimal_control.bid_offset_bps - nudged_control.bid_offset_bps;
+            let nudged_ask_gap = optimal_control.ask_offset_bps - nudged_control.ask_offset_bps;
+            let nudged_loss = nudged_bid_gap.powi(2) + nudged_ask_gap.powi(2);
+            
+            // Calculate partial derivative: dL/d_phi
+            let gradient = (nudged_loss - current_loss) / nudge_amount;
+            gradient_vector[*i] = gradient;
+        }
+        
+        Some(gradient_vector)
+    }
+    
     /// Run HJB grid search optimization in background and compare with heuristic
     /// 
     /// This spawns a background task to run the expensive `optimize_control()` grid search
@@ -1396,6 +1504,8 @@ impl MarketMaker {
         let adam_optimizer = Arc::clone(&self.adam_optimizer);
         let trading_enabled = Arc::clone(&self.trading_enabled);
         let enable_trading_gap_threshold_percent = self.enable_trading_gap_threshold_percent;
+        let gradient_accumulator = Arc::clone(&self.gradient_accumulator);
+        let gradient_count = Arc::clone(&self.gradient_count);
         
         tokio::task::spawn_blocking(move || {
             // Run expensive grid search optimization using half-spread
@@ -1487,252 +1597,252 @@ impl MarketMaker {
                 // Get the constrained (theta) params for logging purposes
                 let original_params_theta = original_params_phi.get_constrained();
                 
-                let mut gradient_vector: Vec<f64> = vec![0.0; 7];
-                
-                // 4. Calculate numerical gradient for each parameter
-                let param_indices = [
-                    ("skew_adjustment_factor", 0),
-                    ("adverse_selection_adjustment_factor", 1),
-                    ("adverse_selection_lambda", 2),
-                    ("inventory_urgency_threshold", 3),
-                    ("liquidation_rate_multiplier", 4),
-                    ("min_spread_base_ratio", 5),
-                    ("adverse_selection_spread_scale", 6),
-                ];
-                
-                for (param_name, i) in param_indices.iter() {
-                    // Get current parameter value for logging
-                    let current_theta_value = match *i {
-                        0 => original_params_theta.skew_adjustment_factor,
-                        1 => original_params_theta.adverse_selection_adjustment_factor,
-                        2 => original_params_theta.adverse_selection_lambda,
-                        3 => original_params_theta.inventory_urgency_threshold,
-                        4 => original_params_theta.liquidation_rate_multiplier,
-                        5 => original_params_theta.min_spread_base_ratio,
-                        6 => original_params_theta.adverse_selection_spread_scale,
-                        _ => 0.0,
-                    };
+                // 3. Use ACCUMULATED GRADIENTS instead of single snapshot
+                // This is the key stability improvement - we average gradients
+                // over the entire 60-second window instead of using one noisy sample
+                let gradient_vector: Vec<f64> = {
+                    let accumulator = gradient_accumulator.read().unwrap();
+                    let count = gradient_count.read().unwrap();
                     
-                    // Nudge the *unconstrained* (phi) parameter
-                    // A small, consistent nudge in phi-space is stable
-                    let nudge_amount = match *i {
-                        0 | 1 => 0.001,
-                        2 => 0.001, // Standardized nudge
-                        3 => 0.001,
-                        4 => 0.001, // Standardized nudge
-                        5 => 0.001,
-                        6 => 0.001, // Standardized nudge
-                        _ => 0.001,
-                    };
-                    
-                    // Create nudged *unconstrained* (phi) parameters
-                    let mut nudged_params_phi = original_params_phi.clone();
-                    match *i {
-                        0 => nudged_params_phi.skew_adjustment_factor_phi += nudge_amount,
-                        1 => nudged_params_phi.adverse_selection_adjustment_factor_phi += nudge_amount,
-                        2 => nudged_params_phi.adverse_selection_lambda_phi += nudge_amount,
-                        3 => nudged_params_phi.inventory_urgency_threshold_phi += nudge_amount,
-                        4 => nudged_params_phi.liquidation_rate_multiplier_phi += nudge_amount,
-                        5 => nudged_params_phi.min_spread_base_ratio_phi += nudge_amount,
-                        6 => nudged_params_phi.adverse_selection_spread_scale_phi += nudge_amount,
-                        _ => {}
-                    }
-                    
-                    // Get the *constrained* (theta) version of the nudged params
-                    let nudged_params_theta = nudged_params_phi.get_constrained();
-                    
-                    // Validation is no longer needed, parameters are valid by construction
-                    
-                    // Re-run heuristic with nudged params using half-spread
-                    let mut nudged_control = ControlVector::symmetric(base_half_spread_bps);
-                    nudged_control.apply_state_adjustments(
-                        &state_vector,
-                        base_half_spread_bps,
-                        max_absolute_position_size,
-                        &nudged_params_theta, // Use constrained params
-                        &hjb_components,
-                    );
-                    
-                    // Calculate control gap loss with nudged params
-                    // L = (bid_optimal - bid_nudged)² + (ask_optimal - ask_nudged)²
-                    let nudged_bid_gap = optimal_control.bid_offset_bps - nudged_control.bid_offset_bps;
-                    let nudged_ask_gap = optimal_control.ask_offset_bps - nudged_control.ask_offset_bps;
-                    let nudged_loss = nudged_bid_gap.powi(2) + nudged_ask_gap.powi(2);
-                    
-                    // Calculate partial derivative (gradient component)
-                    // dL/d_phi = (L(phi + d_phi) - L(phi)) / d_phi
-                    // Pure numerical gradient without heuristic normalization
-                    // The sigmoid/exp transformations already handle scaling naturally
-                    let gradient = (nudged_loss - current_loss) / nudge_amount;
-                    gradient_vector[*i] = gradient;
-                    
-                    info!("Gradient[{}] = {:.6} (theta_value={:.6}, nudge_phi={:.6})", param_name, gradient, current_theta_value, nudge_amount);
-                }
-                
-                // 5. Gradient Clipping (relax thresholds due to normalization)
-                let max_individual_norm = 100.0; // Relaxed individual clipping
-                let max_global_norm = 50.0;      // Added global norm clipping
-
-                let mut clipped_gradient_vector = gradient_vector.clone();
-                let mut num_clipped = 0;
-
-                // Clip individual gradients
-                for i in 0..7 {
-                    if clipped_gradient_vector[i].abs() > max_individual_norm {
-                        clipped_gradient_vector[i] = clipped_gradient_vector[i].signum() * max_individual_norm;
-                        num_clipped += 1;
-                    }
-                }
-
-                // Also clip by global norm (prevents extreme cases even after individual clipping)
-                let gradient_norm_after_individual: f64 = clipped_gradient_vector.iter().map(|g| g.powi(2)).sum::<f64>().sqrt();
-                if gradient_norm_after_individual > max_global_norm {
-                    let scale = max_global_norm / (gradient_norm_after_individual + 1e-8); // Add epsilon for stability
-                    for i in 0..7 {
-                        clipped_gradient_vector[i] *= scale;
-                    }
-                    info!("  Applied global norm scaling: {:.3}x", scale);
-                    // Ensure num_clipped reflects that clipping occurred, even if only global
-                    if num_clipped == 0 { num_clipped = 1; }
-                }
-                
-                // Calculate gradient norm for monitoring (L2 norm)
-                let gradient_norm: f64 = gradient_vector.iter().map(|g| g.powi(2)).sum::<f64>().sqrt();
-                let clipped_gradient_norm: f64 = clipped_gradient_vector.iter().map(|g| g.powi(2)).sum::<f64>().sqrt();
-                
-                info!("Gradient Statistics:");
-                info!("  Gradient L2 norm: {:.6}", gradient_norm);
-                if num_clipped > 0 {
-                    info!("  Clipped {} gradients (norm after clipping: {:.6})", num_clipped, clipped_gradient_norm);
-                }
-                
-                // 6. Apply Adam optimizer update with warmup
-                let updates = {
-                    let mut optimizer = adam_optimizer.write().unwrap();
-                    
-                    // Learning rate warmup: gradually increase alpha over first N steps
-                    // This prevents divergence when optimizer's internal state is still initializing
-                    let warmup_steps = 3; // Changed from 10: faster warmup with normalized gradients
-                    let current_step = optimizer.t + 1; // +1 because compute_update increments t
-                    let warmup_factor = if current_step <= warmup_steps {
-                        current_step as f64 / warmup_steps as f64
+                    if *count > 0 {
+                        // Average the accumulated gradients
+                        let mut avg_gradient = vec![0.0; 7];
+                        for i in 0..7 {
+                            avg_gradient[i] = accumulator[i] / (*count as f64);
+                        }
+                        
+                        info!("Using accumulated gradients: {} samples over 60s window", *count);
+                        info!("Accumulated gradient statistics:");
+                        let param_names = [
+                            "skew_adjustment_factor",
+                            "adverse_selection_adjustment_factor",
+                            "adverse_selection_lambda",
+                            "inventory_urgency_threshold",
+                            "liquidation_rate_multiplier",
+                            "min_spread_base_ratio",
+                            "adverse_selection_spread_scale",
+                        ];
+                        for i in 0..7 {
+                            let current_theta_value = match i {
+                                0 => original_params_theta.skew_adjustment_factor,
+                                1 => original_params_theta.adverse_selection_adjustment_factor,
+                                2 => original_params_theta.adverse_selection_lambda,
+                                3 => original_params_theta.inventory_urgency_threshold,
+                                4 => original_params_theta.liquidation_rate_multiplier,
+                                5 => original_params_theta.min_spread_base_ratio,
+                                6 => original_params_theta.adverse_selection_spread_scale,
+                                _ => 0.0,
+                            };
+                            info!("  Avg Gradient[{}] = {:.6} (theta_value={:.6}, samples={})", 
+                                param_names[i], avg_gradient[i], current_theta_value, *count);
+                        }
+                        
+                        avg_gradient
                     } else {
-                        1.0
-                    };
-                    
-                    // Temporarily apply warmup to learning rate
-                    let original_alpha = optimizer.alpha;
-                    optimizer.alpha *= warmup_factor;
-                    
-                    // Compute update with clipped gradients
-                    let updates = optimizer.compute_update(&clipped_gradient_vector);
-                    
-                    // Restore original alpha
-                    optimizer.alpha = original_alpha;
-                    
-                    updates
+                        // No gradients accumulated yet (first 60s window or all below threshold)
+                        // Skip this update cycle
+                        info!("No gradients accumulated in this window, skipping Adam update");
+                        vec![0.0; 7]
+                    }
                 };
                 
-                // 7. Log optimizer state and diagnostics
-                {
-                    let optimizer = adam_optimizer.read().unwrap();
-                    info!("Adam Optimizer State:");
-                    info!("  Time step: {}", optimizer.t);
-                    info!("  Base learning rate (α): {}", optimizer.alpha);
+                // Check if we have valid gradients to work with
+                let gradient_count_value = *gradient_count.read().unwrap();
+                if gradient_count_value == 0 {
+                    // Skip Adam update if no gradients were accumulated
+                    info!("Skipping Adam update - no valid gradients accumulated in this window");
+                } else {
+                    // 5. Gradient Clipping (relax thresholds due to normalization)
+                    let max_individual_norm = 100.0; // Relaxed individual clipping
+                    let max_global_norm = 50.0;      // Added global norm clipping
+
+                    let mut clipped_gradient_vector = gradient_vector.clone();
+                    let mut num_clipped = 0;
+
+                    // Clip individual gradients
+                    for i in 0..7 {
+                        if clipped_gradient_vector[i].abs() > max_individual_norm {
+                            clipped_gradient_vector[i] = clipped_gradient_vector[i].signum() * max_individual_norm;
+                            num_clipped += 1;
+                        }
+                    }
+
+                    // Also clip by global norm (prevents extreme cases even after individual clipping)
+                    let gradient_norm_after_individual: f64 = clipped_gradient_vector.iter().map(|g| g.powi(2)).sum::<f64>().sqrt();
+                    if gradient_norm_after_individual > max_global_norm {
+                        let scale = max_global_norm / (gradient_norm_after_individual + 1e-8); // Add epsilon for stability
+                        for i in 0..7 {
+                            clipped_gradient_vector[i] *= scale;
+                        }
+                        info!("  Applied global norm scaling: {:.3}x", scale);
+                        // Ensure num_clipped reflects that clipping occurred, even if only global
+                        if num_clipped == 0 { num_clipped = 1; }
+                    }
                     
-                    // Calculate warmup factor for current step
-                    let warmup_steps = 3; // Changed from 10: faster warmup with normalized gradients
-                    let warmup_factor = if optimizer.t <= warmup_steps {
-                        optimizer.t as f64 / warmup_steps as f64
-                    } else {
-                        1.0
+                    // Calculate gradient norm for monitoring (L2 norm)
+                    let gradient_norm: f64 = gradient_vector.iter().map(|g| g.powi(2)).sum::<f64>().sqrt();
+                    let clipped_gradient_norm: f64 = clipped_gradient_vector.iter().map(|g| g.powi(2)).sum::<f64>().sqrt();
+                    
+                    info!("Gradient Statistics:");
+                    info!("  Gradient L2 norm: {:.6}", gradient_norm);
+                    if num_clipped > 0 {
+                        info!("  Clipped {} gradients (norm after clipping: {:.6})", num_clipped, clipped_gradient_norm);
+                    }
+                    
+                    // 6. Apply Adam optimizer update with warmup
+                    let updates = {
+                        let mut optimizer = adam_optimizer.write().unwrap();
+                        
+                        // Learning rate warmup: gradually increase alpha over first N steps
+                        // This prevents divergence when optimizer's internal state is still initializing
+                        let warmup_steps = 3; // Changed from 10: faster warmup with normalized gradients
+                        let current_step = optimizer.t + 1; // +1 because compute_update increments t
+                        let warmup_factor = if current_step <= warmup_steps {
+                            current_step as f64 / warmup_steps as f64
+                        } else {
+                            1.0
+                        };
+                        
+                        // Temporarily apply warmup to learning rate
+                        let original_alpha = optimizer.alpha;
+                        optimizer.alpha *= warmup_factor;
+                        
+                        // Compute update with clipped gradients
+                        let updates = optimizer.compute_update(&clipped_gradient_vector);
+                        
+                        // Restore original alpha
+                        optimizer.alpha = original_alpha;
+                        
+                        updates
                     };
-                    if warmup_factor < 1.0 {
-                        info!("  Warmup factor: {:.2}x (step {}/{})", warmup_factor, optimizer.t, warmup_steps);
+                    
+                    // 7. Log optimizer state and diagnostics
+                    {
+                        let optimizer = adam_optimizer.read().unwrap();
+                        info!("Adam Optimizer State:");
+                        info!("  Time step: {}", optimizer.t);
+                        info!("  Base learning rate (α): {}", optimizer.alpha);
+                        
+                        // Calculate warmup factor for current step
+                        let warmup_steps = 3; // Changed from 10: faster warmup with normalized gradients
+                        let warmup_factor = if optimizer.t <= warmup_steps {
+                            optimizer.t as f64 / warmup_steps as f64
+                        } else {
+                            1.0
+                        };
+                        if warmup_factor < 1.0 {
+                            info!("  Warmup factor: {:.2}x (step {}/{})", warmup_factor, optimizer.t, warmup_steps);
+                        }
+                        
+                        // Log effective learning rates per parameter
+                        let param_names = [
+                            "skew_adjustment_factor",
+                            "adverse_selection_adjustment_factor",
+                            "adverse_selection_lambda",
+                            "inventory_urgency_threshold",
+                            "liquidation_rate_multiplier",
+                            "min_spread_base_ratio",
+                            "adverse_selection_spread_scale",
+                        ];
+                        for i in 0..7 {
+                            let eff_lr = optimizer.get_effective_learning_rate(i);
+                            info!("  Effective LR[{}]: {:.6}", param_names[i], eff_lr);
+                        }
+                        
+                        // Log momentum (m) and velocity (v) statistics for health monitoring
+                        let m_norm: f64 = optimizer.m.iter().map(|x| x.powi(2)).sum::<f64>().sqrt();
+                        let v_norm: f64 = optimizer.v.iter().map(|x| x.powi(2)).sum::<f64>().sqrt();
+                        info!("  Momentum (m) L2 norm: {:.6}", m_norm);
+                        info!("  Velocity (v) L2 norm: {:.6}", v_norm);
                     }
                     
-                    // Log effective learning rates per parameter
-                    for (param_name, i) in param_indices.iter() {
-                        let eff_lr = optimizer.get_effective_learning_rate(*i);
-                        info!("  Effective LR[{}]: {:.6}", param_name, eff_lr);
-                    }
+                    // 8. Apply updates: theta_new = theta_old - update
+                    // This updates the *unconstrained* (phi) parameters
+                    let mut updated_params_phi = original_params_phi.clone();
+                    updated_params_phi.skew_adjustment_factor_phi -= updates[0];
+                    updated_params_phi.adverse_selection_adjustment_factor_phi -= updates[1];
+                    updated_params_phi.adverse_selection_lambda_phi -= updates[2];
+                    updated_params_phi.inventory_urgency_threshold_phi -= updates[3];
+                    updated_params_phi.liquidation_rate_multiplier_phi -= updates[4];
+                    updated_params_phi.min_spread_base_ratio_phi -= updates[5];
+                    updated_params_phi.adverse_selection_spread_scale_phi -= updates[6];
                     
-                    // Log momentum (m) and velocity (v) statistics for health monitoring
-                    let m_norm: f64 = optimizer.m.iter().map(|x| x.powi(2)).sum::<f64>().sqrt();
-                    let v_norm: f64 = optimizer.v.iter().map(|x| x.powi(2)).sum::<f64>().sqrt();
-                    info!("  Momentum (m) L2 norm: {:.6}", m_norm);
-                    info!("  Velocity (v) L2 norm: {:.6}", v_norm);
+                    // Calculate update norm for monitoring
+                    let update_norm: f64 = updates.iter().map(|u| u.powi(2)).sum::<f64>().sqrt();
+                    info!("Update Statistics:");
+                    info!("  Update L2 norm: {:.6}", update_norm);
+                    info!("  Largest update: {:.6} (param index {})", 
+                        updates.iter().enumerate().map(|(i, u)| (u.abs(), i)).max_by(|a, b| a.0.partial_cmp(&b.0).unwrap()).unwrap().0,
+                        updates.iter().enumerate().map(|(i, u)| (u.abs(), i)).max_by(|a, b| a.0.partial_cmp(&b.0).unwrap()).unwrap().1);
+                    
+                    // 9. Apply the updated parameters
+                    // Validation is no longer needed as parameters are valid by construction
+                            // Parameters are valid, apply them
+                            {
+                                let mut params = tuning_params.write().unwrap();
+                                *params = updated_params_phi.clone();
+                            }
+                            info!("Adam Update Applied (unconstrained phi): {:?}", updated_params_phi);
+                            
+                            // Log the changes for each parameter
+                            info!("Parameter Changes:");
+                            
+                            // Get *constrained* (theta) values for logging
+                            let updated_params_theta = updated_params_phi.get_constrained();
+                            info!("  skew_adjustment_factor (theta): {:.6} -> {:.6} (Δ={:.6})",
+                                original_params_theta.skew_adjustment_factor,
+                                updated_params_theta.skew_adjustment_factor,
+                                updated_params_theta.skew_adjustment_factor - original_params_theta.skew_adjustment_factor);
+                            info!("  adverse_selection_adjustment_factor (theta): {:.6} -> {:.6} (Δ={:.6})",
+                                original_params_theta.adverse_selection_adjustment_factor,
+                                updated_params_theta.adverse_selection_adjustment_factor,
+                                updated_params_theta.adverse_selection_adjustment_factor - original_params_theta.adverse_selection_adjustment_factor);
+                            info!("  adverse_selection_lambda (theta): {:.6} -> {:.6} (Δ={:.6})",
+                                original_params_theta.adverse_selection_lambda,
+                                updated_params_theta.adverse_selection_lambda,
+                                updated_params_theta.adverse_selection_lambda - original_params_theta.adverse_selection_lambda);
+                            info!("  inventory_urgency_threshold (theta): {:.6} -> {:.6} (Δ={:.6})",
+                                original_params_theta.inventory_urgency_threshold,
+                                updated_params_theta.inventory_urgency_threshold,
+                                updated_params_theta.inventory_urgency_threshold - original_params_theta.inventory_urgency_threshold);
+                            info!("  liquidation_rate_multiplier (theta): {:.6} -> {:.6} (Δ={:.6})",
+                                original_params_theta.liquidation_rate_multiplier,
+                                updated_params_theta.liquidation_rate_multiplier,
+                                updated_params_theta.liquidation_rate_multiplier - original_params_theta.liquidation_rate_multiplier);
+                            info!("  min_spread_base_ratio (theta): {:.6} -> {:.6} (Δ={:.6})",
+                                original_params_theta.min_spread_base_ratio,
+                                updated_params_theta.min_spread_base_ratio,
+                                updated_params_theta.min_spread_base_ratio - original_params_theta.min_spread_base_ratio);
+                            info!("  adverse_selection_spread_scale (theta): {:.6} -> {:.6} (Δ={:.6})",
+                                original_params_theta.adverse_selection_spread_scale,
+                                updated_params_theta.adverse_selection_spread_scale,
+                                updated_params_theta.adverse_selection_spread_scale - original_params_theta.adverse_selection_spread_scale);
+                            
+                            // Save to JSON file for persistence
+                            // This saves the *constrained* (theta) values
+                            if let Err(e) = updated_params_phi.to_json_file("tuning_params.json") {
+                                error!("Failed to save updated tuning params to JSON: {}", e);
+                            } else {
+                                info!("Updated tuning parameters saved to tuning_params.json");
+                            }
                 }
                 
-                // 8. Apply updates: theta_new = theta_old - update
-                // This updates the *unconstrained* (phi) parameters
-                let mut updated_params_phi = original_params_phi.clone();
-                updated_params_phi.skew_adjustment_factor_phi -= updates[0];
-                updated_params_phi.adverse_selection_adjustment_factor_phi -= updates[1];
-                updated_params_phi.adverse_selection_lambda_phi -= updates[2];
-                updated_params_phi.inventory_urgency_threshold_phi -= updates[3];
-                updated_params_phi.liquidation_rate_multiplier_phi -= updates[4];
-                updated_params_phi.min_spread_base_ratio_phi -= updates[5];
-                updated_params_phi.adverse_selection_spread_scale_phi -= updates[6];
-                
-                // Calculate update norm for monitoring
-                let update_norm: f64 = updates.iter().map(|u| u.powi(2)).sum::<f64>().sqrt();
-                info!("Update Statistics:");
-                info!("  Update L2 norm: {:.6}", update_norm);
-                info!("  Largest update: {:.6} (param index {})", 
-                    updates.iter().enumerate().map(|(i, u)| (u.abs(), i)).max_by(|a, b| a.0.partial_cmp(&b.0).unwrap()).unwrap().0,
-                    updates.iter().enumerate().map(|(i, u)| (u.abs(), i)).max_by(|a, b| a.0.partial_cmp(&b.0).unwrap()).unwrap().1);
-                
-                // 9. Apply the updated parameters
-                // Validation is no longer needed as parameters are valid by construction
-                        // Parameters are valid, apply them
-                        {
-                            let mut params = tuning_params.write().unwrap();
-                            *params = updated_params_phi.clone();
-                        }
-                        info!("Adam Update Applied (unconstrained phi): {:?}", updated_params_phi);
-                        
-                        // Log the changes for each parameter
-                        info!("Parameter Changes:");
-                        
-                        // Get *constrained* (theta) values for logging
-                        let updated_params_theta = updated_params_phi.get_constrained();
-                        info!("  skew_adjustment_factor (theta): {:.6} -> {:.6} (Δ={:.6})",
-                            original_params_theta.skew_adjustment_factor,
-                            updated_params_theta.skew_adjustment_factor,
-                            updated_params_theta.skew_adjustment_factor - original_params_theta.skew_adjustment_factor);
-                        info!("  adverse_selection_adjustment_factor (theta): {:.6} -> {:.6} (Δ={:.6})",
-                            original_params_theta.adverse_selection_adjustment_factor,
-                            updated_params_theta.adverse_selection_adjustment_factor,
-                            updated_params_theta.adverse_selection_adjustment_factor - original_params_theta.adverse_selection_adjustment_factor);
-                        info!("  adverse_selection_lambda (theta): {:.6} -> {:.6} (Δ={:.6})",
-                            original_params_theta.adverse_selection_lambda,
-                            updated_params_theta.adverse_selection_lambda,
-                            updated_params_theta.adverse_selection_lambda - original_params_theta.adverse_selection_lambda);
-                        info!("  inventory_urgency_threshold (theta): {:.6} -> {:.6} (Δ={:.6})",
-                            original_params_theta.inventory_urgency_threshold,
-                            updated_params_theta.inventory_urgency_threshold,
-                            updated_params_theta.inventory_urgency_threshold - original_params_theta.inventory_urgency_threshold);
-                        info!("  liquidation_rate_multiplier (theta): {:.6} -> {:.6} (Δ={:.6})",
-                            original_params_theta.liquidation_rate_multiplier,
-                            updated_params_theta.liquidation_rate_multiplier,
-                            updated_params_theta.liquidation_rate_multiplier - original_params_theta.liquidation_rate_multiplier);
-                        info!("  min_spread_base_ratio (theta): {:.6} -> {:.6} (Δ={:.6})",
-                            original_params_theta.min_spread_base_ratio,
-                            updated_params_theta.min_spread_base_ratio,
-                            updated_params_theta.min_spread_base_ratio - original_params_theta.min_spread_base_ratio);
-                        info!("  adverse_selection_spread_scale (theta): {:.6} -> {:.6} (Δ={:.6})",
-                            original_params_theta.adverse_selection_spread_scale,
-                            updated_params_theta.adverse_selection_spread_scale,
-                            updated_params_theta.adverse_selection_spread_scale - original_params_theta.adverse_selection_spread_scale);
-                        
-                        // Save to JSON file for persistence
-                        // This saves the *constrained* (theta) values
-                        if let Err(e) = updated_params_phi.to_json_file("tuning_params.json") {
-                            error!("Failed to save updated tuning params to JSON: {}", e);
-                        } else {
-                            info!("Updated tuning parameters saved to tuning_params.json");
-                        }
+                // ============================================
+                // RESET GRADIENT ACCUMULATOR FOR NEXT WINDOW
+                // ============================================
+                // Always reset after 60s timer, regardless of whether we applied an update
+                {
+                    let mut accumulator = gradient_accumulator.write().unwrap();
+                    let mut count = gradient_count.write().unwrap();
+                    
+                    // Reset to zeros for next accumulation window
+                    for i in 0..7 {
+                        accumulator[i] = 0.0;
+                    }
+                    *count = 0;
+                    
+                    info!("Gradient accumulator reset for next 60-second window");
+                }
             } else {
                 info!("Control gap {:.6} bps² is below threshold {:.6} bps², skipping Adam tuning", 
                     current_loss, control_gap_threshold);
@@ -1906,6 +2016,9 @@ impl MarketMaker {
             spread_volatility_multiplier: input.spread_volatility_multiplier,
             trading_enabled: Arc::new(RwLock::new(false)), // Start with trading disabled until optimizer validates performance
             enable_trading_gap_threshold_percent: input.enable_trading_gap_threshold_percent,
+            gradient_accumulator: Arc::new(RwLock::new(vec![0.0; 7])), // 7 parameters
+            gradient_count: Arc::new(RwLock::new(0)),
+            message_counter: Arc::new(RwLock::new(0)),
         })
     }
 
@@ -2054,6 +2167,41 @@ impl MarketMaker {
                         
                         // Update state vector with new mid price
                         self.update_state_vector();
+                        
+                        // ============================================
+                        // GRADIENT ACCUMULATION FOR STABLE ADAM OPTIMIZER
+                        // ============================================
+                        // Sample every 10th AllMids message to balance CPU usage with gradient quality
+                        // This provides ~6 gradient samples per minute (assuming ~1 AllMids/second)
+                        // Over 60 seconds, this accumulates ~60 gradients for stable averaging
+                        {
+                            let mut counter = self.message_counter.write().unwrap();
+                            *counter += 1;
+                            let sample_interval = 10; // Accumulate gradient every 10th message
+                            
+                            if *counter % sample_interval == 0 {
+                                // Calculate gradient for current state
+                                if let Some(gradient_vec) = self.calculate_gradient_snapshot() {
+                                    // Accumulate gradient
+                                    let mut accumulator = self.gradient_accumulator.write().unwrap();
+                                    let mut count = self.gradient_count.write().unwrap();
+                                    
+                                    for i in 0..7 {
+                                        accumulator[i] += gradient_vec[i];
+                                    }
+                                    *count += 1;
+                                    
+                                    // Log accumulation progress every 10 gradients
+                                    if *count % 10 == 0 {
+                                        let gradient_norm: f64 = gradient_vec.iter().map(|g| g.powi(2)).sum::<f64>().sqrt();
+                                        info!("Gradient accumulation: {}/60s window, current_norm={:.4}", *count, gradient_norm);
+                                    }
+                                } else {
+                                    // Control gap below threshold, skip gradient calculation
+                                    // This is normal and expected when heuristic is performing well
+                                }
+                            }
+                        }
                         
                         // Check to see if we need to cancel or place any new orders
                         self.potentially_update().await;
