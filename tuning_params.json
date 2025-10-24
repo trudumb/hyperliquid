@@ -1,10 +1,10 @@
 {
-  "skew_adjustment_factor": 0.5264467561428654,
-  "adverse_selection_adjustment_factor": 0.5109154717637635,
-  "adverse_selection_lambda": 0.11390609111551622,
-  "inventory_urgency_threshold": 0.7221127336157872,
-  "liquidation_rate_multiplier": 10.02109098428433,
-  "min_spread_base_ratio": 0.2151802085138241,
-  "adverse_selection_spread_scale": 100.02092460034157,
-  "control_gap_threshold": 1.0
+  "skew_adjustment_factor": 0.3973648126845398,
+  "adverse_selection_adjustment_factor": 0.27021787210634796,
+  "adverse_selection_lambda": 0.10000000000000002,
+  "inventory_urgency_threshold": 0.7,
+  "liquidation_rate_multiplier": 10.000000000000002,
+  "min_spread_base_ratio": 0.2,
+  "adverse_selection_spread_scale": 100.00000000000004,
+  "control_gap_threshold": 0.10000000000000002
 }

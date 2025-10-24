@@ -39,6 +39,7 @@ fn main() {
         lob_imbalance: 0.5,
         previous_mid_price: 100.0,
         volatility_ema_bps: 10.0,
+        trade_flow_ema: 0.0,
     };
     
     println!("State: {}", state_balanced.to_log_string());
@@ -67,6 +68,7 @@ fn main() {
         lob_imbalance: 0.5,
         previous_mid_price: 100.0,
         volatility_ema_bps: 10.0,
+        trade_flow_ema: 0.0,
     };
     
     println!("State: {}", state_long.to_log_string());
@@ -100,6 +102,7 @@ fn main() {
         lob_imbalance: 0.5,
         previous_mid_price: 100.0,
         volatility_ema_bps: 10.0,
+        trade_flow_ema: 0.0,
     };
     
     println!("State: {}", state_upward.to_log_string());
@@ -127,6 +130,7 @@ fn main() {
         lob_imbalance: 0.9, // Lots of buy orders
         previous_mid_price: 100.0,
         volatility_ema_bps: 10.0,
+        trade_flow_ema: 0.0,
     };
     
     println!("State: {}", state_imbalance.to_log_string());
@@ -158,6 +162,7 @@ fn main() {
         lob_imbalance: 0.5,
         previous_mid_price: 100.0,
         volatility_ema_bps: 10.0,
+        trade_flow_ema: 0.0,
     };
     
     println!("Inventory Penalty (φQ²) for max_position={}:", max_position);
@@ -180,6 +185,7 @@ fn main() {
         lob_imbalance: 0.5,
         previous_mid_price: 100.0,
         volatility_ema_bps: 10.0,
+        trade_flow_ema: 0.0,
     };
     
     // Maker bid at configured half_spread
@@ -208,6 +214,7 @@ fn main() {
         lob_imbalance: 0.5,
         previous_mid_price: 100.0,
         volatility_ema_bps: 10.0,
+        trade_flow_ema: 0.0,
     };
     
     println!("State: Q=1.5 (50% of max), μ̂=1.0, Δ=10bps");

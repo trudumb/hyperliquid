@@ -12,48 +12,117 @@ use crate::{
     OrderBook, Subscription, TickLotValidator, UserData, EPSILON,
 };
 
+/// Epsilon for clamping values during inverse transforms (logit/log)
+const PARAM_EPSILON: f64 = 1e-8;
+
+/// Standard sigmoid function: maps (-inf, inf) -> (0, 1)
+fn sigmoid(phi: f64) -> f64 {
+    1.0 / (1.0 + (-phi).exp())
+}
+
+/// Logit function (inverse sigmoid): maps (0, 1) -> (-inf, inf)
+fn logit(theta: f64) -> f64 {
+    // Clamp to avoid log(0) or division by zero
+    let theta_clamped = theta.clamp(PARAM_EPSILON, 1.0 - PARAM_EPSILON);
+    (theta_clamped / (1.0 - theta_clamped)).ln()
+}
+
+/// Scaled sigmoid: maps (-inf, inf) -> (a, b)
+fn scaled_sigmoid(phi: f64, a: f64, b: f64) -> f64 {
+    a + (b - a) * sigmoid(phi)
+}
+
+/// Inverse scaled sigmoid: maps (a, b) -> (-inf, inf)
+fn inv_scaled_sigmoid(theta: f64, a: f64, b: f64) -> f64 {
+    let y = (theta - a) / (b - a);
+    logit(y)
+}
+
+/// Exponential transform: maps (-inf, inf) -> (0, inf)
+fn exp_transform(phi: f64) -> f64 {
+    phi.exp()
+}
+
+/// Log transform (inverse exp): maps (0, inf) -> (-inf, inf)
+fn inv_exp_transform(theta: f64) -> f64 {
+    theta.clamp(PARAM_EPSILON, f64::MAX).ln()
+}
+
 /// Tunable parameters for live adjustment of market making strategy
 /// These parameters control various aspects of the algorithm and can be
 /// reloaded at runtime without restarting the bot
+///
+/// This struct stores the *UNCONSTRAINED* parameters (phi), which are
+/// optimized by Adam. They are transformed into constrained values (theta)
+/// via the `get_constrained()` method before being used by the strategy.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TuningParams {
-    /// Inventory skew adjustment factor (default: 0.5)
+    /// Unconstrained (phi) value for inventory skew adjustment factor (theta range: [0.0, 2.0])
+    pub skew_adjustment_factor_phi: f64,
+    
+    /// Unconstrained (phi) value for adverse selection adjustment factor (theta range: [0.0, 2.0])
+    pub adverse_selection_adjustment_factor_phi: f64,
+    
+    /// Unconstrained (phi) value for adverse selection filter smoothing (theta range: [0.0, 1.0])
+    pub adverse_selection_lambda_phi: f64,
+    
+    /// Unconstrained (phi) value for inventory urgency threshold (theta range: [0.0, 1.0])
+    pub inventory_urgency_threshold_phi: f64,
+    
+    /// Unconstrained (phi) value for liquidation rate multiplier (theta range: [0.0, 100.0])
+    pub liquidation_rate_multiplier_phi: f64,
+    
+    /// Unconstrained (phi) value for minimum spread base ratio (theta range: [0.0, 1.0])
+    pub min_spread_base_ratio_phi: f64,
+    
+    /// Unconstrained (phi) value for adverse selection spread scale (theta range: (0.0, inf))
+    pub adverse_selection_spread_scale_phi: f64,
+    
+    /// Unconstrained (phi) value for control gap threshold (theta range: (0.0, inf))
+    pub control_gap_threshold_phi: f64,
+}
+
+/// Holds the *CONSTRAINED* (theta) parameters after transformation.
+/// This struct is used by the strategy logic.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ConstrainedTuningParams {
+    /// Inventory skew adjustment factor
     /// Controls how much to skew quotes based on inventory
     /// Higher = more aggressive inventory management
     pub skew_adjustment_factor: f64,
     
-    /// Adverse selection adjustment factor (default: 0.5)
+    /// Adverse selection adjustment factor
     /// Controls how much to adjust spreads based on adverse selection estimates
     /// Higher = more aggressive response to adverse selection signals
     pub adverse_selection_adjustment_factor: f64,
     
-    /// Adverse selection filter smoothing parameter (lambda) (default: 0.1)
+    /// Adverse selection filter smoothing parameter (lambda)
     /// Controls how responsive the adverse selection filter is to new signals
     /// Higher = more weight on recent observations (more responsive)
     /// Lower = more weight on historical average (smoother)
     pub adverse_selection_lambda: f64,
     
-    /// Inventory urgency threshold (default: 0.7)
+    /// Inventory urgency threshold
     /// Inventory ratio above which to activate taker orders for liquidation
     /// Range: [0.0, 1.0] where 1.0 = at max inventory
     pub inventory_urgency_threshold: f64,
     
-    /// Liquidation rate multiplier (default: 10.0)
+    /// Liquidation rate multiplier
     /// Scales the taker order rate when urgency is high
     /// Higher = more aggressive liquidation via market orders
     pub liquidation_rate_multiplier: f64,
     
-    /// Minimum spread base ratio (default: 0.2)
+    /// Minimum spread base ratio
     /// Minimum quote offset as a fraction of base spread
     /// Ensures quotes don't get too tight during adjustments
     pub min_spread_base_ratio: f64,
     
-    /// Adverse selection spread scale factor (default: 100.0)
+    /// Adverse selection spread scale factor
     /// Denominator for normalizing spread in adverse selection calculation
     /// Higher = less sensitivity to spread changes
     pub adverse_selection_spread_scale: f64,
     
-    /// Control gap threshold for Adam optimizer (default: 1.0 bps²)
+    /// Control gap threshold for Adam optimizer
     /// Minimum control gap (bid_gap² + ask_gap²) required to trigger parameter tuning
     /// Higher = more conservative, only tune when quotes deviate significantly from optimal
     /// Lower = more aggressive, tune even for small deviations
@@ -94,7 +163,7 @@ impl Default for AdamOptimizerState {
             m: vec![0.0; 7], // 7 parameters
             v: vec![0.0; 7],
             t: 0,
-            alpha: 0.01,   // Increased 10x: allows meaningful parameter updates
+            alpha: 0.1,    // Increased from 0.01 -> 10x faster convergence
             beta1: 0.9,
             beta2: 0.99,   // Reduced from 0.999: "forgets" old gradients 10x faster, prevents v explosion
             epsilon: 1e-8,
@@ -173,61 +242,66 @@ impl AdamOptimizerState {
 
 impl Default for TuningParams {
     fn default() -> Self {
+        // These are the inverse-transformed (phi) values of the original (theta) defaults
         Self {
-            skew_adjustment_factor: 0.5,
-            adverse_selection_adjustment_factor: 0.5,
-            adverse_selection_lambda: 0.1,
-            inventory_urgency_threshold: 0.7,
-            liquidation_rate_multiplier: 10.0,
-            min_spread_base_ratio: 0.2,
-            adverse_selection_spread_scale: 100.0,
-            control_gap_threshold: 1.0,
+            skew_adjustment_factor_phi: inv_scaled_sigmoid(0.5, 0.0, 2.0), // logit(0.25) = -1.0986
+            adverse_selection_adjustment_factor_phi: inv_scaled_sigmoid(0.5, 0.0, 2.0), // logit(0.25) = -1.0986
+            adverse_selection_lambda_phi: inv_scaled_sigmoid(0.1, 0.0, 1.0), // logit(0.1) = -2.1972
+            inventory_urgency_threshold_phi: inv_scaled_sigmoid(0.7, 0.0, 1.0), // logit(0.7) = 0.8473
+            liquidation_rate_multiplier_phi: inv_scaled_sigmoid(10.0, 0.0, 100.0), // logit(0.1) = -2.1972
+            min_spread_base_ratio_phi: inv_scaled_sigmoid(0.2, 0.0, 1.0), // logit(0.2) = -1.3863
+            adverse_selection_spread_scale_phi: inv_exp_transform(100.0), // ln(100.0) = 4.6052
+            control_gap_threshold_phi: inv_exp_transform(0.1), // ln(0.1) = -2.3026
         }
     }
 }
 
 impl TuningParams {
-    /// Validate that all parameters are within reasonable ranges
-    pub fn validate(&self) -> Result<(), String> {
-        if self.skew_adjustment_factor < 0.0 || self.skew_adjustment_factor > 2.0 {
-            return Err(format!("skew_adjustment_factor must be in [0.0, 2.0], got {}", self.skew_adjustment_factor));
+    /// Transform unconstrained (phi) parameters into constrained (theta) parameters
+    pub fn get_constrained(&self) -> ConstrainedTuningParams {
+        ConstrainedTuningParams {
+            skew_adjustment_factor: scaled_sigmoid(self.skew_adjustment_factor_phi, 0.0, 2.0),
+            adverse_selection_adjustment_factor: scaled_sigmoid(self.adverse_selection_adjustment_factor_phi, 0.0, 2.0),
+            adverse_selection_lambda: scaled_sigmoid(self.adverse_selection_lambda_phi, 0.0, 1.0),
+            inventory_urgency_threshold: scaled_sigmoid(self.inventory_urgency_threshold_phi, 0.0, 1.0),
+            liquidation_rate_multiplier: scaled_sigmoid(self.liquidation_rate_multiplier_phi, 0.0, 100.0),
+            min_spread_base_ratio: scaled_sigmoid(self.min_spread_base_ratio_phi, 0.0, 1.0),
+            adverse_selection_spread_scale: exp_transform(self.adverse_selection_spread_scale_phi),
+            control_gap_threshold: exp_transform(self.control_gap_threshold_phi),
         }
-        if self.adverse_selection_adjustment_factor < 0.0 || self.adverse_selection_adjustment_factor > 2.0 {
-            return Err(format!("adverse_selection_adjustment_factor must be in [0.0, 2.0], got {}", self.adverse_selection_adjustment_factor));
+    }
+
+    /// Convert a constrained (theta) struct into an unconstrained (phi) struct
+    /// This is used when loading from JSON
+    fn from_constrained(constrained: &ConstrainedTuningParams) -> Self {
+        Self {
+            skew_adjustment_factor_phi: inv_scaled_sigmoid(constrained.skew_adjustment_factor, 0.0, 2.0),
+            adverse_selection_adjustment_factor_phi: inv_scaled_sigmoid(constrained.adverse_selection_adjustment_factor, 0.0, 2.0),
+            adverse_selection_lambda_phi: inv_scaled_sigmoid(constrained.adverse_selection_lambda, 0.0, 1.0),
+            inventory_urgency_threshold_phi: inv_scaled_sigmoid(constrained.inventory_urgency_threshold, 0.0, 1.0),
+            liquidation_rate_multiplier_phi: inv_scaled_sigmoid(constrained.liquidation_rate_multiplier, 0.0, 100.0),
+            min_spread_base_ratio_phi: inv_scaled_sigmoid(constrained.min_spread_base_ratio, 0.0, 1.0),
+            adverse_selection_spread_scale_phi: inv_exp_transform(constrained.adverse_selection_spread_scale),
+            control_gap_threshold_phi: inv_exp_transform(constrained.control_gap_threshold),
         }
-        if self.adverse_selection_lambda < 0.0 || self.adverse_selection_lambda > 1.0 {
-            return Err(format!("adverse_selection_lambda must be in [0.0, 1.0], got {}", self.adverse_selection_lambda));
-        }
-        if self.inventory_urgency_threshold < 0.0 || self.inventory_urgency_threshold > 1.0 {
-            return Err(format!("inventory_urgency_threshold must be in [0.0, 1.0], got {}", self.inventory_urgency_threshold));
-        }
-        if self.liquidation_rate_multiplier < 0.0 || self.liquidation_rate_multiplier > 100.0 {
-            return Err(format!("liquidation_rate_multiplier must be in [0.0, 100.0], got {}", self.liquidation_rate_multiplier));
-        }
-        if self.min_spread_base_ratio < 0.0 || self.min_spread_base_ratio > 1.0 {
-            return Err(format!("min_spread_base_ratio must be in [0.0, 1.0], got {}", self.min_spread_base_ratio));
-        }
-        if self.adverse_selection_spread_scale <= 0.0 {
-            return Err(format!("adverse_selection_spread_scale must be positive, got {}", self.adverse_selection_spread_scale));
-        }
-        if self.control_gap_threshold <= 0.0 {
-            return Err(format!("control_gap_threshold must be positive, got {}", self.control_gap_threshold));
-        }
-        Ok(())
     }
     
     /// Load parameters from a JSON file
+    /// Reads constrained (theta) values and converts them to unconstrained (phi) for storage
     pub fn from_json_file(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let contents = std::fs::read_to_string(path)?;
-        let params: TuningParams = serde_json::from_str(&contents)?;
-        params.validate()?;
-        Ok(params)
+        // Deserialize into the *constrained* struct shape
+        let constrained_params: ConstrainedTuningParams = serde_json::from_str(&contents)?;
+        // Convert to our internal unconstrained (phi) representation
+        Ok(Self::from_constrained(&constrained_params))
     }
     
     /// Save parameters to a JSON file
+    /// Converts unconstrained (phi) values to constrained (theta) before saving
     pub fn to_json_file(&self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
-        self.validate()?;
-        let contents = serde_json::to_string_pretty(self)?;
+        // Get the human-readable constrained (theta) values
+        let constrained_params = self.get_constrained();
+        let contents = serde_json::to_string_pretty(&constrained_params)?;
         std::fs::write(path, contents)?;
         Ok(())
     }
@@ -265,6 +339,10 @@ pub struct StateVector {
     /// S_{t-1}: Previous mid-price - used for volatility calculation
     /// Tracks the last mid-price to compute log returns
     pub previous_mid_price: f64,
+    
+    /// EMA of recent trade flow direction (+1 for taker buy, -1 for taker sell)
+    /// This is updated by the Trades stream
+    pub trade_flow_ema: f64,
 }
 
 impl StateVector {
@@ -278,6 +356,7 @@ impl StateVector {
             lob_imbalance: 0.0,
             volatility_ema_bps: 10.0, // Default to 10 bps volatility estimate
             previous_mid_price: 0.0,
+            trade_flow_ema: 0.0, // Initialize to neutral
         }
     }
     
@@ -311,7 +390,7 @@ impl StateVector {
         inventory: f64,
         book_analysis: Option<&BookAnalysis>,
         order_book: Option<&OrderBook>,
-        tuning_params: &TuningParams,
+        tuning_params: &ConstrainedTuningParams,
     ) {
         // Calculate volatility before updating mid_price
         if let Some(new_vol) = self.calculate_new_volatility(mid_price) {
@@ -345,21 +424,27 @@ impl StateVector {
         }
     }
     
-    /// Update the adverse selection estimate using an exponential moving average
-    /// The LOB imbalance is used as a signal for short-term price direction
-    fn update_adverse_selection(&mut self, tuning_params: &TuningParams) {
-        // Smoothing parameter (lambda) - adjust this based on desired responsiveness
-        // Higher lambda = more weight on recent observations
+    /// Update the adverse selection estimate using a weighted average
+    /// This is called by `StateVector::update` (on AllMids)
+    fn update_adverse_selection(&mut self, tuning_params: &ConstrainedTuningParams) {
+        // Smoothing parameter (lambda) for the *combined* signal
         let lambda = tuning_params.adverse_selection_lambda;
+
+        // --- 1. Signal 1 (80%): Trade Flow (from our new EMA) ---
+        // We just read the value that is being updated by the Trades stream
+        let trade_flow_signal = self.trade_flow_ema;
+
+        // --- 2. Signal 2 (20%): LOB Imbalance (Corrected Logic) ---
+        // Corrected logic: (0.5 - I) -> thick ask (I < 0.5) is bullish
+        let lob_imbalance_signal = (0.5 - self.lob_imbalance) * 2.0; // Range: [-1, 1]
+
+        // --- 3. Combine Signals with 80/20 Weighting ---
+        let trade_flow_weight = 0.8;
+        let lob_weight = 0.2;
         
-        // Convert imbalance to directional signal centered at 0
-        // imbalance = 0.5 means balanced, no expected drift
-        // imbalance > 0.5 means buying pressure (positive drift expected)
-        // imbalance < 0.5 means selling pressure (negative drift expected)
-        let signal = (self.lob_imbalance - 0.5) * 2.0; // Range: [-1, 1]
-        
-        // Scale by market spread to account for volatility
-        // Higher spread = more uncertainty, scale down the signal
+        let signal = (trade_flow_weight * trade_flow_signal) + (lob_weight * lob_imbalance_signal);
+
+        // Scale by market spread
         let spread_scale = if self.market_spread_bps > 0.0 {
             1.0 / (1.0 + self.market_spread_bps / tuning_params.adverse_selection_spread_scale)
         } else {
@@ -368,7 +453,8 @@ impl StateVector {
         
         let scaled_signal = signal * spread_scale;
         
-        // Update estimate using exponential moving average
+        // Update the final adverse_selection_estimate using an EMA
+        // This provides a "second layer" of smoothing on the combined signal
         self.adverse_selection_estimate = 
             lambda * scaled_signal + (1.0 - lambda) * self.adverse_selection_estimate;
     }
@@ -426,20 +512,50 @@ impl StateVector {
     /// Get a string representation of the state vector for logging
     pub fn to_log_string(&self) -> String {
         format!(
-            "StateVector[S={:.2}, Q={:.4}, μ̂={:.4}, Δ={:.1}bps, I={:.3}, σ̂={:.2}bps]",
+            "StateVector[S={:.2}, Q={:.4}, μ̂={:.4}, Δ={:.1}bps, I={:.3}, σ̂={:.2}bps, TF_EMA={:.3}]",
             self.mid_price,
             self.inventory,
-            self.adverse_selection_estimate,
+            self.adverse_selection_estimate, // This is the final combined/smoothed signal
             self.market_spread_bps,
             self.lob_imbalance,
-            self.volatility_ema_bps
+            self.volatility_ema_bps,
+            self.trade_flow_ema // This is the raw trade flow signal
         )
+    }
+    
+    /// Update the trade flow EMA from a batch of trades
+    pub fn update_trade_flow_ema(
+        &mut self,
+        trades: &Vec<crate::Trade>,
+        tuning_params: &ConstrainedTuningParams,
+    ) {
+        if trades.is_empty() {
+            return;
+        }
+        
+        // Use adverse_selection_lambda for smoothing the trade flow.
+        // You could also add a new, dedicated parameter for this.
+        let lambda = tuning_params.adverse_selection_lambda;
+        let decay = 1.0 - lambda;
+        
+        // We must apply the EMA sequentially for each trade in the batch
+        // to correctly model time.
+        for trade in trades {
+            // side="A" = Taker hit ask = Bullish = +1.0
+            // side="B" = Taker hit bid = Bearish = -1.0
+            let signal = if trade.side == "A" { 1.0 } else { -1.0 };
+            
+            // Update EMA: V_t = λ * S_t + (1-λ) * V_{t-1}
+            self.trade_flow_ema = lambda * signal + decay * self.trade_flow_ema;
+        }
     }
 }
 
 impl Default for StateVector {
     fn default() -> Self {
-        Self::new()
+        let mut s = Self::new();
+        s.trade_flow_ema = 0.0; // Ensure it's set in default as well
+        s
     }
 }
 
@@ -585,7 +701,8 @@ impl ControlVector {
         state: &StateVector,
         base_spread_bps: f64,
         max_inventory: f64,
-        tuning_params: &TuningParams,
+        tuning_params: &ConstrainedTuningParams,
+        hjb_components: &HJBComponents,
     ) {
         // 1. Adverse Selection Adjustment (Two-Sided Shift)
         let adverse_adj = state.get_adverse_selection_adjustment(
@@ -627,6 +744,14 @@ impl ControlVector {
         // Ensure offsets stay positive
         self.ask_offset_bps = self.ask_offset_bps.max(base_spread_bps * tuning_params.min_spread_base_ratio);
         self.bid_offset_bps = self.bid_offset_bps.max(base_spread_bps * tuning_params.min_spread_base_ratio);
+        
+        // --- NEW: Explicitly add maker fee buffer ---
+        // Add slightly more than the fee as a buffer (e.g., fee + 0.5bps)
+        // This ensures our quotes always cover the fee, especially when base spread hits the floor
+        let fee_buffer_bps = hjb_components.maker_fee_bps + 0.5;
+        self.ask_offset_bps += fee_buffer_bps;
+        self.bid_offset_bps += fee_buffer_bps;
+        // --- End New ---
         
         // 4. Active Liquidation Control
         // If inventory urgency is high, activate taker orders
@@ -771,6 +896,9 @@ pub struct HJBComponents {
     /// Inventory penalty (φ in objective)
     pub phi: f64,
     
+    /// Maker fee (paid when passively filled) in BPS
+    pub maker_fee_bps: f64,
+    
     /// Taker fee (paid when crossing spread)
     pub taker_fee_bps: f64,
 }
@@ -781,7 +909,8 @@ impl HJBComponents {
         Self {
             lambda_base: 1.0,      // 1 fill per second at best quotes
             phi: 0.01,             // Inventory penalty coefficient
-            taker_fee_bps: 2.0,    // 2 bps taker fee
+            maker_fee_bps: 1.5,    // 1.5 bps maker fee
+            taker_fee_bps: 4.5,    // 4.5 bps taker fee
         }
     }
     
@@ -819,7 +948,7 @@ impl HJBComponents {
     }
     
     /// Calculate expected value from maker bid fill
-    /// λ^b * [V(Q+1) - V(Q) - (S_t - δ^b)]
+    /// λ^b * [V(Q+1) - V(Q) - (S_t - δ^b) - fee]
     pub fn maker_bid_value(
         &self,
         bid_offset_bps: f64,
@@ -833,13 +962,17 @@ impl HJBComponents {
         
         // Cash flow: we pay (S_t - δ^b) to buy
         let price_paid = state.mid_price * (1.0 - bid_offset_bps / 10000.0);
-        let cash_flow = -price_paid;
+        
+        // Maker fee: paid on the filled notional
+        let maker_fee = price_paid * self.maker_fee_bps / 10000.0;
+        
+        let cash_flow = -price_paid - maker_fee;
         
         lambda_b * (value_change + cash_flow)
     }
     
     /// Calculate expected value from maker ask fill
-    /// λ^a * [V(Q-1) - V(Q) + (S_t + δ^a)]
+    /// λ^a * [V(Q-1) - V(Q) + (S_t + δ^a) - fee]
     pub fn maker_ask_value(
         &self,
         ask_offset_bps: f64,
@@ -853,7 +986,11 @@ impl HJBComponents {
         
         // Cash flow: we receive (S_t + δ^a) from selling
         let price_received = state.mid_price * (1.0 + ask_offset_bps / 10000.0);
-        let cash_flow = price_received;
+        
+        // Maker fee: paid on the filled notional
+        let maker_fee = price_received * self.maker_fee_bps / 10000.0;
+        
+        let cash_flow = price_received - maker_fee;
         
         lambda_a * (value_change + cash_flow)
     }
@@ -1020,6 +1157,10 @@ pub struct MarketMakerInput {
     pub wallet: PrivateKeySigner, // Wallet containing private key
     pub inventory_skew_config: Option<InventorySkewConfig>, // Optional inventory skewing configuration
     pub spread_volatility_multiplier: f64, // Multiplier for dynamic spread: spread = volatility_ema * multiplier (e.g., 1.5)
+    
+    /// Performance gap threshold (in percent) to enable live trading
+    /// E.g., 15.0 means trading starts when heuristic gap is < 15%
+    pub enable_trading_gap_threshold_percent: f64,
 }
 
 #[derive(Debug)]
@@ -1054,6 +1195,11 @@ pub struct MarketMaker {
     pub adam_optimizer: Arc<RwLock<AdamOptimizerState>>,
     /// Multiplier for dynamic spread calculation: spread = volatility_ema * multiplier
     pub spread_volatility_multiplier: f64,
+    /// Flag indicating if live trading is enabled (set by optimizer)
+    pub trading_enabled: Arc<RwLock<bool>>,
+    /// Performance gap threshold (in percent) to enable live trading
+    /// E.g., 15.0 means trading starts when heuristic gap is < 15%
+    pub enable_trading_gap_threshold_percent: f64,
 }
 
 impl MarketMaker {
@@ -1064,13 +1210,14 @@ impl MarketMaker {
     
     /// Update the state vector with current market conditions
     fn update_state_vector(&mut self) {
-        let params = self.tuning_params.read().unwrap();
+        // Get constrained (theta) params for use in logic
+        let constrained_params = self.tuning_params.read().unwrap().get_constrained();
         self.state_vector.update(
             self.latest_mid_price,
             self.cur_position,
             self.latest_book_analysis.as_ref(),
             self.latest_book.as_ref(),
-            &params,
+            &constrained_params,
         );
         
         // Log state vector for monitoring (can be disabled for performance)
@@ -1087,9 +1234,10 @@ impl MarketMaker {
         let base_spread_bps = self.state_vector.volatility_ema_bps * self.spread_volatility_multiplier;
         
         // Ensure minimum spread to avoid zero or negative spreads
-        let base_spread_bps = base_spread_bps.max(5.0); // Minimum 5 bps total spread
+        let base_spread_bps = base_spread_bps.max(12.0); // Minimum 12 bps total spread
         
-        let params = self.tuning_params.read().unwrap();
+        // Get constrained (theta) params for use in logic
+        let constrained_params = self.tuning_params.read().unwrap().get_constrained();
         
         // Log dynamic spread calculation
         info!(
@@ -1113,7 +1261,8 @@ impl MarketMaker {
             &self.state_vector,
             base_spread_bps,
             self.max_absolute_position_size,
-            &params,
+            &constrained_params,
+            &self.hjb_components,
         );
         
         // Validate the control vector
@@ -1228,12 +1377,13 @@ impl MarketMaker {
         let hjb_components = self.hjb_components.clone();
         let state_vector = self.state_vector.clone();
         let value_function = self.value_function.clone();
-        let current_control = self.control_vector.clone();
         // Use dynamic spread calculation
         let base_spread_bps = (state_vector.volatility_ema_bps * self.spread_volatility_multiplier).max(5.0);
         let max_absolute_position_size = self.max_absolute_position_size;
         let tuning_params = Arc::clone(&self.tuning_params);
         let adam_optimizer = Arc::clone(&self.adam_optimizer);
+        let trading_enabled = Arc::clone(&self.trading_enabled);
+        let enable_trading_gap_threshold_percent = self.enable_trading_gap_threshold_percent;
         
         tokio::task::spawn_blocking(move || {
             // Run expensive grid search optimization
@@ -1243,9 +1393,21 @@ impl MarketMaker {
                 base_spread_bps,
             );
             
-            // Evaluate both controls for comparison
+            // Recompute heuristic fresh using the SAME state_vector as optimal control
+            // This ensures apples-to-apples comparison at State_t0
+            let constrained_params = tuning_params.read().unwrap().get_constrained();
+            let mut heuristic_control_recomputed = ControlVector::symmetric(base_spread_bps);
+            heuristic_control_recomputed.apply_state_adjustments(
+                &state_vector,
+                base_spread_bps,
+                max_absolute_position_size,
+                &constrained_params,
+                &hjb_components,
+            );
+            
+            // Evaluate both controls for comparison (both based on same state_vector)
             let heuristic_value = hjb_components.evaluate_control(
-                &current_control,
+                &heuristic_control_recomputed,
                 &state_vector,
                 &value_function,
             );
@@ -1257,6 +1419,31 @@ impl MarketMaker {
             );
             
             // ============================================
+            // PERFORMANCE GAP CALCULATION AND TRADING ENABLEMENT
+            // ============================================
+            
+            // Calculate performance gap as percentage
+            let perf_gap = (optimal_value - heuristic_value).abs();
+            let gap_percent = if optimal_value.abs() > EPSILON {
+                (perf_gap / optimal_value.abs()) * 100.0
+            } else {
+                0.0
+            };
+            
+            // Check if trading should be enabled based on performance gap
+            // Only enable if currently disabled AND gap is below threshold
+            if !*trading_enabled.read().unwrap() && gap_percent <= enable_trading_gap_threshold_percent {
+                // Acquire write lock and enable trading
+                let mut enabled = trading_enabled.write().unwrap();
+                *enabled = true;
+                // Log the transition
+                info!(
+                    "✅ Performance gap ({:.2}%) is below threshold ({:.2}%). ENABLING LIVE TRADING.",
+                    gap_percent, enable_trading_gap_threshold_percent
+                );
+            }
+            
+            // ============================================
             // ADAM OPTIMIZER-BASED AUTOMATIC PARAMETER TUNING
             // ============================================
             
@@ -1264,8 +1451,8 @@ impl MarketMaker {
             // L = (bid_optimal - bid_heuristic)² + (ask_optimal - ask_heuristic)²
             // This measures how different our quotes are from optimal, which produces
             // stable, interpretable gradients compared to the value gap.
-            let bid_gap = optimal_control.bid_offset_bps - current_control.bid_offset_bps;
-            let ask_gap = optimal_control.ask_offset_bps - current_control.ask_offset_bps;
+            let bid_gap = optimal_control.bid_offset_bps - heuristic_control_recomputed.bid_offset_bps;
+            let ask_gap = optimal_control.ask_offset_bps - heuristic_control_recomputed.ask_offset_bps;
             let current_loss = bid_gap.powi(2) + ask_gap.powi(2);
             
             // Get configurable control gap threshold from tuning params
@@ -1273,19 +1460,21 @@ impl MarketMaker {
             // - Volatile/noisy markets: higher threshold (5.0-20.0) prevents chasing noise
             // - Stable/quiet markets: lower threshold (0.5-2.0) allows fine-tuning
             let control_gap_threshold = {
-                let params = tuning_params.read().unwrap();
-                params.control_gap_threshold
+                // Get the constrained (theta) value of the threshold
+                tuning_params.read().unwrap().get_constrained().control_gap_threshold
             };
             
             if current_loss > control_gap_threshold {
                 info!("Control gap detected: {:.6} bps² (bid_gap={:.2}bps, ask_gap={:.2}bps, threshold={:.2}bps²). Running Adam optimizer parameter tuning...", 
                     current_loss, bid_gap, ask_gap, control_gap_threshold);
                 
-                // 2. Gradient Calculation Parameters
-                let nudge_percent = 0.01; // 1% relative perturbation for stability across different parameter scales
+                // 2. Get current parameters
+                // These are the *unconstrained* (phi) parameters
+                let original_params_phi = tuning_params.read().unwrap().clone();
                 
-                // 3. Get current parameters
-                let original_params = tuning_params.read().unwrap().clone();
+                // Get the constrained (theta) params for logging purposes
+                let original_params_theta = original_params_phi.get_constrained();
+                
                 let mut gradient_vector: Vec<f64> = vec![0.0; 7];
                 
                 // 4. Calculate numerical gradient for each parameter
@@ -1300,47 +1489,47 @@ impl MarketMaker {
                 ];
                 
                 for (param_name, i) in param_indices.iter() {
-                    // Get current parameter value and calculate relative nudge
-                    let current_value = match *i {
-                        0 => original_params.skew_adjustment_factor,
-                        1 => original_params.adverse_selection_adjustment_factor,
-                        2 => original_params.adverse_selection_lambda,
-                        3 => original_params.inventory_urgency_threshold,
-                        4 => original_params.liquidation_rate_multiplier,
-                        5 => original_params.min_spread_base_ratio,
-                        6 => original_params.adverse_selection_spread_scale,
+                    // Get current parameter value for logging
+                    let current_theta_value = match *i {
+                        0 => original_params_theta.skew_adjustment_factor,
+                        1 => original_params_theta.adverse_selection_adjustment_factor,
+                        2 => original_params_theta.adverse_selection_lambda,
+                        3 => original_params_theta.inventory_urgency_threshold,
+                        4 => original_params_theta.liquidation_rate_multiplier,
+                        5 => original_params_theta.min_spread_base_ratio,
+                        6 => original_params_theta.adverse_selection_spread_scale,
                         _ => 0.0,
                     };
                     
-                    // Use relative perturbation: 1% of current value
-                    // This ensures gradients are on consistent scale regardless of parameter magnitude
-                    // e.g., for lambda=0.1, nudge=0.001; for spread_scale=100.0, nudge=1.0
-                    let nudge_amount = current_value.abs() * nudge_percent;
+                    // Nudge the *unconstrained* (phi) parameter
+                    // A small, consistent nudge in phi-space is stable
+                    let nudge_amount = match *i {
+                        0 | 1 => 0.001,
+                        2 => 0.001, // Standardized nudge
+                        3 => 0.001,
+                        4 => 0.001, // Standardized nudge
+                        5 => 0.001,
+                        6 => 0.001, // Standardized nudge
+                        _ => 0.001,
+                    };
                     
-                    // Skip if parameter is too close to zero (would make relative nudge unstable)
-                    if nudge_amount < 1e-8 {
-                        info!("Skipping {} - parameter too close to zero for relative nudge", param_name);
-                        continue;
-                    }
-                    
-                    // Create nudged parameters
-                    let mut nudged_params = original_params.clone();
+                    // Create nudged *unconstrained* (phi) parameters
+                    let mut nudged_params_phi = original_params_phi.clone();
                     match *i {
-                        0 => nudged_params.skew_adjustment_factor += nudge_amount,
-                        1 => nudged_params.adverse_selection_adjustment_factor += nudge_amount,
-                        2 => nudged_params.adverse_selection_lambda += nudge_amount,
-                        3 => nudged_params.inventory_urgency_threshold += nudge_amount,
-                        4 => nudged_params.liquidation_rate_multiplier += nudge_amount,
-                        5 => nudged_params.min_spread_base_ratio += nudge_amount,
-                        6 => nudged_params.adverse_selection_spread_scale += nudge_amount,
+                        0 => nudged_params_phi.skew_adjustment_factor_phi += nudge_amount,
+                        1 => nudged_params_phi.adverse_selection_adjustment_factor_phi += nudge_amount,
+                        2 => nudged_params_phi.adverse_selection_lambda_phi += nudge_amount,
+                        3 => nudged_params_phi.inventory_urgency_threshold_phi += nudge_amount,
+                        4 => nudged_params_phi.liquidation_rate_multiplier_phi += nudge_amount,
+                        5 => nudged_params_phi.min_spread_base_ratio_phi += nudge_amount,
+                        6 => nudged_params_phi.adverse_selection_spread_scale_phi += nudge_amount,
                         _ => {}
                     }
                     
-                    // Skip if nudged params are invalid
-                    if nudged_params.validate().is_err() {
-                        info!("Skipping {} - nudge would violate constraints", param_name);
-                        continue;
-                    }
+                    // Get the *constrained* (theta) version of the nudged params
+                    let nudged_params_theta = nudged_params_phi.get_constrained();
+                    
+                    // Validation is no longer needed, parameters are valid by construction
                     
                     // Re-run heuristic with nudged params
                     let mut nudged_control = ControlVector::symmetric(base_spread_bps);
@@ -1348,7 +1537,8 @@ impl MarketMaker {
                         &state_vector,
                         base_spread_bps,
                         max_absolute_position_size,
-                        &nudged_params,
+                        &nudged_params_theta, // Use constrained params
+                        &hjb_components,
                     );
                     
                     // Calculate control gap loss with nudged params
@@ -1358,24 +1548,40 @@ impl MarketMaker {
                     let nudged_loss = nudged_bid_gap.powi(2) + nudged_ask_gap.powi(2);
                     
                     // Calculate partial derivative (gradient component)
-                    // dL/dθ = (L(θ + δθ) - L(θ)) / δθ
-                    // With relative nudge, this is automatically scaled correctly for each parameter
+                    // dL/d_phi = (L(phi + d_phi) - L(phi)) / d_phi
+                    // Pure numerical gradient without heuristic normalization
+                    // The sigmoid/exp transformations already handle scaling naturally
                     let gradient = (nudged_loss - current_loss) / nudge_amount;
                     gradient_vector[*i] = gradient;
                     
-                    info!("Gradient[{}] = {:.6} (value={:.6}, nudge={:.6})", param_name, gradient, current_value, nudge_amount);
+                    info!("Gradient[{}] = {:.6} (theta_value={:.6}, nudge_phi={:.6})", param_name, gradient, current_theta_value, nudge_amount);
                 }
                 
-                // 5. Gradient Clipping (prevent outlier gradients from poisoning v vector)
-                let max_gradient_norm = 10.0; // Clip individual gradients above this value
+                // 5. Gradient Clipping (relax thresholds due to normalization)
+                let max_individual_norm = 100.0; // Relaxed individual clipping
+                let max_global_norm = 50.0;      // Added global norm clipping
+
                 let mut clipped_gradient_vector = gradient_vector.clone();
                 let mut num_clipped = 0;
-                
+
+                // Clip individual gradients
                 for i in 0..7 {
-                    if clipped_gradient_vector[i].abs() > max_gradient_norm {
-                        clipped_gradient_vector[i] = clipped_gradient_vector[i].signum() * max_gradient_norm;
+                    if clipped_gradient_vector[i].abs() > max_individual_norm {
+                        clipped_gradient_vector[i] = clipped_gradient_vector[i].signum() * max_individual_norm;
                         num_clipped += 1;
                     }
+                }
+
+                // Also clip by global norm (prevents extreme cases even after individual clipping)
+                let gradient_norm_after_individual: f64 = clipped_gradient_vector.iter().map(|g| g.powi(2)).sum::<f64>().sqrt();
+                if gradient_norm_after_individual > max_global_norm {
+                    let scale = max_global_norm / (gradient_norm_after_individual + 1e-8); // Add epsilon for stability
+                    for i in 0..7 {
+                        clipped_gradient_vector[i] *= scale;
+                    }
+                    info!("  Applied global norm scaling: {:.3}x", scale);
+                    // Ensure num_clipped reflects that clipping occurred, even if only global
+                    if num_clipped == 0 { num_clipped = 1; }
                 }
                 
                 // Calculate gradient norm for monitoring (L2 norm)
@@ -1394,7 +1600,7 @@ impl MarketMaker {
                     
                     // Learning rate warmup: gradually increase alpha over first N steps
                     // This prevents divergence when optimizer's internal state is still initializing
-                    let warmup_steps = 10;
+                    let warmup_steps = 3; // Changed from 10: faster warmup with normalized gradients
                     let current_step = optimizer.t + 1; // +1 because compute_update increments t
                     let warmup_factor = if current_step <= warmup_steps {
                         current_step as f64 / warmup_steps as f64
@@ -1423,7 +1629,7 @@ impl MarketMaker {
                     info!("  Base learning rate (α): {}", optimizer.alpha);
                     
                     // Calculate warmup factor for current step
-                    let warmup_steps = 10;
+                    let warmup_steps = 3; // Changed from 10: faster warmup with normalized gradients
                     let warmup_factor = if optimizer.t <= warmup_steps {
                         optimizer.t as f64 / warmup_steps as f64
                     } else {
@@ -1447,14 +1653,15 @@ impl MarketMaker {
                 }
                 
                 // 8. Apply updates: theta_new = theta_old - update
-                let mut updated_params = original_params.clone();
-                updated_params.skew_adjustment_factor -= updates[0];
-                updated_params.adverse_selection_adjustment_factor -= updates[1];
-                updated_params.adverse_selection_lambda -= updates[2];
-                updated_params.inventory_urgency_threshold -= updates[3];
-                updated_params.liquidation_rate_multiplier -= updates[4];
-                updated_params.min_spread_base_ratio -= updates[5];
-                updated_params.adverse_selection_spread_scale -= updates[6];
+                // This updates the *unconstrained* (phi) parameters
+                let mut updated_params_phi = original_params_phi.clone();
+                updated_params_phi.skew_adjustment_factor_phi -= updates[0];
+                updated_params_phi.adverse_selection_adjustment_factor_phi -= updates[1];
+                updated_params_phi.adverse_selection_lambda_phi -= updates[2];
+                updated_params_phi.inventory_urgency_threshold_phi -= updates[3];
+                updated_params_phi.liquidation_rate_multiplier_phi -= updates[4];
+                updated_params_phi.min_spread_base_ratio_phi -= updates[5];
+                updated_params_phi.adverse_selection_spread_scale_phi -= updates[6];
                 
                 // Calculate update norm for monitoring
                 let update_norm: f64 = updates.iter().map(|u| u.powi(2)).sum::<f64>().sqrt();
@@ -1464,73 +1671,76 @@ impl MarketMaker {
                     updates.iter().enumerate().map(|(i, u)| (u.abs(), i)).max_by(|a, b| a.0.partial_cmp(&b.0).unwrap()).unwrap().0,
                     updates.iter().enumerate().map(|(i, u)| (u.abs(), i)).max_by(|a, b| a.0.partial_cmp(&b.0).unwrap()).unwrap().1);
                 
-                // 9. Validate and apply the updated parameters
-                match updated_params.validate() {
-                    Ok(_) => {
+                // 9. Apply the updated parameters
+                // Validation is no longer needed as parameters are valid by construction
                         // Parameters are valid, apply them
                         {
                             let mut params = tuning_params.write().unwrap();
-                            *params = updated_params.clone();
+                            *params = updated_params_phi.clone();
                         }
+                        info!("Adam Update Applied (unconstrained phi): {:?}", updated_params_phi);
                         
-                        info!("Adam Update Applied: {:?}", updated_params);
+                        // Log the changes for each parameter
+                        info!("Parameter Changes:");
+                        
+                        // Get *constrained* (theta) values for logging
+                        let updated_params_theta = updated_params_phi.get_constrained();
+                        info!("  skew_adjustment_factor (theta): {:.6} -> {:.6} (Δ={:.6})",
+                            original_params_theta.skew_adjustment_factor,
+                            updated_params_theta.skew_adjustment_factor,
+                            updated_params_theta.skew_adjustment_factor - original_params_theta.skew_adjustment_factor);
+                        info!("  adverse_selection_adjustment_factor (theta): {:.6} -> {:.6} (Δ={:.6})",
+                            original_params_theta.adverse_selection_adjustment_factor,
+                            updated_params_theta.adverse_selection_adjustment_factor,
+                            updated_params_theta.adverse_selection_adjustment_factor - original_params_theta.adverse_selection_adjustment_factor);
+                        info!("  adverse_selection_lambda (theta): {:.6} -> {:.6} (Δ={:.6})",
+                            original_params_theta.adverse_selection_lambda,
+                            updated_params_theta.adverse_selection_lambda,
+                            updated_params_theta.adverse_selection_lambda - original_params_theta.adverse_selection_lambda);
+                        info!("  inventory_urgency_threshold (theta): {:.6} -> {:.6} (Δ={:.6})",
+                            original_params_theta.inventory_urgency_threshold,
+                            updated_params_theta.inventory_urgency_threshold,
+                            updated_params_theta.inventory_urgency_threshold - original_params_theta.inventory_urgency_threshold);
+                        info!("  liquidation_rate_multiplier (theta): {:.6} -> {:.6} (Δ={:.6})",
+                            original_params_theta.liquidation_rate_multiplier,
+                            updated_params_theta.liquidation_rate_multiplier,
+                            updated_params_theta.liquidation_rate_multiplier - original_params_theta.liquidation_rate_multiplier);
+                        info!("  min_spread_base_ratio (theta): {:.6} -> {:.6} (Δ={:.6})",
+                            original_params_theta.min_spread_base_ratio,
+                            updated_params_theta.min_spread_base_ratio,
+                            updated_params_theta.min_spread_base_ratio - original_params_theta.min_spread_base_ratio);
+                        info!("  adverse_selection_spread_scale (theta): {:.6} -> {:.6} (Δ={:.6})",
+                            original_params_theta.adverse_selection_spread_scale,
+                            updated_params_theta.adverse_selection_spread_scale,
+                            updated_params_theta.adverse_selection_spread_scale - original_params_theta.adverse_selection_spread_scale);
                         
                         // Save to JSON file for persistence
-                        if let Err(e) = updated_params.to_json_file("tuning_params.json") {
+                        // This saves the *constrained* (theta) values
+                        if let Err(e) = updated_params_phi.to_json_file("tuning_params.json") {
                             error!("Failed to save updated tuning params to JSON: {}", e);
                         } else {
                             info!("Updated tuning parameters saved to tuning_params.json");
                         }
-                        
-                        // Log the changes for each parameter
-                        info!("Parameter Changes:");
-                        info!("  skew_adjustment_factor: {:.6} -> {:.6} (Δ={:.6})",
-                            original_params.skew_adjustment_factor,
-                            updated_params.skew_adjustment_factor,
-                            updated_params.skew_adjustment_factor - original_params.skew_adjustment_factor);
-                        info!("  adverse_selection_adjustment_factor: {:.6} -> {:.6} (Δ={:.6})",
-                            original_params.adverse_selection_adjustment_factor,
-                            updated_params.adverse_selection_adjustment_factor,
-                            updated_params.adverse_selection_adjustment_factor - original_params.adverse_selection_adjustment_factor);
-                        info!("  adverse_selection_lambda: {:.6} -> {:.6} (Δ={:.6})",
-                            original_params.adverse_selection_lambda,
-                            updated_params.adverse_selection_lambda,
-                            updated_params.adverse_selection_lambda - original_params.adverse_selection_lambda);
-                        info!("  inventory_urgency_threshold: {:.6} -> {:.6} (Δ={:.6})",
-                            original_params.inventory_urgency_threshold,
-                            updated_params.inventory_urgency_threshold,
-                            updated_params.inventory_urgency_threshold - original_params.inventory_urgency_threshold);
-                        info!("  liquidation_rate_multiplier: {:.6} -> {:.6} (Δ={:.6})",
-                            original_params.liquidation_rate_multiplier,
-                            updated_params.liquidation_rate_multiplier,
-                            updated_params.liquidation_rate_multiplier - original_params.liquidation_rate_multiplier);
-                        info!("  min_spread_base_ratio: {:.6} -> {:.6} (Δ={:.6})",
-                            original_params.min_spread_base_ratio,
-                            updated_params.min_spread_base_ratio,
-                            updated_params.min_spread_base_ratio - original_params.min_spread_base_ratio);
-                        info!("  adverse_selection_spread_scale: {:.6} -> {:.6} (Δ={:.6})",
-                            original_params.adverse_selection_spread_scale,
-                            updated_params.adverse_selection_spread_scale,
-                            updated_params.adverse_selection_spread_scale - original_params.adverse_selection_spread_scale);
-                    }
-                    Err(e) => {
-                        error!("Adam optimizer produced invalid parameters: {}. Reverting to original.", e);
-                        error!("Attempted params: {:?}", updated_params);
-                        
-                        // Reset Adam optimizer state when encountering invalid parameters
-                        // This helps recover from bad optimization trajectories
-                        {
-                            let mut optimizer = adam_optimizer.write().unwrap();
-                            optimizer.reset();
-                            info!("Adam optimizer state has been reset due to invalid parameters");
-                        }
-                    }
-                }
             } else {
                 info!("Control gap {:.6} bps² is below threshold {:.6} bps², skipping Adam tuning", 
                     current_loss, control_gap_threshold);
                 info!("Heuristic quotes close to optimal (bid_gap={:.2}bps, ask_gap={:.2}bps)", 
                     bid_gap, ask_gap);
+            }
+            
+            // ============================================
+            // LOG OPTIMIZATION RESULTS
+            // ============================================
+            
+            info!(
+                "Background HJB Optimization Complete: Heuristic_Value={:.4}, Optimal_Value={:.4}, Gap={:.2}%",
+                heuristic_value, optimal_value, gap_percent
+            );
+            info!("Optimal Control (from grid search): {}", optimal_control.to_log_string());
+            
+            // Warn if performance gap is high
+            if gap_percent > 10.0 {
+                log::warn!("Heuristic performance gap is high (>{:.2}%)! Consider tuning.", gap_percent);
             }
             
             (optimal_control, heuristic_value, optimal_value)
@@ -1542,11 +1752,12 @@ impl MarketMaker {
     pub fn calculate_state_based_spread_adjustment(&self) -> f64 {
         // Use dynamic spread calculation
         let base_spread_bps = (self.state_vector.volatility_ema_bps * self.spread_volatility_multiplier).max(5.0);
-        let params = self.tuning_params.read().unwrap();
+        // Get constrained (theta) params
+        let constrained_params = self.tuning_params.read().unwrap().get_constrained();
         
         // Get adverse selection adjustment
         let adverse_adjustment = self.state_vector
-            .get_adverse_selection_adjustment(base_spread_bps, params.adverse_selection_adjustment_factor);
+            .get_adverse_selection_adjustment(base_spread_bps, constrained_params.adverse_selection_adjustment_factor);
         
         // Get inventory risk multiplier
         let risk_multiplier = self.state_vector
@@ -1644,7 +1855,8 @@ impl MarketMaker {
                 TuningParams::default()
             });
         
-        info!("Initialized with tuning parameters: {:?}", initial_params);
+        // Log the *constrained* (theta) values for readability
+        info!("Initialized with tuning parameters (constrained): {:?}", initial_params.get_constrained());
         info!("Adam optimizer will now autonomously tune these parameters");
 
         Ok(MarketMaker {
@@ -1679,6 +1891,8 @@ impl MarketMaker {
             tuning_params: Arc::new(RwLock::new(initial_params)),
             adam_optimizer: Arc::new(RwLock::new(AdamOptimizerState::default())),
             spread_volatility_multiplier: input.spread_volatility_multiplier,
+            trading_enabled: Arc::new(RwLock::new(false)), // Start with trading disabled until optimizer validates performance
+            enable_trading_gap_threshold_percent: input.enable_trading_gap_threshold_percent,
         })
     }
 
@@ -1714,11 +1928,23 @@ impl MarketMaker {
                     Subscription::L2Book {
                         coin: self.asset.clone(),
                     },
-                    sender,
+                    sender.clone(),
                 )
                 .await
                 .unwrap();
         }
+
+        // Subscribe to Trades data for trade flow analysis
+        info!("Subscribing to Trades data for trade flow analysis");
+        self.info_client
+            .subscribe(
+                Subscription::Trades {
+                    coin: self.asset.clone(),
+                },
+                sender,
+            )
+            .await
+            .unwrap();
 
         // Initialize background optimization loop timer
         let mut last_optimization_time = std::time::Instant::now();
@@ -1799,6 +2025,12 @@ impl MarketMaker {
                         // Update state vector with new book data
                         self.update_state_vector();
                     }
+                }
+                Message::Trades(trades) => {
+                    // Get constrained (theta) params
+                    let constrained_params = self.tuning_params.read().unwrap().get_constrained();
+                    // Call our new function to update the trade flow EMA
+                    self.state_vector.update_trade_flow_ema(&trades.data, &constrained_params);
                 }
                 Message::AllMids(all_mids) => {
                     let all_mids = all_mids.data.mids;
@@ -2185,7 +2417,8 @@ impl MarketMaker {
         self.calculate_optimal_control();
         
         // Calculate dynamic reprice threshold based on current volatility-adjusted spread
-        let dynamic_base_spread = (self.state_vector.volatility_ema_bps * self.spread_volatility_multiplier).max(5.0);
+        // CRITICAL: Must use same .max(12.0) as calculate_optimal_control() to stay consistent
+        let dynamic_base_spread = (self.state_vector.volatility_ema_bps * self.spread_volatility_multiplier).max(12.0);
         let dynamic_max_bps_diff = (dynamic_base_spread * self.reprice_threshold_ratio) as u16;
         
         info!(
@@ -2194,6 +2427,24 @@ impl MarketMaker {
             self.reprice_threshold_ratio * 100.0,
             dynamic_base_spread
         );
+        
+        // ============================================
+        // CHECK IF TRADING IS ENABLED
+        // ============================================
+        
+        if !*self.trading_enabled.read().unwrap() {
+            info!(
+                "⏳ Trading disabled: Waiting for performance gap to close below {:.1}%. Skipping order placement/cancellation.",
+                self.enable_trading_gap_threshold_percent
+            );
+            // CRITICAL: Do NOT return here. We still need state updates to happen.
+            // Just skip the order management block below.
+            return;
+        }
+        
+        // ============================================
+        // ORDER MANAGEMENT (only executed if trading is enabled)
+        // ============================================
         
         // Execute taker orders if the control vector signals urgency
         // Taker sell: liquidate long position by hitting bids with market orders
@@ -2467,6 +2718,7 @@ mod tests {
             lob_imbalance: imbalance,
             volatility_ema_bps: 10.0, // Default test volatility
             previous_mid_price: mid_price, // Initialize to current price for tests
+            trade_flow_ema: 0.0, // Initialize to neutral for tests
         }
     }
 
@@ -2485,7 +2737,7 @@ mod tests {
     fn test_state_vector_update_basic() {
         let mut state = StateVector::new();
         let (book, analysis) = create_balanced_book();
-        let params = TuningParams::default();
+        let params = TuningParams::default().get_constrained();
         
         state.update(100.5, 0.0, Some(&analysis), Some(&book), &params);
         
@@ -2497,7 +2749,7 @@ mod tests {
     #[test]
     fn test_lob_imbalance_calculation() {
         let mut state = StateVector::new();
-        let params = TuningParams::default();
+        let params = TuningParams::default().get_constrained();
         
         let (book, analysis) = create_balanced_book();
         state.update(100.5, 0.0, Some(&analysis), Some(&book), &params);
@@ -2513,7 +2765,7 @@ mod tests {
     #[test]
     fn test_adverse_selection_adjustment() {
         let mut state = StateVector::new();
-        let params = TuningParams::default();
+        let params = TuningParams::default().get_constrained();
         
         state.adverse_selection_estimate = 0.1;
         let adjustment = state.get_adverse_selection_adjustment(100.0, params.adverse_selection_adjustment_factor);
@@ -2637,11 +2889,12 @@ mod tests {
     #[test]
     fn test_control_vector_state_adjustments() {
         let mut control = ControlVector::symmetric(10.0);
-        let params = TuningParams::default();
+        let params = TuningParams::default().get_constrained();
+        let hjb_components = HJBComponents::default();
         
         let state = create_test_state_vector(100.0, 0.0, 0.0, 10.0, 0.5);
         
-        control.apply_state_adjustments(&state, 10.0, 100.0, &params);
+        control.apply_state_adjustments(&state, 10.0, 100.0, &params, &hjb_components);
         
         // With neutral state, should remain roughly symmetric
         assert!(control.ask_offset_bps > 0.0);
@@ -2652,12 +2905,13 @@ mod tests {
     #[test]
     fn test_control_vector_adverse_selection_adjustment() {
         let mut control = ControlVector::symmetric(10.0);
-        let params = TuningParams::default();
+        let params = TuningParams::default().get_constrained();
+        let hjb_components = HJBComponents::default();
         
         // Bullish state (positive adverse selection - expect price to rise)
         let mut state = create_test_state_vector(100.0, 0.0, 0.2, 10.0, 0.7);
         
-        control.apply_state_adjustments(&state, 10.0, 100.0, &params);
+        control.apply_state_adjustments(&state, 10.0, 100.0, &params, &hjb_components);
         
         // Bullish signal should widen ask more than bid (make selling less attractive)
         // When price is expected to rise, we want to avoid selling cheap
@@ -2671,7 +2925,7 @@ mod tests {
         state.adverse_selection_estimate = -0.2;
         state.lob_imbalance = 0.3;
         
-        control.apply_state_adjustments(&state, 10.0, 100.0, &params);
+        control.apply_state_adjustments(&state, 10.0, 100.0, &params, &hjb_components);
         
         // Bearish signal should widen bid more than ask (make buying less attractive)
         // When price is expected to fall, we want to avoid buying high
@@ -2683,13 +2937,14 @@ mod tests {
     fn test_control_vector_inventory_adjustment() {
         let base_spread = 10.0;
         let max_inventory = 100.0;
-        let params = TuningParams::default();
+        let params = TuningParams::default().get_constrained();
+        let hjb_components = HJBComponents::default();
         
         // Long position - should tighten ask, widen bid
         let mut control = ControlVector::symmetric(base_spread);
         let state_long = create_test_state_vector(100.0, 80.0, 0.0, 10.0, 0.5); // 80% long
         
-        control.apply_state_adjustments(&state_long, base_spread, max_inventory, &params);
+        control.apply_state_adjustments(&state_long, base_spread, max_inventory, &params, &hjb_components);
         
         // Long position should create asymmetry favoring sells
         assert!(control.bid_offset_bps > control.ask_offset_bps);
@@ -2698,7 +2953,7 @@ mod tests {
         let mut control = ControlVector::symmetric(base_spread);
         let state_short = create_test_state_vector(100.0, -80.0, 0.0, 10.0, 0.5); // 80% short
         
-        control.apply_state_adjustments(&state_short, base_spread, max_inventory, &params);
+        control.apply_state_adjustments(&state_short, base_spread, max_inventory, &params, &hjb_components);
         
         // Short position should create asymmetry favoring buys
         assert!(control.ask_offset_bps > control.bid_offset_bps);
@@ -2707,12 +2962,13 @@ mod tests {
     #[test]
     fn test_control_vector_urgency_triggers_taker() {
         let mut control = ControlVector::symmetric(10.0);
-        let params = TuningParams::default();
+        let params = TuningParams::default().get_constrained();
+        let hjb_components = HJBComponents::default();
         
         // High urgency state (>0.7)
         let state = create_test_state_vector(100.0, 95.0, 0.0, 10.0, 0.5); // 95% of max = high urgency
         
-        control.apply_state_adjustments(&state, 10.0, 100.0, &params);
+        control.apply_state_adjustments(&state, 10.0, 100.0, &params, &hjb_components);
         
         // Should activate taker selling due to long position + high urgency
         assert!(control.taker_sell_rate > 0.0);
@@ -2724,20 +2980,21 @@ mod tests {
     fn test_control_vector_risk_multiplier_effect() {
         let base_spread = 10.0;
         let max_inventory = 100.0;
-        let params = TuningParams::default();
+        let params = TuningParams::default().get_constrained();
+        let hjb_components = HJBComponents::default();
         
         // Zero inventory - minimal risk
         let mut control_zero = ControlVector::symmetric(base_spread);
         let state_zero = create_test_state_vector(100.0, 0.0, 0.0, 10.0, 0.5);
         
-        control_zero.apply_state_adjustments(&state_zero, base_spread, max_inventory, &params);
+        control_zero.apply_state_adjustments(&state_zero, base_spread, max_inventory, &params, &hjb_components);
         let spread_zero = control_zero.total_spread_bps();
         
         // Max inventory - maximum risk
         let mut control_max = ControlVector::symmetric(base_spread);
         let state_max = create_test_state_vector(100.0, 100.0, 0.0, 10.0, 0.5);
         
-        control_max.apply_state_adjustments(&state_max, base_spread, max_inventory, &params);
+        control_max.apply_state_adjustments(&state_max, base_spread, max_inventory, &params, &hjb_components);
         let spread_max = control_max.total_spread_bps();
         
         // Max inventory should have wider spread due to risk multiplier
