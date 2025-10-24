@@ -10,7 +10,10 @@ The algorithm continuously monitors market state and adjusts quotes to maximize 
 while managing inventory risk through state-aware control policies.
 */
 use alloy::signers::local::PrivateKeySigner;
-use hyperliquid_rust_sdk::{AssetType, InventorySkewConfig, MarketMakerV2, MarketMakerInputV2};
+use hyperliquid_rust_sdk::{
+    AssetType, InventorySkewConfig,
+};
+use hyperliquid_rust_sdk::market_maker_v2::{MarketMaker, MarketMakerInput};
 use std::env;
 use tokio::signal;
 use log::info;
@@ -38,7 +41,7 @@ async fn main() {
         10,   // depth_analysis_levels: analyze top 10 levels for better state estimation
     ).expect("Failed to create skew config");
     
-    let market_maker_input = MarketMakerInputV2 {
+    let market_maker_input = MarketMakerInput {
         asset: "HYPE".to_string(),
         target_liquidity: 0.3,  // Order size: 0.3 per side (allows ~10 fills to reach max position)
         reprice_threshold_ratio: 0.5,  // Reprice when mid moves 50% of current spread (dynamic threshold)
@@ -51,7 +54,7 @@ async fn main() {
         enable_trading_gap_threshold_percent: 15.0,  // Enable trading when heuristic is within 15% of optimal
     };
     
-    let mut market_maker = MarketMakerV2::new(market_maker_input).await
+    let mut market_maker = MarketMaker::new(market_maker_input).await
         .expect("Failed to create market maker");
     
     info!("=== Market Maker V2 Initialized ===");

@@ -8,7 +8,7 @@ mod helpers;
 mod info;
 mod inventory_skew;
 mod market_maker;
-mod market_maker_v2;
+pub mod market_maker_v2;
 mod meta;
 mod prelude;
 mod req;
