@@ -696,17 +696,20 @@ impl ControlVector {
     
     /// Apply state-based adjustments to the control vector
     /// This is where the state vector informs the control vector
+    /// 
+    /// **IMPORTANT**: base_half_spread_bps should be the HALF-SPREAD, not total spread.
+    /// For example, if you want a 12 bps total spread, pass 6.0 as base_half_spread_bps.
     pub fn apply_state_adjustments(
         &mut self,
         state: &StateVector,
-        base_spread_bps: f64,
+        base_half_spread_bps: f64,
         max_inventory: f64,
         tuning_params: &ConstrainedTuningParams,
         hjb_components: &HJBComponents,
     ) {
         // 1. Adverse Selection Adjustment (Two-Sided Shift)
         let adverse_adj = state.get_adverse_selection_adjustment(
-            base_spread_bps,
+            base_half_spread_bps,
             tuning_params.adverse_selection_adjustment_factor,
         );
         
@@ -737,13 +740,13 @@ impl ControlVector {
             0.0
         };
         
-        let skew_adjustment = inventory_ratio * base_spread_bps * tuning_params.skew_adjustment_factor;
+        let skew_adjustment = inventory_ratio * base_half_spread_bps * tuning_params.skew_adjustment_factor;
         self.ask_offset_bps -= skew_adjustment; // Long -> tighter ask
         self.bid_offset_bps += skew_adjustment; // Long -> wider bid
         
-        // Ensure offsets stay positive
-        self.ask_offset_bps = self.ask_offset_bps.max(base_spread_bps * tuning_params.min_spread_base_ratio);
-        self.bid_offset_bps = self.bid_offset_bps.max(base_spread_bps * tuning_params.min_spread_base_ratio);
+        // Ensure offsets stay positive (using half-spread minimum)
+        self.ask_offset_bps = self.ask_offset_bps.max(base_half_spread_bps * tuning_params.min_spread_base_ratio);
+        self.bid_offset_bps = self.bid_offset_bps.max(base_half_spread_bps * tuning_params.min_spread_base_ratio);
         
         // --- NEW: Explicitly add maker fee buffer ---
         // Add slightly more than the fee as a buffer (e.g., fee + 0.5bps)
@@ -1082,6 +1085,9 @@ impl HJBComponents {
     ///   - Generate training data for ML-based control policies
     /// 
     /// For production, the fast heuristic is typically just as good and 100x+ faster.
+    /// 
+    /// **Parameter**: base_spread_bps should be the HALF-SPREAD (not total spread).
+    /// For example, if you want a 12 bps total spread, pass 6.0.
     pub fn optimize_control(
         &self,
         state: &StateVector,
@@ -1231,20 +1237,24 @@ impl MarketMaker {
         // This adapts to market conditions automatically:
         // - High volatility = wider spreads (more protection from adverse selection)
         // - Low volatility = tighter spreads (more competitive quotes)
-        let base_spread_bps = self.state_vector.volatility_ema_bps * self.spread_volatility_multiplier;
+        let base_total_spread_bps = self.state_vector.volatility_ema_bps * self.spread_volatility_multiplier;
         
         // Ensure minimum spread to avoid zero or negative spreads
-        let base_spread_bps = base_spread_bps.max(12.0); // Minimum 12 bps total spread
+        let base_total_spread_bps = base_total_spread_bps.max(12.0); // Minimum 12 bps total spread
+        
+        // Convert to half-spread for use in symmetric control initialization
+        let base_half_spread_bps = base_total_spread_bps / 2.0;
         
         // Get constrained (theta) params for use in logic
         let constrained_params = self.tuning_params.read().unwrap().get_constrained();
         
         // Log dynamic spread calculation
         info!(
-            "Dynamic spread: volatility={:.2}bps * multiplier={:.2} = {:.2}bps total spread",
+            "Dynamic spread: volatility={:.2}bps * multiplier={:.2} = {:.2}bps total spread ({:.2}bps half-spread)",
             self.state_vector.volatility_ema_bps,
             self.spread_volatility_multiplier,
-            base_spread_bps
+            base_total_spread_bps,
+            base_half_spread_bps
         );
         
         // Update value function time if needed
@@ -1253,23 +1263,23 @@ impl MarketMaker {
         
         // Use heuristic adjustments (fast, approximates HJB solution)
         // For full HJB optimization, call hjb_components.optimize_control() directly
-        // Start with symmetric quotes
-        self.control_vector = ControlVector::symmetric(base_spread_bps);
+        // Start with symmetric quotes using half-spread
+        self.control_vector = ControlVector::symmetric(base_half_spread_bps);
         
-        // Apply state-based adjustments
+        // Apply state-based adjustments using half-spread
         self.control_vector.apply_state_adjustments(
             &self.state_vector,
-            base_spread_bps,
+            base_half_spread_bps,
             self.max_absolute_position_size,
             &constrained_params,
             &self.hjb_components,
         );
         
-        // Validate the control vector
-        if let Err(e) = self.control_vector.validate(base_spread_bps * 0.5) {
+        // Validate the control vector using total spread minimum
+        if let Err(e) = self.control_vector.validate(base_total_spread_bps) {
             error!("Invalid control vector: {}", e);
-            // Fallback to safe symmetric control
-            self.control_vector = ControlVector::symmetric(base_spread_bps);
+            // Fallback to safe symmetric control using half-spread
+            self.control_vector = ControlVector::symmetric(base_half_spread_bps);
         }
         
         // Log control vector
@@ -1281,17 +1291,18 @@ impl MarketMaker {
     /// By default, calculate_optimal_control() uses fast heuristics
     pub fn calculate_optimal_control_hjb(&mut self) {
         // Use dynamic spread calculation (same as heuristic method)
-        let base_spread_bps = self.state_vector.volatility_ema_bps * self.spread_volatility_multiplier;
-        let base_spread_bps = base_spread_bps.max(5.0); // Minimum 5 bps
+        let base_total_spread_bps = self.state_vector.volatility_ema_bps * self.spread_volatility_multiplier;
+        let base_total_spread_bps = base_total_spread_bps.max(12.0); // Minimum 12 bps total spread
+        let base_half_spread_bps = base_total_spread_bps / 2.0;
         
         self.control_vector = self.hjb_components.optimize_control(
             &self.state_vector,
             &self.value_function,
-            base_spread_bps,
+            base_half_spread_bps,
         );
         
         // Validate the control vector
-        if let Err(e) = self.control_vector.validate(base_spread_bps * 0.5) {
+        if let Err(e) = self.control_vector.validate(base_total_spread_bps) {
             error!("Invalid control vector from HJB optimization: {}", e);
             // Fallback to heuristic method
             self.calculate_optimal_control();
@@ -1377,8 +1388,9 @@ impl MarketMaker {
         let hjb_components = self.hjb_components.clone();
         let state_vector = self.state_vector.clone();
         let value_function = self.value_function.clone();
-        // Use dynamic spread calculation
-        let base_spread_bps = (state_vector.volatility_ema_bps * self.spread_volatility_multiplier).max(5.0);
+        // Use dynamic spread calculation - compute both total and half spread
+        let base_total_spread_bps = (state_vector.volatility_ema_bps * self.spread_volatility_multiplier).max(12.0);
+        let base_half_spread_bps = base_total_spread_bps / 2.0;
         let max_absolute_position_size = self.max_absolute_position_size;
         let tuning_params = Arc::clone(&self.tuning_params);
         let adam_optimizer = Arc::clone(&self.adam_optimizer);
@@ -1386,20 +1398,20 @@ impl MarketMaker {
         let enable_trading_gap_threshold_percent = self.enable_trading_gap_threshold_percent;
         
         tokio::task::spawn_blocking(move || {
-            // Run expensive grid search optimization
+            // Run expensive grid search optimization using half-spread
             let optimal_control = hjb_components.optimize_control(
                 &state_vector,
                 &value_function,
-                base_spread_bps,
+                base_half_spread_bps,
             );
             
             // Recompute heuristic fresh using the SAME state_vector as optimal control
             // This ensures apples-to-apples comparison at State_t0
             let constrained_params = tuning_params.read().unwrap().get_constrained();
-            let mut heuristic_control_recomputed = ControlVector::symmetric(base_spread_bps);
+            let mut heuristic_control_recomputed = ControlVector::symmetric(base_half_spread_bps);
             heuristic_control_recomputed.apply_state_adjustments(
                 &state_vector,
-                base_spread_bps,
+                base_half_spread_bps,
                 max_absolute_position_size,
                 &constrained_params,
                 &hjb_components,
@@ -1531,11 +1543,11 @@ impl MarketMaker {
                     
                     // Validation is no longer needed, parameters are valid by construction
                     
-                    // Re-run heuristic with nudged params
-                    let mut nudged_control = ControlVector::symmetric(base_spread_bps);
+                    // Re-run heuristic with nudged params using half-spread
+                    let mut nudged_control = ControlVector::symmetric(base_half_spread_bps);
                     nudged_control.apply_state_adjustments(
                         &state_vector,
-                        base_spread_bps,
+                        base_half_spread_bps,
                         max_absolute_position_size,
                         &nudged_params_theta, // Use constrained params
                         &hjb_components,
@@ -1750,14 +1762,15 @@ impl MarketMaker {
     /// Calculate optimal spread adjustment based on state vector
     /// This can be used to implement more sophisticated pricing strategies
     pub fn calculate_state_based_spread_adjustment(&self) -> f64 {
-        // Use dynamic spread calculation
-        let base_spread_bps = (self.state_vector.volatility_ema_bps * self.spread_volatility_multiplier).max(5.0);
+        // Use dynamic spread calculation (half-spread)
+        let base_total_spread_bps = (self.state_vector.volatility_ema_bps * self.spread_volatility_multiplier).max(12.0);
+        let base_half_spread_bps = base_total_spread_bps / 2.0;
         // Get constrained (theta) params
         let constrained_params = self.tuning_params.read().unwrap().get_constrained();
         
         // Get adverse selection adjustment
         let adverse_adjustment = self.state_vector
-            .get_adverse_selection_adjustment(base_spread_bps, constrained_params.adverse_selection_adjustment_factor);
+            .get_adverse_selection_adjustment(base_half_spread_bps, constrained_params.adverse_selection_adjustment_factor);
         
         // Get inventory risk multiplier
         let risk_multiplier = self.state_vector
@@ -1765,15 +1778,15 @@ impl MarketMaker {
         
         // Combined adjustment: adverse selection shift + risk-based widening
         // Note: This is a simple combination - more sophisticated models could be used
-        adverse_adjustment + (base_spread_bps * (risk_multiplier - 1.0))
+        adverse_adjustment + (base_half_spread_bps * (risk_multiplier - 1.0))
     }
     
     /// Check if we should pause market making based on state vector
     pub fn should_pause_trading(&self) -> bool {
         // Pause if market conditions are unfavorable
         // Use dynamic spread: threshold = 10x current volatility-based spread
-        let base_spread_bps = (self.state_vector.volatility_ema_bps * self.spread_volatility_multiplier).max(5.0);
-        let max_spread_threshold = base_spread_bps * 10.0;
+        let base_total_spread_bps = (self.state_vector.volatility_ema_bps * self.spread_volatility_multiplier).max(12.0);
+        let max_spread_threshold = base_total_spread_bps * 10.0;
         !self.state_vector.is_market_favorable(max_spread_threshold)
     }
     
