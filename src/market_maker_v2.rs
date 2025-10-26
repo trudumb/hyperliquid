@@ -3,6 +3,7 @@ use log::{debug, error, info, warn};
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::time;
 use std::sync::{Arc, RwLock};
+use std::collections::HashMap;
 
 //RUST_LOG=info cargo run --bin market_maker_v2
 
@@ -17,6 +18,25 @@ use crate::{
 
 /// Epsilon for clamping values during inverse transforms (logit/log)
 const PARAM_EPSILON: f64 = 1e-8;
+
+/// Minimum time between taker executions (seconds) to prevent over-trading
+const MIN_TAKER_INTERVAL_SECS: f64 = 2.0;
+
+/// Smoothing factor for taker rate EMA (higher = more responsive, lower = smoother)
+/// alpha = 0.3 means 30% weight on new value, 70% on old value
+const TAKER_RATE_SMOOTHING_ALPHA: f64 = 0.3;
+
+/// Maximum taker size as fraction of max position (prevents single large liquidations)
+const MAX_TAKER_SIZE_FRACTION: f64 = 0.2;
+
+/// L2 regularization strength for Adam optimizer (prevents parameter drift)
+/// Higher values pull parameters toward zero more strongly
+const L2_REGULARIZATION_LAMBDA: f64 = 0.001;
+
+/// Timeout for pending cancel orders in HashMap (seconds)
+/// Orders older than this are removed from pending_cancel_orders to prevent memory leak
+/// Set to 3 minutes to handle delayed fill messages from the exchange
+const PENDING_CANCEL_TIMEOUT_SECS: f64 = 180.0;
 
 /// Standard sigmoid function: maps (-inf, inf) -> (0, 1)
 fn sigmoid(phi: f64) -> f64 {
@@ -1382,7 +1402,15 @@ pub struct MarketMakerRestingOrder {
     pub oid: u64,
     pub position: f64,
     pub price: f64,
-    pub level: usize,  // NEW: Track which level this is (0 = L1, 1 = L2, etc.)
+    pub level: usize,  // Track which level this is (0 = L1, 1 = L2, etc.)
+    pub pending_cancel: bool,  // Track if cancellation has been sent but not confirmed
+}
+
+/// Wrapper for an order pending cancellation with timestamp
+#[derive(Debug, Clone)]
+pub struct PendingCancelOrder {
+    pub order: MarketMakerRestingOrder,
+    pub cancel_time: f64,  // Unix timestamp when cancel was sent
 }
 
 #[derive(Debug)]
@@ -1478,10 +1506,15 @@ pub struct MarketMaker {
     /// Resting bid orders by level (replaces old lower_resting)
     /// bid_levels[0] = L1 (tightest), bid_levels[1] = L2, etc.
     pub bid_levels: Vec<MarketMakerRestingOrder>,
-    
+
     /// Resting ask orders by level (replaces old upper_resting)
     /// ask_levels[0] = L1 (tightest), ask_levels[1] = L2, etc.
     pub ask_levels: Vec<MarketMakerRestingOrder>,
+
+    /// Orders that have been sent for cancellation but might still receive fills
+    /// Key: order ID (oid), Value: order + cancel timestamp
+    /// Cleaned up periodically to prevent memory leak
+    pub pending_cancel_orders: HashMap<u64, PendingCancelOrder>,
     
     // ===== Adam Self-Tuning System =====
     /// Tunable parameters wrapped in Arc<RwLock> for live updates
@@ -1509,12 +1542,24 @@ pub struct MarketMaker {
     /// E.g., 15.0 means trading starts when heuristic gap is < 15%
     pub enable_trading_gap_threshold_percent: f64,
     
-    // ===== Temporary Fields =====
+    // ===== Taker Logic State =====
     /// Latest taker buy rate (if needed for taker logic)
     pub latest_taker_buy_rate: f64,
-    
+
     /// Latest taker sell rate (if needed for taker logic)
     pub latest_taker_sell_rate: f64,
+
+    /// Timestamp of last taker buy execution (for rate limiting)
+    pub last_taker_buy_time: f64,
+
+    /// Timestamp of last taker sell execution (for rate limiting)
+    pub last_taker_sell_time: f64,
+
+    /// Smoothed taker buy rate (exponential moving average to prevent spikes)
+    pub smoothed_taker_buy_rate: f64,
+
+    /// Smoothed taker sell rate (exponential moving average to prevent spikes)
+    pub smoothed_taker_sell_rate: f64,
     
     // ===== REMOVED/DEPRECATED Fields (Documented for Reference) =====
     // The following fields have been removed in this refactor:
@@ -1832,6 +1877,29 @@ impl MarketMaker {
                  initial_asks - self.ask_levels.len()
              );
         }
+
+        // Clean up old pending_cancel_orders (prevent memory leak)
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+
+        let initial_pending_count = self.pending_cancel_orders.len();
+        self.pending_cancel_orders.retain(|oid, pending| {
+            let age = current_time - pending.cancel_time;
+            if age > PENDING_CANCEL_TIMEOUT_SECS {
+                debug!("Removing stale pending_cancel order (oid={}, age={:.1}s > {:.1}s)",
+                      oid, age, PENDING_CANCEL_TIMEOUT_SECS);
+                false
+            } else {
+                true
+            }
+        });
+
+        if self.pending_cancel_orders.len() < initial_pending_count {
+            debug!("Cleaned up {} stale pending_cancel orders",
+                  initial_pending_count - self.pending_cancel_orders.len());
+        }
     }
 
     /// Helper function to cancel all currently tracked resting orders.
@@ -2024,6 +2092,7 @@ impl MarketMaker {
             // ===== Resting Order State (Multi-Level) =====
             bid_levels: Vec::with_capacity(max_levels),  // Initialize empty, will be populated on first quote
             ask_levels: Vec::with_capacity(max_levels),  // Initialize empty, will be populated on first quote
+            pending_cancel_orders: HashMap::new(),  // Initialize empty HashMap for tracking canceled orders
             
             // ===== Adam Self-Tuning System =====
             tuning_params: Arc::new(RwLock::new(initial_params)),  // Meta-parameters for heuristic adjustments
@@ -2035,10 +2104,14 @@ impl MarketMaker {
             // ===== Trading Control =====
             trading_enabled: Arc::new(RwLock::new(false)),  // Start disabled, enabled when optimizer validates performance
             enable_trading_gap_threshold_percent: input.enable_trading_gap_threshold_percent,
-            
-            // ===== Temporary Fields =====
+
+            // ===== Taker Logic State =====
             latest_taker_buy_rate: 0.0,  // Initialize to zero
             latest_taker_sell_rate: 0.0,  // Initialize to zero
+            last_taker_buy_time: 0.0,  // Initialize to zero (unix epoch)
+            last_taker_sell_time: 0.0,  // Initialize to zero (unix epoch)
+            smoothed_taker_buy_rate: 0.0,  // Initialize to zero
+            smoothed_taker_sell_rate: 0.0,  // Initialize to zero
         })
     }
 
@@ -2211,38 +2284,68 @@ impl MarketMaker {
                                 self.cur_position += amount;
                                 info!("Fill: bought {} {} (oid: {})", amount, self.asset.clone(), filled_oid);
 
-                                // Find and update the specific resting bid
-                                if let Some(index) = self.bid_levels.iter().position(|o| o.oid == filled_oid) {
+                                // First, check pending_cancel_orders HashMap (O(1) lookup for late fills)
+                                if let Some(pending_cancel) = self.pending_cancel_orders.get_mut(&filled_oid) {
+                                    // Fill arrived after cancel was sent
+                                    filled_level = Some(pending_cancel.order.level);
+                                    pending_cancel.order.position -= amount;
+
+                                    if pending_cancel.order.position < EPSILON {
+                                        info!("Bid oid {} (L{}) filled after cancel sent, removing from pending_cancel HashMap.",
+                                              filled_oid, filled_level.unwrap_or(99) + 1);
+                                        self.pending_cancel_orders.remove(&filled_oid);
+                                    } else {
+                                        info!("Bid oid {} (L{}) partially filled after cancel sent, remaining: {}",
+                                              filled_oid, filled_level.unwrap_or(99) + 1, pending_cancel.order.position);
+                                    }
+                                } else if let Some(index) = self.bid_levels.iter().position(|o| o.oid == filled_oid) {
+                                    // Find and update the specific active resting bid
                                     filled_level = Some(self.bid_levels[index].level); // Get level before modifying/removing
                                     self.bid_levels[index].position -= amount;
-                                    
+
                                     if self.bid_levels[index].position < EPSILON {
                                         info!("Resting bid oid {} (L{}) fully filled, removing.", filled_oid, filled_level.unwrap_or(99) + 1);
                                         self.bid_levels.remove(index);
                                     } else {
-                                        info!("Resting bid oid {} (L{}) partially filled, remaining: {}", filled_oid, filled_level.unwrap_or(99) + 1, self.bid_levels[index].position);
+                                        info!("Resting bid oid {} (L{}) partially filled, remaining: {}",
+                                              filled_oid, filled_level.unwrap_or(99) + 1, self.bid_levels[index].position);
                                     }
                                 } else {
-                                    warn!("Received fill for untracked bid oid: {}", filled_oid);
+                                    warn!("Received fill for untracked bid oid: {} (not in active bids or pending_cancel)", filled_oid);
                                 }
                             } else {
                                 // Our Ask was filled (we sold)
                                 self.cur_position -= amount;
                                 info!("Fill: sold {} {} (oid: {})", amount, self.asset.clone(), filled_oid);
 
-                                // Find and update the specific resting ask
-                                if let Some(index) = self.ask_levels.iter().position(|o| o.oid == filled_oid) {
+                                // First, check pending_cancel_orders HashMap (O(1) lookup for late fills)
+                                if let Some(pending_cancel) = self.pending_cancel_orders.get_mut(&filled_oid) {
+                                    // Fill arrived after cancel was sent
+                                    filled_level = Some(pending_cancel.order.level);
+                                    pending_cancel.order.position -= amount;
+
+                                    if pending_cancel.order.position < EPSILON {
+                                        info!("Ask oid {} (L{}) filled after cancel sent, removing from pending_cancel HashMap.",
+                                              filled_oid, filled_level.unwrap_or(99) + 1);
+                                        self.pending_cancel_orders.remove(&filled_oid);
+                                    } else {
+                                        info!("Ask oid {} (L{}) partially filled after cancel sent, remaining: {}",
+                                              filled_oid, filled_level.unwrap_or(99) + 1, pending_cancel.order.position);
+                                    }
+                                } else if let Some(index) = self.ask_levels.iter().position(|o| o.oid == filled_oid) {
+                                    // Find and update the specific active resting ask
                                     filled_level = Some(self.ask_levels[index].level);
                                     self.ask_levels[index].position -= amount;
-                                    
+
                                     if self.ask_levels[index].position < EPSILON {
                                         info!("Resting ask oid {} (L{}) fully filled, removing.", filled_oid, filled_level.unwrap_or(99) + 1);
                                         self.ask_levels.remove(index);
                                     } else {
-                                        info!("Resting ask oid {} (L{}) partially filled, remaining: {}", filled_oid, filled_level.unwrap_or(99) + 1, self.ask_levels[index].position);
+                                        info!("Resting ask oid {} (L{}) partially filled, remaining: {}",
+                                              filled_oid, filled_level.unwrap_or(99) + 1, self.ask_levels[index].position);
                                     }
                                 } else {
-                                    warn!("Received fill for untracked ask oid: {}", filled_oid);
+                                    warn!("Received fill for untracked ask oid: {} (not in active asks or pending_cancel)", filled_oid);
                                 }
                             }
 
@@ -2601,6 +2704,22 @@ impl MarketMaker {
             return;
         }
 
+        // --- 0b. Check Urgency and Execute Taker First if Critical ---
+        // If inventory urgency is extremely high, prioritize taker execution before slow maker reconciliation
+        let inventory_ratio = self.cur_position.abs() / self.max_absolute_position_size;
+        let tuning_params = self.tuning_params.read().unwrap().get_constrained();
+        let urgency_threshold = tuning_params.inventory_urgency_threshold;
+
+        // Define "critical urgency" as being significantly above threshold (e.g., 1.2x threshold)
+        let critical_urgency_multiplier = 1.2;
+        if inventory_ratio > urgency_threshold * critical_urgency_multiplier {
+            info!("🚨 CRITICAL URGENCY: inventory_ratio={:.2} > threshold*{:.1}={:.2}, executing taker FIRST",
+                  inventory_ratio, critical_urgency_multiplier, urgency_threshold * critical_urgency_multiplier);
+
+            // Execute urgent taker logic immediately (before maker reconciliation)
+            self.execute_taker_logic().await;
+        }
+
         // --- 1. Calculate Target Quotes (Multi-Level) ---
         // This now returns Vec<(price, size)> using the new framework
         let (target_bids, target_asks) = self.calculate_multi_level_targets();
@@ -2610,22 +2729,42 @@ impl MarketMaker {
         let mut bids_to_place = target_bids.clone();
         let mut asks_to_place = target_asks.clone();
 
+        // Get current time for pending_cancel timestamp
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+
         // Check existing bids against targets with improved tolerance
         let mut remaining_bids: Vec<MarketMakerRestingOrder> = Vec::new();
-        for order in self.bid_levels.drain(..) {
-            if order.oid == 0 || order.position < EPSILON { 
-                continue; 
+        for mut order in self.bid_levels.drain(..) {
+            if order.oid == 0 || order.position < EPSILON {
+                continue;
             }
 
-            // Enhanced matching logic with better tolerance (0.1% price, 1% size)
+            // Skip orders that are already in pending_cancel_orders HashMap
+            if order.pending_cancel {
+                // This shouldn't happen anymore, but keep as safety check
+                warn!("Found order with pending_cancel=true in bid_levels (should be in HashMap): oid={}", order.oid);
+                continue;
+            }
+
+            // Enhanced matching logic using exchange-native tick/lot precision
+            // This prevents unnecessary cancels due to floating-point rounding
             let order_price = order.price;
             let order_position = order.position;
             let order_level = order.level;
             let order_oid = order.oid;
-            
+
+            // Calculate minimum meaningful price and size differences based on exchange precision
+            let min_price_step = 10f64.powi(-(self.tick_lot_validator.max_price_decimals() as i32));
+            let min_size_step = 10f64.powi(-(self.tick_lot_validator.sz_decimals as i32));
+
+            // Use half a tick/lot as tolerance to handle rounding edge cases
+            let price_tolerance = min_price_step * 0.5;
+            let size_tolerance = min_size_step * 0.5;
+
             if let Some(target_idx) = bids_to_place.iter().position(|(p, s)| {
-                let price_tolerance = order_price * 0.001; // 0.1% price tolerance
-                let size_tolerance = order_position * 0.01; // 1% size tolerance
                 (p - order_price).abs() <= price_tolerance && (s - order_position).abs() <= size_tolerance
             }) {
                 // Match found! Keep this resting order, remove from placement list
@@ -2633,28 +2772,51 @@ impl MarketMaker {
                 debug!("Keeping existing L{} Bid: {} @ {} (matched target)", order_level + 1, order_position, order_price);
                 remaining_bids.push(order);
             } else {
-                // No match found - cancel this order
+                // No match found - REMOVE from active tracking and move to pending_cancel HashMap
+                order.pending_cancel = true;
                 orders_to_cancel.push(order_oid);
-                info!("Cancelling outdated L{} Bid: {} @ {} (oid: {})", order_level + 1, order_position, order_price, order_oid);
+                info!("Marking for cancellation L{} Bid: {} @ {} (oid: {})", order_level + 1, order_position, order_price, order_oid);
+
+                // Move to pending_cancel_orders HashMap (O(1) insert)
+                self.pending_cancel_orders.insert(order_oid, PendingCancelOrder {
+                    order: order.clone(),
+                    cancel_time: current_time,
+                });
+                // Note: NOT pushing to remaining_bids - order is removed from active tracking
             }
         }
         self.bid_levels = remaining_bids;
 
         // Check existing asks against targets with same enhanced logic
         let mut remaining_asks: Vec<MarketMakerRestingOrder> = Vec::new();
-        for order in self.ask_levels.drain(..) {
-            if order.oid == 0 || order.position < EPSILON { 
-                continue; 
+        for mut order in self.ask_levels.drain(..) {
+            if order.oid == 0 || order.position < EPSILON {
+                continue;
             }
-            
+
+            // Skip orders that are already in pending_cancel_orders HashMap
+            if order.pending_cancel {
+                // This shouldn't happen anymore, but keep as safety check
+                warn!("Found order with pending_cancel=true in ask_levels (should be in HashMap): oid={}", order.oid);
+                continue;
+            }
+
+            // Enhanced matching logic using exchange-native tick/lot precision
+            // This prevents unnecessary cancels due to floating-point rounding
             let order_price = order.price;
             let order_position = order.position;
             let order_level = order.level;
             let order_oid = order.oid;
-            
+
+            // Calculate minimum meaningful price and size differences based on exchange precision
+            let min_price_step = 10f64.powi(-(self.tick_lot_validator.max_price_decimals() as i32));
+            let min_size_step = 10f64.powi(-(self.tick_lot_validator.sz_decimals as i32));
+
+            // Use half a tick/lot as tolerance to handle rounding edge cases
+            let price_tolerance = min_price_step * 0.5;
+            let size_tolerance = min_size_step * 0.5;
+
             if let Some(target_idx) = asks_to_place.iter().position(|(p, s)| {
-                let price_tolerance = order_price * 0.001; // 0.1% price tolerance
-                let size_tolerance = order_position * 0.01; // 1% size tolerance
                 (p - order_price).abs() <= price_tolerance && (s - order_position).abs() <= size_tolerance
             }) {
                 // Match found! Keep this resting order
@@ -2662,37 +2824,43 @@ impl MarketMaker {
                 debug!("Keeping existing L{} Ask: {} @ {} (matched target)", order_level + 1, order_position, order_price);
                 remaining_asks.push(order);
             } else {
-                // No match found - cancel this order
+                // No match found - REMOVE from active tracking and move to pending_cancel HashMap
+                order.pending_cancel = true;
                 orders_to_cancel.push(order_oid);
-                info!("Cancelling outdated L{} Ask: {} @ {} (oid: {})", order_level + 1, order_position, order_price, order_oid);
+                info!("Marking for cancellation L{} Ask: {} @ {} (oid: {})", order_level + 1, order_position, order_price, order_oid);
+
+                // Move to pending_cancel_orders HashMap (O(1) insert)
+                self.pending_cancel_orders.insert(order_oid, PendingCancelOrder {
+                    order: order.clone(),
+                    cancel_time: current_time,
+                });
+                // Note: NOT pushing to remaining_asks - order is removed from active tracking
             }
         }
         self.ask_levels = remaining_asks;
 
-        // --- 3. Execute Cancellations Sequentially ---
+        // --- 3. Execute Cancellations in Batch (OPTIMIZED) ---
         let num_cancellations = orders_to_cancel.len();
         if !orders_to_cancel.is_empty() {
-            info!("Executing {} cancellations sequentially", num_cancellations);
-            
-            // Execute cancellations sequentially (ExchangeClient doesn't implement Clone)
-            let mut successful_cancels = 0;
-            for oid in orders_to_cancel {
-                let cancel_result = self.exchange_client.cancel(
-                    crate::ClientCancelRequest { 
-                        asset: self.asset.clone(), 
-                        oid 
-                    }, 
-                    None
-                ).await;
-                
-                if cancel_result.is_ok() {
-                    successful_cancels += 1;
-                } else {
-                    warn!("Failed to cancel order {}", oid);
-                }
+            info!("Executing {} cancellations in batch", num_cancellations);
+
+            // Build batch cancel request (single network call instead of N sequential calls)
+            let cancel_requests: Vec<crate::ClientCancelRequest> = orders_to_cancel
+                .into_iter()
+                .map(|oid| crate::ClientCancelRequest {
+                    asset: self.asset.clone(),
+                    oid,
+                })
+                .collect();
+
+            // Execute batch cancellation
+            let cancel_result = self.exchange_client.bulk_cancel(cancel_requests, None).await;
+
+            if cancel_result.is_ok() {
+                info!("Batch cancellation completed successfully ({} orders)", num_cancellations);
+            } else {
+                warn!("Batch cancellation failed: {:?}", cancel_result.err());
             }
-            
-            info!("Completed {}/{} cancellations successfully", successful_cancels, num_cancellations);
         }
 
         // --- 4. Position Limit Safety Checks ---
@@ -2742,7 +2910,7 @@ impl MarketMaker {
                 let (placed_size, oid) = self.place_order(self.asset.clone(), *size, *price, true).await;
 
                 if oid != 0 && placed_size > EPSILON {
-                    let new_order = MarketMakerRestingOrder { oid, position: placed_size, price: *price, level };
+                    let new_order = MarketMakerRestingOrder { oid, position: placed_size, price: *price, level, pending_cancel: false };
                     self.bid_levels.push(new_order);
                     successful_placements += 1;
                     info!("Successfully placed L{} Bid: {} @ {} (oid: {})", level + 1, placed_size, price, oid);
@@ -2772,7 +2940,7 @@ impl MarketMaker {
                 let (placed_size, oid) = self.place_order(self.asset.clone(), *size, *price, false).await;
 
                 if oid != 0 && placed_size > EPSILON {
-                    let new_order = MarketMakerRestingOrder { oid, position: placed_size, price: *price, level };
+                    let new_order = MarketMakerRestingOrder { oid, position: placed_size, price: *price, level, pending_cancel: false };
                     self.ask_levels.push(new_order);
                     successful_placements += 1;
                     info!("Successfully placed L{} Ask: {} @ {} (oid: {})", level + 1, placed_size, price, oid);
@@ -2802,110 +2970,169 @@ impl MarketMaker {
         info!("Order placement complete: {} Bids, {} Asks ({} successful placements)", 
               self.bid_levels.len(), self.ask_levels.len(), successful_placements);
 
-        // --- 7. Implement Taker Logic Based on Latest Rates ---
+        // --- 7. Implement Taker Logic (Normal Priority) ---
+        // For normal urgency, execute taker logic after maker reconciliation
+        self.execute_taker_logic().await;
+    }
+
+    /// Execute taker logic with rate limiting, smoothing, and size caps
+    /// Can be called before or after maker reconciliation depending on urgency
+    async fn execute_taker_logic(&mut self) {
         if self.latest_taker_buy_rate > EPSILON || self.latest_taker_sell_rate > EPSILON {
-            info!("Executing taker logic: buy_rate={:.4}, sell_rate={:.4}", 
-                  self.latest_taker_buy_rate, self.latest_taker_sell_rate);
-            
+            let current_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64();
+
+            // Smooth taker rates using EMA to prevent sudden spikes
+            self.smoothed_taker_buy_rate = TAKER_RATE_SMOOTHING_ALPHA * self.latest_taker_buy_rate
+                + (1.0 - TAKER_RATE_SMOOTHING_ALPHA) * self.smoothed_taker_buy_rate;
+            self.smoothed_taker_sell_rate = TAKER_RATE_SMOOTHING_ALPHA * self.latest_taker_sell_rate
+                + (1.0 - TAKER_RATE_SMOOTHING_ALPHA) * self.smoothed_taker_sell_rate;
+
+            info!("Taker logic: raw buy_rate={:.4}, sell_rate={:.4}, smoothed buy={:.4}, sell={:.4}",
+                  self.latest_taker_buy_rate, self.latest_taker_sell_rate,
+                  self.smoothed_taker_buy_rate, self.smoothed_taker_sell_rate);
+
             // Taker Buy Logic (for when we need to buy aggressively)
-            if self.latest_taker_buy_rate > EPSILON {
-                // FIX: Round size DOWN to asset's sz_decimals (conservative)
-                let desired_buy_size = self.tick_lot_validator.round_size(self.latest_taker_buy_rate, false);
+            if self.smoothed_taker_buy_rate > EPSILON {
+                // Rate limiting: Check if enough time has passed since last execution
+                let time_since_last_buy = current_time - self.last_taker_buy_time;
 
-                // CRITICAL SAFETY: Cap taker buy at remaining capacity to prevent excessive shorting
-                // remaining_buy_capacity = how much we can buy before hitting max short position
-                let remaining_buy_capacity = (self.max_absolute_position_size + self.cur_position).max(0.0);
-                let taker_buy_size = desired_buy_size.min(remaining_buy_capacity);
-
-                if taker_buy_size < desired_buy_size {
-                    warn!("⚠️ Taker buy clamped: desired={:.2} → clamped={:.2} (cur_pos={:.2}, max={:.2})",
-                          desired_buy_size, taker_buy_size, self.cur_position, self.max_absolute_position_size);
-                }
-
-                if taker_buy_size < EPSILON {
-                    warn!("Taker buy size too small after rounding/clamping, skipping");
+                if time_since_last_buy < MIN_TAKER_INTERVAL_SECS {
+                    info!("Taker buy rate-limited: {:.1}s since last execution (min={:.1}s)",
+                          time_since_last_buy, MIN_TAKER_INTERVAL_SECS);
                 } else {
-                    let notional = taker_buy_size * self.latest_mid_price;
+                    // Use smoothed rate instead of raw rate
+                    let desired_buy_size = self.tick_lot_validator.round_size(self.smoothed_taker_buy_rate, false);
 
-                    if notional >= 10.0 { // $10 notional minimum
-                        info!("Executing taker buy: {} @ market (${:.2} notional)",
-                              taker_buy_size, notional);
+                    // Cap to maximum single taker size (prevents huge liquidations)
+                    let max_single_taker = self.max_absolute_position_size * MAX_TAKER_SIZE_FRACTION;
+                    let size_capped = desired_buy_size.min(max_single_taker);
 
-                        // Use market_open for better slippage protection
-                        let market_params = crate::MarketOrderParams {
-                            asset: &self.asset,
-                            is_buy: true,
-                            sz: taker_buy_size, // Rounded size
-                            px: None, // Let SDK fetch current price
-                            slippage: Some(0.01), // 1% slippage tolerance
-                            cloid: None,
-                            wallet: None, // Use default wallet
-                        };
-                    
-                        match self.exchange_client.market_open(market_params).await {
-                            Ok(crate::ExchangeResponseStatus::Ok(_)) => {
-                                info!("Taker buy executed successfully");
-                            }
-                            Ok(crate::ExchangeResponseStatus::Err(e)) => {
-                                error!("Taker buy failed: {}", e);
-                            }
-                            Err(e) => {
-                                error!("Taker buy error: {}", e);
-                            }
-                        }
+                    // CRITICAL SAFETY: Cap taker buy to prevent excessive long positions
+                    // BUT allow buying to REDUCE extreme short positions
+                    let remaining_buy_capacity = if self.cur_position < 0.0 {
+                        // If short, only allow buying up to the absolute current position size
+                        // This prevents flipping aggressively long during liquidation.
+                        self.cur_position.abs()
                     } else {
-                        warn!("Taker buy skipped: notional ${:.2} < $10 minimum", notional);
+                        // If already long, only allow buying up to max long position
+                        (self.max_absolute_position_size - self.cur_position).max(0.0)
+                    };
+                    let taker_buy_size = size_capped.min(remaining_buy_capacity);
+
+                    if taker_buy_size < desired_buy_size {
+                        warn!("⚠️ Taker buy clamped: desired={:.2} → clamped={:.2} (cur_pos={:.2}, max={:.2})",
+                              desired_buy_size, taker_buy_size, self.cur_position, self.max_absolute_position_size);
+                    }
+
+                    if taker_buy_size < EPSILON {
+                        warn!("Taker buy size too small after rounding/clamping, skipping");
+                    } else {
+                        let notional = taker_buy_size * self.latest_mid_price;
+
+                        if notional >= 10.0 { // $10 notional minimum
+                            info!("Executing taker buy: {} @ market (${:.2} notional)",
+                                  taker_buy_size, notional);
+
+                            // Use market_open for better slippage protection
+                            let market_params = crate::MarketOrderParams {
+                                asset: &self.asset,
+                                is_buy: true,
+                                sz: taker_buy_size, // Rounded size
+                                px: None, // Let SDK fetch current price
+                                slippage: Some(0.01), // 1% slippage tolerance
+                                cloid: None,
+                                wallet: None, // Use default wallet
+                            };
+
+                            match self.exchange_client.market_open(market_params).await {
+                                Ok(crate::ExchangeResponseStatus::Ok(_)) => {
+                                    info!("Taker buy executed successfully");
+                                    self.last_taker_buy_time = current_time; // Update timestamp
+                                }
+                                Ok(crate::ExchangeResponseStatus::Err(e)) => {
+                                    error!("Taker buy failed: {}", e);
+                                }
+                                Err(e) => {
+                                    error!("Taker buy error: {}", e);
+                                }
+                            }
+                        } else {
+                            warn!("Taker buy skipped: notional ${:.2} < $10 minimum", notional);
+                        }
                     }
                 }
             }
             
             // Taker Sell Logic (for when we need to sell aggressively)
-            if self.latest_taker_sell_rate > EPSILON {
-                // FIX: Round size DOWN to asset's sz_decimals (conservative)
-                let desired_sell_size = self.tick_lot_validator.round_size(self.latest_taker_sell_rate, false);
+            if self.smoothed_taker_sell_rate > EPSILON {
+                // Rate limiting: Check if enough time has passed since last execution
+                let time_since_last_sell = current_time - self.last_taker_sell_time;
 
-                // CRITICAL SAFETY: Cap taker sell at current long position (can't sell what we don't own!)
-                // max_sellable = only sell if we're long, prevent flipping to excessive short
-                let max_sellable = self.cur_position.max(0.0);
-                let taker_sell_size = desired_sell_size.min(max_sellable);
-
-                if taker_sell_size < desired_sell_size {
-                    warn!("⚠️ Taker sell clamped: desired={:.2} → clamped={:.2} (cur_pos={:.2}, max_sellable={:.2})",
-                          desired_sell_size, taker_sell_size, self.cur_position, max_sellable);
-                }
-
-                if taker_sell_size < EPSILON {
-                    warn!("Taker sell size too small after rounding/clamping, skipping");
+                if time_since_last_sell < MIN_TAKER_INTERVAL_SECS {
+                    info!("Taker sell rate-limited: {:.1}s since last execution (min={:.1}s)",
+                          time_since_last_sell, MIN_TAKER_INTERVAL_SECS);
                 } else {
-                    let notional = taker_sell_size * self.latest_mid_price;
+                    // Use smoothed rate instead of raw rate
+                    let desired_sell_size = self.tick_lot_validator.round_size(self.smoothed_taker_sell_rate, false);
 
-                    if notional >= 10.0 { // $10 notional minimum
-                        info!("Executing taker sell: {} @ market (${:.2} notional)",
-                              taker_sell_size, notional);
+                    // Cap to maximum single taker size (prevents huge liquidations)
+                    let max_single_taker = self.max_absolute_position_size * MAX_TAKER_SIZE_FRACTION;
+                    let size_capped = desired_sell_size.min(max_single_taker);
 
-                        let market_params = crate::MarketOrderParams {
-                            asset: &self.asset,
-                            is_buy: false,
-                            sz: taker_sell_size, // Rounded size
-                            px: None, // Let SDK fetch current price
-                            slippage: Some(0.01), // 1% slippage tolerance
-                            cloid: None,
-                            wallet: None, // Use default wallet
-                        };
-                    
-                        match self.exchange_client.market_open(market_params).await {
-                            Ok(crate::ExchangeResponseStatus::Ok(_)) => {
-                                info!("Taker sell executed successfully");
-                            }
-                            Ok(crate::ExchangeResponseStatus::Err(e)) => {
-                                error!("Taker sell failed: {}", e);
-                            }
-                            Err(e) => {
-                                error!("Taker sell error: {}", e);
-                            }
-                        }
+                    // CRITICAL SAFETY: Cap taker sell to prevent excessive short positions
+                    // BUT allow selling to REDUCE extreme long positions
+                    let remaining_sell_capacity = if self.cur_position > 0.0 {
+                        // If long, only allow selling up to the current position size
+                        // This prevents flipping aggressively short during liquidation.
+                        self.cur_position
                     } else {
-                        warn!("Taker sell skipped: notional ${:.2} < $10 minimum", notional);
+                        // If already short, only allow selling down to max short position
+                        (self.max_absolute_position_size - self.cur_position.abs()).max(0.0)
+                    };
+                    let taker_sell_size = size_capped.min(remaining_sell_capacity);
+
+                    if taker_sell_size < desired_sell_size {
+                        warn!("⚠️ Taker sell clamped: desired={:.2} → clamped={:.2} (cur_pos={:.2}, max={:.2})",
+                              desired_sell_size, taker_sell_size, self.cur_position, self.max_absolute_position_size);
+                    }
+
+                    if taker_sell_size < EPSILON {
+                        warn!("Taker sell size too small after rounding/clamping, skipping");
+                    } else {
+                        let notional = taker_sell_size * self.latest_mid_price;
+
+                        if notional >= 10.0 { // $10 notional minimum
+                            info!("Executing taker sell: {} @ market (${:.2} notional)",
+                                  taker_sell_size, notional);
+
+                            let market_params = crate::MarketOrderParams {
+                                asset: &self.asset,
+                                is_buy: false,
+                                sz: taker_sell_size, // Rounded size
+                                px: None, // Let SDK fetch current price
+                                slippage: Some(0.01), // 1% slippage tolerance
+                                cloid: None,
+                                wallet: None, // Use default wallet
+                            };
+
+                            match self.exchange_client.market_open(market_params).await {
+                                Ok(crate::ExchangeResponseStatus::Ok(_)) => {
+                                    info!("Taker sell executed successfully");
+                                    self.last_taker_sell_time = current_time; // Update timestamp
+                                }
+                                Ok(crate::ExchangeResponseStatus::Err(e)) => {
+                                    error!("Taker sell failed: {}", e);
+                                }
+                                Err(e) => {
+                                    error!("Taker sell error: {}", e);
+                                }
+                            }
+                        } else {
+                            warn!("Taker sell skipped: notional ${:.2} < $10 minimum", notional);
+                        }
                     }
                 }
             }
@@ -2984,9 +3211,44 @@ impl MarketMaker {
                     }
                 }
                 
-                let clipped_gradient_norm: f64 = clipped_gradient_vector.iter().map(|g| g.powi(2)).sum::<f64>().sqrt();
+                // Apply L2 Regularization: gradient += lambda * params_phi
+                // This penalizes parameters moving away from zero (in phi space)
+                // and helps prevent unbounded drift
+                let mut regularized_gradient = clipped_gradient_vector.clone();
+                let params_phi_values = [
+                    original_params_phi.skew_adjustment_factor_phi,
+                    original_params_phi.adverse_selection_adjustment_factor_phi,
+                    original_params_phi.adverse_selection_lambda_phi,
+                    original_params_phi.inventory_urgency_threshold_phi,
+                    original_params_phi.liquidation_rate_multiplier_phi,
+                    original_params_phi.min_spread_base_ratio_phi,
+                    original_params_phi.adverse_selection_spread_scale_phi,
+                    original_params_phi.control_gap_threshold_phi,
+                ];
 
-                // b) Compute Adam Update (with warmup)
+                for i in 0..8 {
+                    regularized_gradient[i] += L2_REGULARIZATION_LAMBDA * params_phi_values[i];
+                }
+
+                let clipped_gradient_norm: f64 = clipped_gradient_vector.iter().map(|g| g.powi(2)).sum::<f64>().sqrt();
+                let regularized_gradient_norm: f64 = regularized_gradient.iter().map(|g| g.powi(2)).sum::<f64>().sqrt();
+
+                // Log individual gradient components for diagnostics
+                info!("📊 Gradient Components:");
+                info!("  [0] skew_adjustment_factor: {:.6}", avg_gradient_vector[0]);
+                info!("  [1] adverse_selection_adjustment_factor: {:.6}", avg_gradient_vector[1]);
+                info!("  [2] adverse_selection_lambda: {:.6}", avg_gradient_vector[2]);
+                info!("  [3] inventory_urgency_threshold: {:.6}", avg_gradient_vector[3]);
+                info!("  [4] liquidation_rate_multiplier: {:.6}", avg_gradient_vector[4]);
+                info!("  [5] min_spread_base_ratio: {:.6}", avg_gradient_vector[5]);
+                info!("  [6] adverse_selection_spread_scale: {:.6}", avg_gradient_vector[6]);
+                info!("  [7] control_gap_threshold: {:.6}", avg_gradient_vector[7]);
+                info!("  Raw gradient norm: {:.4}, Clipped norm: {:.4}, Regularized norm: {:.4}",
+                      avg_gradient_vector.iter().map(|g| g.powi(2)).sum::<f64>().sqrt(),
+                      clipped_gradient_norm,
+                      regularized_gradient_norm);
+
+                // b) Compute Adam Update (with warmup) using REGULARIZED gradient
                 let updates = {
                     let mut optimizer_state = adam_optimizer_arc.write().unwrap(); // Lock for update
                     let warmup_steps = 3;
@@ -2998,7 +3260,8 @@ impl MarketMaker {
                     let original_alpha = optimizer_state.alpha;
                     optimizer_state.alpha *= warmup_factor; // Apply warmup
 
-                    let updates = optimizer_state.compute_update(&clipped_gradient_vector);
+                    // Use REGULARIZED gradient instead of clipped gradient
+                    let updates = optimizer_state.compute_update(&regularized_gradient);
 
                     optimizer_state.alpha = original_alpha; // Restore alpha
                     updates // Return the computed updates
@@ -3048,12 +3311,55 @@ impl MarketMaker {
                 info!("  min_spread_base_ratio: {:.4} -> {:.4}", 
                     original_params_theta.min_spread_base_ratio, 
                     updated_params_theta.min_spread_base_ratio);
-                info!("  adverse_selection_spread_scale: {:.4} -> {:.4}", 
-                    original_params_theta.adverse_selection_spread_scale, 
+                info!("  adverse_selection_spread_scale: {:.4} -> {:.4}",
+                    original_params_theta.adverse_selection_spread_scale,
                     updated_params_theta.adverse_selection_spread_scale);
-                info!("  control_gap_threshold: {:.4} -> {:.4}", 
-                    original_params_theta.control_gap_threshold, 
+                info!("  control_gap_threshold: {:.4} -> {:.4}",
+                    original_params_theta.control_gap_threshold,
                     updated_params_theta.control_gap_threshold);
+
+                // f) Drift Monitoring - Check for parameters drifting to extremes
+                let mut drift_warnings = Vec::new();
+
+                // Check adverse_selection_adjustment_factor (should stay reasonable, e.g., < 0.5)
+                if updated_params_theta.adverse_selection_adjustment_factor > 0.5 {
+                    drift_warnings.push(format!(
+                        "adverse_selection_adjustment_factor={:.4} is high (>0.5)",
+                        updated_params_theta.adverse_selection_adjustment_factor
+                    ));
+                }
+
+                // Check adverse_selection_spread_scale (should stay < 10.0)
+                if updated_params_theta.adverse_selection_spread_scale > 10.0 {
+                    drift_warnings.push(format!(
+                        "adverse_selection_spread_scale={:.4} is high (>10.0)",
+                        updated_params_theta.adverse_selection_spread_scale
+                    ));
+                }
+
+                // Check liquidation_rate_multiplier (should stay < 50.0)
+                if updated_params_theta.liquidation_rate_multiplier > 50.0 {
+                    drift_warnings.push(format!(
+                        "liquidation_rate_multiplier={:.4} is very high (>50.0)",
+                        updated_params_theta.liquidation_rate_multiplier
+                    ));
+                }
+
+                // Check skew_adjustment_factor (should stay < 5.0)
+                if updated_params_theta.skew_adjustment_factor > 5.0 {
+                    drift_warnings.push(format!(
+                        "skew_adjustment_factor={:.4} is high (>5.0)",
+                        updated_params_theta.skew_adjustment_factor
+                    ));
+                }
+
+                if !drift_warnings.is_empty() {
+                    warn!("⚠️  PARAMETER DRIFT DETECTED:");
+                    for warning in drift_warnings {
+                        warn!("    - {}", warning);
+                    }
+                    warn!("    Consider reviewing loss function or adding regularization");
+                }
 
             } else {
                 info!("No gradients accumulated in the last window. Skipping Adam update.");
