@@ -2188,8 +2188,33 @@ impl MarketMaker {
                 Message::L2Book(l2_book) => {
                     // Update our order book state
                     if let Some(book) = OrderBook::from_l2_data(&l2_book.data) {
-                        self.latest_book = Some(book);
-                        
+                        self.latest_book = Some(book.clone());
+
+                        // DEBUG: Calculate mid from L2Book
+                        if !book.bids.is_empty() && !book.asks.is_empty() {
+                            if let (Ok(best_bid), Ok(best_ask)) = (
+                                book.bids[0].px.parse::<f64>(),
+                                book.asks[0].px.parse::<f64>()
+                            ) {
+                                let l2_mid = (best_bid + best_ask) / 2.0;
+                                let allmids_mid = self.latest_mid_price;
+                                let diff_bps = ((l2_mid - allmids_mid) / allmids_mid * 10000.0).abs();
+
+                                // Log if there's significant divergence
+                                if diff_bps > 5.0 {  // More than 5 bps difference
+                                    warn!(
+                                        "🔴 MID DIVERGENCE: L2Book={:.3} vs AllMids={:.3} (Δ {:.1}bps) | BBO: {:.3} x {:.3}",
+                                        l2_mid, allmids_mid, diff_bps, best_bid, best_ask
+                                    );
+                                } else {
+                                    debug!(
+                                        "✅ L2Book mid={:.3} vs AllMids={:.3} (Δ {:.1}bps)",
+                                        l2_mid, allmids_mid, diff_bps
+                                    );
+                                }
+                            }
+                        }
+
                         // Update state vector with new book data
                         self.update_state_vector();
                     }
