@@ -1615,8 +1615,8 @@ impl MarketMaker {
         // This replaces the simple EMA volatility calculation
         let mut pf = self.particle_filter.write().unwrap();
         
-        // This line is still correct, as .update() returns Option<f64>
-        if let Some(vol_estimate_bps) = pf.update(self.latest_mid_price) {
+        // Use L2 mid price for particle filter updates (consistent with order pricing)
+        if let Some(vol_estimate_bps) = pf.update(self.latest_l2_mid_price) {
             // Update state vector with particle filter estimate
             self.state_vector.volatility_ema_bps = vol_estimate_bps;
             
@@ -2209,6 +2209,7 @@ impl MarketMaker {
                                 book.asks[0].px.parse::<f64>()
                             ) {
                                 let l2_mid = (best_bid + best_ask) / 2.0;
+                                info!("L2 mid price updated: {:.3}", l2_mid);
 
                                 // CRITICAL: Update L2Book mid-price (used for order pricing)
                                 self.latest_l2_mid_price = l2_mid;
@@ -2380,7 +2381,7 @@ impl MarketMaker {
                                               filled_oid, filled_level.unwrap_or(99) + 1, pending_cancel.order.position);
                                     }
                                 } else if let Some(index) = self.bid_levels.iter().position(|o| o.oid == filled_oid) {
-                                    // Find and update the specific active resting bid
+                                    // Find and update the specific active resting bid (normal case)
                                     filled_level = Some(self.bid_levels[index].level); // Get level before modifying/removing
                                     self.bid_levels[index].position -= amount;
 
@@ -2390,6 +2391,26 @@ impl MarketMaker {
                                     } else {
                                         info!("Resting bid oid {} (L{}) partially filled, remaining: {}",
                                               filled_oid, filled_level.unwrap_or(99) + 1, self.bid_levels[index].position);
+                                    }
+                                } else if let Some(index) = self.bid_levels.iter().position(|o| 
+                                    o.oid == 0 && (o.price - fill_price).abs() < EPSILON && (o.position - amount).abs() < EPSILON
+                                ) {
+                                    // 🔧 FIX: Handle instant fill race condition
+                                    // Fill arrived before place_order() returned with oid
+                                    // Match on price and size instead (placeholder order with oid=0)
+                                    filled_level = Some(self.bid_levels[index].level);
+                                    info!("⚡ INSTANT FILL DETECTED: Bid placeholder (oid=0) matched by price={:.3} size={:.2} (L{})",
+                                          fill_price, amount, filled_level.unwrap_or(99) + 1);
+                                    
+                                    // Update placeholder with actual oid from fill
+                                    self.bid_levels[index].oid = filled_oid;
+                                    self.bid_levels[index].position -= amount;
+
+                                    if self.bid_levels[index].position < EPSILON {
+                                        info!("Placeholder bid fully filled, removing.");
+                                        self.bid_levels.remove(index);
+                                    } else {
+                                        info!("Placeholder bid partially filled, remaining: {}", self.bid_levels[index].position);
                                     }
                                 } else {
                                     warn!("Received fill for untracked bid oid: {} (not in active bids or pending_cancel)", filled_oid);
@@ -2414,7 +2435,7 @@ impl MarketMaker {
                                               filled_oid, filled_level.unwrap_or(99) + 1, pending_cancel.order.position);
                                     }
                                 } else if let Some(index) = self.ask_levels.iter().position(|o| o.oid == filled_oid) {
-                                    // Find and update the specific active resting ask
+                                    // Find and update the specific active resting ask (normal case)
                                     filled_level = Some(self.ask_levels[index].level);
                                     self.ask_levels[index].position -= amount;
 
@@ -2424,6 +2445,26 @@ impl MarketMaker {
                                     } else {
                                         info!("Resting ask oid {} (L{}) partially filled, remaining: {}",
                                               filled_oid, filled_level.unwrap_or(99) + 1, self.ask_levels[index].position);
+                                    }
+                                } else if let Some(index) = self.ask_levels.iter().position(|o| 
+                                    o.oid == 0 && (o.price - fill_price).abs() < EPSILON && (o.position - amount).abs() < EPSILON
+                                ) {
+                                    // 🔧 FIX: Handle instant fill race condition
+                                    // Fill arrived before place_order() returned with oid
+                                    // Match on price and size instead (placeholder order with oid=0)
+                                    filled_level = Some(self.ask_levels[index].level);
+                                    info!("⚡ INSTANT FILL DETECTED: Ask placeholder (oid=0) matched by price={:.3} size={:.2} (L{})",
+                                          fill_price, amount, filled_level.unwrap_or(99) + 1);
+                                    
+                                    // Update placeholder with actual oid from fill
+                                    self.ask_levels[index].oid = filled_oid;
+                                    self.ask_levels[index].position -= amount;
+
+                                    if self.ask_levels[index].position < EPSILON {
+                                        info!("Placeholder ask fully filled, removing.");
+                                        self.ask_levels.remove(index);
+                                    } else {
+                                        info!("Placeholder ask partially filled, remaining: {}", self.ask_levels[index].position);
                                     }
                                 } else {
                                     warn!("Received fill for untracked ask oid: {} (not in active asks or pending_cancel)", filled_oid);
@@ -2477,7 +2518,7 @@ impl MarketMaker {
                     info!(
                         "[HEARTBEAT] Pos: {:.4} | Mid: {:.2} | Vol (σ̂): {:.2}bps | Drift (μ̂): {:.4} | Trading: {} | Orders: {} Bids / {} Asks",
                         self.cur_position,
-                        self.latest_mid_price,
+                        self.latest_l2_mid_price,
                         self.state_vector.volatility_ema_bps,
                         self.state_vector.adverse_selection_estimate,
                         *self.trading_enabled.read().unwrap(),
@@ -2801,7 +2842,7 @@ impl MarketMaker {
         // DEBUG: Periodic snapshot of market state
         debug!(
             "📸 SNAPSHOT: mid={:.3} | pos={:.2} | bids={} | asks={} | L2_available={}",
-            self.latest_mid_price,
+            self.latest_l2_mid_price,
             self.cur_position,
             self.bid_levels.len(),
             self.ask_levels.len(),
@@ -3047,21 +3088,36 @@ impl MarketMaker {
                 // DEBUG: Log bid price calculation details
                 debug!(
                     "🔵 BID CALC: mid={:.3} | offset_bps={:.1} | price={:.3} | spread_to_mid_bps={:.1}",
-                    self.latest_mid_price,
-                    ((self.latest_mid_price - *price) / self.latest_mid_price * 10000.0),
+                    self.latest_l2_mid_price,
+                    ((self.latest_l2_mid_price - *price) / self.latest_l2_mid_price * 10000.0),
                     price,
-                    ((self.latest_mid_price - *price) / self.latest_mid_price * 10000.0)
+                    ((self.latest_l2_mid_price - *price) / self.latest_l2_mid_price * 10000.0)
                 );
+
+                // 🔧 FIX: Add order to tracking BEFORE placement to prevent race condition
+                // This ensures that if an instant fill arrives, the fill handler can find the order
+                let placeholder_order = MarketMakerRestingOrder { 
+                    oid: 0,  // Temporary placeholder - will be updated after placement
+                    position: *size, 
+                    price: *price, 
+                    level, 
+                    pending_cancel: false 
+                };
+                self.bid_levels.push(placeholder_order);
+                let bid_index = self.bid_levels.len() - 1;  // Remember index for updating oid
 
                 let (placed_size, oid) = self.place_order(self.asset.clone(), *size, *price, true).await;
 
                 if oid != 0 && placed_size > EPSILON {
-                    let new_order = MarketMakerRestingOrder { oid, position: placed_size, price: *price, level, pending_cancel: false };
-                    self.bid_levels.push(new_order);
+                    // Update the placeholder with the actual oid
+                    self.bid_levels[bid_index].oid = oid;
+                    self.bid_levels[bid_index].position = placed_size;  // Update with actual placed size
                     successful_placements += 1;
-                    info!("Successfully placed L{} Bid: {} @ {} (oid: {})", level + 1, placed_size, price, oid);
+                    info!("✅ Successfully placed L{} Bid: {} @ {} (oid: {})", level + 1, placed_size, price, oid);
                 } else {
-                    warn!("Failed to place L{} Bid: {} @ {}", level + 1, size, price);
+                    // Placement failed - remove the placeholder
+                    self.bid_levels.remove(bid_index);
+                    warn!("❌ Failed to place L{} Bid: {} @ {}", level + 1, size, price);
                 }
             } else if (*size * *price) < 10.0 {
                 warn!("Skipping L{} Bid: notional ${:.2} < $10 minimum", level + 1, size * price);
@@ -3086,21 +3142,36 @@ impl MarketMaker {
                 // DEBUG: Log ask price calculation details
                 debug!(
                     "🔴 ASK CALC: mid={:.3} | offset_bps={:.1} | price={:.3} | spread_to_mid_bps={:.1}",
-                    self.latest_mid_price,
-                    ((*price - self.latest_mid_price) / self.latest_mid_price * 10000.0),
+                    self.latest_l2_mid_price,
+                    ((*price - self.latest_l2_mid_price) / self.latest_l2_mid_price * 10000.0),
                     price,
-                    ((*price - self.latest_mid_price) / self.latest_mid_price * 10000.0)
+                    ((*price - self.latest_l2_mid_price) / self.latest_l2_mid_price * 10000.0)
                 );
+
+                // 🔧 FIX: Add order to tracking BEFORE placement to prevent race condition
+                // This ensures that if an instant fill arrives, the fill handler can find the order
+                let placeholder_order = MarketMakerRestingOrder { 
+                    oid: 0,  // Temporary placeholder - will be updated after placement
+                    position: *size, 
+                    price: *price, 
+                    level, 
+                    pending_cancel: false 
+                };
+                self.ask_levels.push(placeholder_order);
+                let ask_index = self.ask_levels.len() - 1;  // Remember index for updating oid
 
                 let (placed_size, oid) = self.place_order(self.asset.clone(), *size, *price, false).await;
 
                 if oid != 0 && placed_size > EPSILON {
-                    let new_order = MarketMakerRestingOrder { oid, position: placed_size, price: *price, level, pending_cancel: false };
-                    self.ask_levels.push(new_order);
+                    // Update the placeholder with the actual oid
+                    self.ask_levels[ask_index].oid = oid;
+                    self.ask_levels[ask_index].position = placed_size;  // Update with actual placed size
                     successful_placements += 1;
-                    info!("Successfully placed L{} Ask: {} @ {} (oid: {})", level + 1, placed_size, price, oid);
+                    info!("✅ Successfully placed L{} Ask: {} @ {} (oid: {})", level + 1, placed_size, price, oid);
                 } else {
-                    warn!("Failed to place L{} Ask: {} @ {}", level + 1, size, price);
+                    // Placement failed - remove the placeholder
+                    self.ask_levels.remove(ask_index);
+                    warn!("❌ Failed to place L{} Ask: {} @ {}", level + 1, size, price);
                 }
             } else if (*size * *price) < 10.0 {
                 warn!("Skipping L{} Ask: notional ${:.2} < $10 minimum", level + 1, size * price);
