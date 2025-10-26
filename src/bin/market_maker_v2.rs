@@ -62,7 +62,7 @@ async fn main() {
     
     // Configure multi-level market making
     let multi_level_config = MultiLevelConfig {
-        max_levels: 5,  // Place up to 5 levels on each side
+        max_levels: 3,  // Place up to 3 levels on each side
         min_profitable_spread_bps: 4.0,  // Minimum 4 bps total spread to cover fees + edge
         level_spacing_bps: 1.5,  // Space levels 1.5 bps apart
         total_size_per_side: 1.0,  // Total size across all levels: 1.0 HYPE per side
