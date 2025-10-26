@@ -2230,8 +2230,20 @@ impl MarketMaker {
                     let mid = all_mids.get(&self.asset);
                     if let Some(mid) = mid {
                         let mid: f64 = mid.parse().unwrap();
+                        let old_mid = self.latest_mid_price;
                         self.latest_mid_price = mid;
-                        
+
+                        // DEBUG: Log mid-price changes
+                        if old_mid > 0.0 {
+                            let change_bps = ((mid - old_mid) / old_mid * 10000.0).abs();
+                            if change_bps > 2.0 {  // More than 2 bps change
+                                info!(
+                                    "📊 AllMids UPDATE: {:.3} → {:.3} (Δ {:.1}bps)",
+                                    old_mid, mid, (mid - old_mid) / old_mid * 10000.0
+                                );
+                            }
+                        }
+
                         // Update state vector with new mid price
                         self.update_state_vector();
                         
@@ -2295,14 +2307,41 @@ impl MarketMaker {
 
                         for fill in fills {
                             let amount: f64 = fill.sz.parse().unwrap_or(0.0);
-                            if amount < EPSILON { 
-                                continue; 
+                            if amount < EPSILON {
+                                continue;
                             }
 
                             position_changed = true;
                             let is_bid_fill = fill.side == "B";
                             let filled_oid = fill.oid;
                             let mut filled_level: Option<usize> = None;
+
+                            // DEBUG: Enhanced fill notification logging
+                            let fill_price: f64 = fill.px.parse().unwrap_or(0.0);
+                            let current_mid = self.latest_mid_price;
+                            let side_str = if is_bid_fill { "BUY" } else { "SELL" };
+
+                            // Calculate how far from mid the fill happened
+                            let offset_from_mid_bps = if is_bid_fill {
+                                (current_mid - fill_price) / current_mid * 10000.0
+                            } else {
+                                (fill_price - current_mid) / current_mid * 10000.0
+                            };
+
+                            // Check if this was likely an instant fill (very close to mid)
+                            let is_suspicious = offset_from_mid_bps.abs() < 20.0;  // Within 20 bps of mid = probably instant fill
+
+                            if is_suspicious {
+                                warn!(
+                                    "⚡ INSTANT FILL?: {} {:.2} @ {:.3} | mid={:.3} | offset={:.1}bps | oid={}",
+                                    side_str, amount, fill_price, current_mid, offset_from_mid_bps, filled_oid
+                                );
+                            } else {
+                                info!(
+                                    "✅ FILL: {} {:.2} @ {:.3} | mid={:.3} | offset={:.1}bps | oid={}",
+                                    side_str, amount, fill_price, current_mid, offset_from_mid_bps, filled_oid
+                                );
+                            }
 
                             if is_bid_fill {
                                 // Our Bid was filled (we bought)
@@ -2729,6 +2768,34 @@ impl MarketMaker {
             return;
         }
 
+        // DEBUG: Periodic snapshot of market state
+        debug!(
+            "📸 SNAPSHOT: mid={:.3} | pos={:.2} | bids={} | asks={} | L2_available={}",
+            self.latest_mid_price,
+            self.cur_position,
+            self.bid_levels.len(),
+            self.ask_levels.len(),
+            self.latest_book.is_some()
+        );
+
+        // If L2 book is available, log BBO
+        if let Some(ref book) = self.latest_book {
+            if !book.bids.is_empty() && !book.asks.is_empty() {
+                if let (Ok(best_bid), Ok(best_ask)) = (
+                    book.bids[0].px.parse::<f64>(),
+                    book.asks[0].px.parse::<f64>()
+                ) {
+                    debug!(
+                        "📖 L2 BBO: {:.3} x {:.3} | spread={:.1}bps | L2_mid={:.3}",
+                        best_bid,
+                        best_ask,
+                        ((best_ask - best_bid) / best_bid * 10000.0),
+                        (best_bid + best_ask) / 2.0
+                    );
+                }
+            }
+        }
+
         // --- 0b. Check Urgency and Execute Taker First if Critical ---
         // If inventory urgency is extremely high, prioritize taker execution before slow maker reconciliation
         let inventory_ratio = self.cur_position.abs() / self.max_absolute_position_size;
@@ -2932,6 +2999,15 @@ impl MarketMaker {
             if *size >= EPSILON && *price > 0.0 && (*size * *price) >= 10.0 { // $10 notional minimum
                 info!("Placing L{} Bid: {} @ {} (${:.2} notional)", level + 1, size, price, size * price);
 
+                // DEBUG: Log bid price calculation details
+                debug!(
+                    "🔵 BID CALC: mid={:.3} | offset_bps={:.1} | price={:.3} | spread_to_mid_bps={:.1}",
+                    self.latest_mid_price,
+                    ((self.latest_mid_price - *price) / self.latest_mid_price * 10000.0),
+                    price,
+                    ((self.latest_mid_price - *price) / self.latest_mid_price * 10000.0)
+                );
+
                 let (placed_size, oid) = self.place_order(self.asset.clone(), *size, *price, true).await;
 
                 if oid != 0 && placed_size > EPSILON {
@@ -2961,6 +3037,15 @@ impl MarketMaker {
 
             if *size >= EPSILON && *price > 0.0 && (*size * *price) >= 10.0 { // $10 notional minimum
                 info!("Placing L{} Ask: {} @ {} (${:.2} notional)", level + 1, size, price, size * price);
+
+                // DEBUG: Log ask price calculation details
+                debug!(
+                    "🔴 ASK CALC: mid={:.3} | offset_bps={:.1} | price={:.3} | spread_to_mid_bps={:.1}",
+                    self.latest_mid_price,
+                    ((*price - self.latest_mid_price) / self.latest_mid_price * 10000.0),
+                    price,
+                    ((*price - self.latest_mid_price) / self.latest_mid_price * 10000.0)
+                );
 
                 let (placed_size, oid) = self.place_order(self.asset.clone(), *size, *price, false).await;
 
