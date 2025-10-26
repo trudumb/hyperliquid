@@ -49,13 +49,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create market maker input
     let input = MarketMakerInputV2 {
         asset: "ETH-USD".to_string(),
-        target_liquidity: 100.0,
-        half_spread: 12,  // Deprecated, kept for compatibility
-        reprice_threshold_ratio: 0.5,
         max_absolute_position_size: 100.0,
         asset_type: AssetType::Perp,
         wallet,
-        inventory_skew_config: None,
         enable_trading_gap_threshold_percent: 15.0,
         
         // NEW: Enable multi-level
@@ -164,13 +160,9 @@ fn single_level_mode() -> MarketMakerInputV2 {
     
     MarketMakerInputV2 {
         asset: "ETH-USD".to_string(),
-        target_liquidity: 100.0,
-        half_spread: 12,
-        reprice_threshold_ratio: 0.5,
         max_absolute_position_size: 100.0,
         asset_type: AssetType::Perp,
         wallet,
-        inventory_skew_config: None,
         enable_trading_gap_threshold_percent: 15.0,
         
         // Disable multi-level

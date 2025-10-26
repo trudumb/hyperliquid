@@ -3,25 +3,52 @@
 The V2 market maker uses:
 - State Vector (Z_t): Tracks mid-price, inventory, adverse selection, market spread, and LOB imbalance
 - Control Vector (u_t): Determines bid/ask offsets and taker order rates
-- HJB (Hamilton-Jacobi-Bellman) optimization for optimal quote placement
-- Value Function V(Q, Z, t) for inventory management
+- Multi-Level Optimizer: Places multiple orders at different price levels
+- Hawkes Fill Model: Self-exciting process for fill rate estimation
+- Particle Filter: Stochastic volatility estimation
+- Robust HJB: Hamilton-Jacobi-Bellman optimization with uncertainty bounds
+- Adam Optimizer: Autonomous parameter tuning
 
 The algorithm continuously monitors market state and adjusts quotes to maximize expected P&L
 while managing inventory risk through state-aware control policies.
 */
 use alloy::signers::local::PrivateKeySigner;
-use hyperliquid_rust_sdk::{
-    AssetType, InventorySkewConfig,
-};
+use hyperliquid_rust_sdk::AssetType;
 use hyperliquid_rust_sdk::market_maker_v2::{MarketMaker, MarketMakerInput};
+use hyperliquid_rust_sdk::{MultiLevelConfig, RobustConfig};
 use std::env;
 use tokio::signal;
 use log::info;
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[tokio::main]
 async fn main() {
-    env_logger::init();
-    
+    // Create a file appender for JSON logs
+    let file_appender = tracing_appender::rolling::never("./", "market_maker.log");
+    let (non_blocking_writer, _guard) = tracing_appender::non_blocking(file_appender);
+
+    // Create console layer (human-readable)
+    let console_layer = fmt::layer()
+        .with_writer(std::io::stderr);
+
+    // Create file layer (JSON format)
+    let file_layer = fmt::layer()
+        .json()
+        .with_writer(non_blocking_writer);
+
+    // Get log level filter from RUST_LOG environment variable
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+
+    // Combine layers and initialize global logger
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(console_layer)
+        .with(file_layer)
+        .init();
+
+    log::info!("Logger initialized. Logging to console and market_maker.log");
+
     // Load environment variables from .env file
     dotenv::dotenv().ok();
     
@@ -33,43 +60,54 @@ async fn main() {
         .parse()
         .expect("Invalid private key format");
     
-    // Configure inventory skewing for V2
-    // The V2 algorithm integrates this with HJB-based control
-    let skew_config = InventorySkewConfig::new(
-        0.6,  // inventory_skew_factor: moderate-high aggression (V2 uses this + HJB)
-        0.4,  // book_imbalance_factor: react to order book (V2 incorporates into state vector)
-        10,   // depth_analysis_levels: analyze top 10 levels for better state estimation
-    ).expect("Failed to create skew config");
+    // Configure multi-level market making
+    let multi_level_config = MultiLevelConfig {
+        max_levels: 3,  // Place up to 3 levels on each side
+        min_profitable_spread_bps: 4.0,  // Minimum 4 bps total spread to cover fees + edge
+        level_spacing_bps: 1.5,  // Space levels 1.5 bps apart
+        total_size_per_side: 1.0,  // Total size across all levels: 1.0 HYPE per side
+        ..Default::default()  // Use defaults for other parameters
+    };
+    
+    // Configure robust control (uncertainty handling)
+    let robust_config = RobustConfig {
+        enabled: true,  // Enable robust control
+        robustness_level: 0.7,  // 70% robustness (0.0 = no robustness, 1.0 = max robustness)
+        ..Default::default()  // Use defaults for other parameters
+    };
     
     let market_maker_input = MarketMakerInput {
         asset: "HYPE".to_string(),
-        target_liquidity: 0.3,  // Order size: 0.3 per side (allows ~10 fills to reach max position)
-        reprice_threshold_ratio: 0.5,  // Reprice when mid moves 50% of current spread (dynamic threshold)
-        half_spread: 5,         // DEPRECATED: Ignored - baseline spread now uses real-time market spread
-        max_absolute_position_size: 3.0,  // Max position: 3.0
+        max_absolute_position_size: 10.0,  // Max position: 10 HYPE
         asset_type: AssetType::Perp, // HYPE is a perpetual
         wallet,
-        inventory_skew_config: Some(skew_config),
-        enable_trading_gap_threshold_percent: 15.0,  // Enable trading when heuristic is within 15% of optimal
-        enable_multi_level: false,  // Disable multi-level market making
-        multi_level_config: None,   // No multi-level configuration
-        enable_robust_control: false,  // Disable robust control
-        robust_config: None,        // No robust control configuration
+        enable_trading_gap_threshold_percent: 30.0,  // Enable trading when performance gap < 30%
+        
+        // IMPORTANT: Multi-level and robust control configuration
+        enable_multi_level: true,  // Enable multi-level market making
+        multi_level_config: Some(multi_level_config),  // Provide configuration
+        enable_robust_control: true,  // Enable robust control with uncertainty bounds
+        robust_config: Some(robust_config),  // Provide configuration
     };
     
     let mut market_maker = MarketMaker::new(market_maker_input).await
         .expect("Failed to create market maker");
     
     info!("=== Market Maker V2 Initialized ===");
-    info!("Asset: HYPE");
-    info!("Target Liquidity: 0.3 per side");
-    info!("Baseline Spread: REAL-TIME MARKET SPREAD (fully market-driven, no arbitrary multipliers)");
-    info!("Dynamic Reprice: {:.0}% of current spread (adaptive threshold)", 0.5 * 100.0);
-    info!("Max Position: 3.0");
-    info!("Trading Enablement: Starts disabled, enables when heuristic gap < {:.1}%", 15.0);
-    info!("Features: Market-Driven Spread, Dynamic Reprice, State Vector, Control Vector, HJB Optimization");
-    info!("Hot-Reloading: tuning_params.json checked every 10 seconds");
-    info!("Adam Optimizer: Autonomous parameter tuning enabled");
+    info!("Asset: HYPE-USD");
+    info!("Max Position: 3.0 HYPE");
+    info!("Multi-Level: ENABLED (3 levels per side)");
+    info!("  - Total size per side: 0.3 HYPE");
+    info!("  - Level spacing: 1.5 bps");
+    info!("  - Min profitable spread: 4.0 bps");
+    info!("Robust Control: ENABLED (70% robustness level)");
+    info!("Trading Enablement: Starts disabled, enables when performance gap < 15%");
+    info!("Features:");
+    info!("  - State Vector with adverse selection estimation");
+    info!("  - Multi-Level Optimizer with Hawkes fill model");
+    info!("  - Particle Filter for stochastic volatility");
+    info!("  - Robust HJB with uncertainty bounds");
+    info!("  - Adam Optimizer for autonomous parameter tuning");
     info!("====================================");
     
     // Set up shutdown signal channel
@@ -83,7 +121,7 @@ async fn main() {
     });
     
     // Start market maker with shutdown signal
-    info!("Starting V2 market maker with HJB-based control...");
+    info!("Starting V2 market maker with multi-level optimization...");
     market_maker.start_with_shutdown_signal(Some(shutdown_rx)).await;
     
     info!("Market Maker V2 shutdown complete.");

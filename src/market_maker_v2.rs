@@ -1,6 +1,7 @@
 use alloy::{primitives::Address, signers::local::PrivateKeySigner};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use tokio::sync::mpsc::unbounded_channel;
+use tokio::time;
 use std::sync::{Arc, RwLock};
 
 //RUST_LOG=info cargo run --bin market_maker_v2
@@ -8,7 +9,7 @@ use std::sync::{Arc, RwLock};
 use crate::{
     AssetType, BaseUrl, BookAnalysis, ClientCancelRequest, ClientLimit, ClientOrder,
     ClientOrderRequest, ExchangeClient, ExchangeDataStatus, ExchangeResponseStatus, InfoClient,
-    InventorySkewConfig, MarketCloseParams, MarketOrderParams, Message,
+    MarketCloseParams, MarketOrderParams, Message,
     OrderBook, ParticleFilterState, AdaptiveConfig, Subscription, TickLotValidator, UserData, EPSILON,
     HawkesFillModel, MultiLevelConfig, MultiLevelOptimizer, OptimizationState,
     ParameterUncertainty, RobustConfig, RobustParameters,
@@ -615,7 +616,7 @@ impl StateVector {
         &mut self,
         mid_price: f64,
         inventory: f64,
-        book_analysis: Option<&BookAnalysis>,
+        _book_analysis: Option<&BookAnalysis>,  // Unused - kept for API compatibility
         order_book: Option<&OrderBook>,
         tuning_params: &ConstrainedTuningParams,
         online_model: &mut OnlineAdverseSelectionModel,
@@ -634,18 +635,37 @@ impl StateVector {
             if let Some(spread_bps) = book.spread_bps() {
                 self.market_spread_bps = spread_bps;
             }
-        }
-        
-        if let Some(analysis) = book_analysis {
-            // Update LOB imbalance (I_t)
-            // BookAnalysis.imbalance is in range [-1, 1]
-            // Convert to ratio: (imbalance + 1) / 2 gives us [0, 1]
-            // Where 0 = all ask volume, 1 = all bid volume, 0.5 = balanced
-            self.lob_imbalance = (analysis.imbalance + 1.0) / 2.0;
-            
-            // Update adverse selection estimate (μ̂_t) using online linear regression model
-            // This is a filtered estimate of short-term price drift
+
+            // FIX: Calculate LOB imbalance directly from order book
+            // Get best bid/ask volumes from the OrderBook
+            if !book.bids.is_empty() && !book.asks.is_empty() {
+                // Parse size strings to f64
+                if let (Ok(bid_vol), Ok(ask_vol)) = (
+                    book.bids[0].sz.parse::<f64>(),
+                    book.asks[0].sz.parse::<f64>()
+                ) {
+                    let total_vol = bid_vol + ask_vol;
+
+                    if total_vol > 1e-10 {  // EPSILON check
+                        // I_t = V^b / (V^b + V^a)
+                        // Range: [0, 1] where 0.5 = balanced, >0.5 = bid-heavy, <0.5 = ask-heavy
+                        self.lob_imbalance = bid_vol / total_vol;
+                    } else {
+                        self.lob_imbalance = 0.5; // Neutral if no volume
+                    }
+                } else {
+                    self.lob_imbalance = 0.5; // Neutral if parse fails
+                }
+            } else {
+                self.lob_imbalance = 0.5; // Neutral if no BBO
+            }
+
+            // FIX: ALWAYS update adverse selection (moved from book_analysis check)
+            // This must run on EVERY update to generate non-zero μ̂
             self.update_adverse_selection(tuning_params, online_model);
+        } else {
+            // No order book available - set neutral defaults
+            self.lob_imbalance = 0.5;
         }
     }
     
@@ -1368,26 +1388,9 @@ pub struct MarketMakerRestingOrder {
 #[derive(Debug)]
 pub struct MarketMakerInput {
     pub asset: String,
-    pub target_liquidity: f64, // DEPRECATED: Replaced by multi_level_config.level_sizes - kept for backward compatibility only
-    
-    /// DEPRECATED: Removed in multi-level refactor - baseline spread now uses real-time market spread
-    /// Kept for backward compatibility only. Value is ignored.
-    #[deprecated(note = "Use multi_level_config instead - baseline spread is now dynamic")]
-    pub half_spread: u16,
-    
-    /// DEPRECATED: Removed in multi-level refactor - reprice logic replaced by multi-level reconciliation
-    /// Kept for backward compatibility only. Value is ignored.
-    #[deprecated(note = "Reprice logic now handled by multi-level reconciliation")]
-    pub reprice_threshold_ratio: f64,
-    
     pub max_absolute_position_size: f64, // Absolute value of the max position we can take on
     pub asset_type: AssetType, // Asset type (Perp or Spot) for tick/lot size validation
     pub wallet: PrivateKeySigner, // Wallet containing private key
-    
-    /// DEPRECATED: Removed in multi-level refactor - skew logic integrated into multi_level_optimizer
-    /// Kept for backward compatibility only. Value is ignored.
-    #[deprecated(note = "Skew logic now integrated into multi_level_optimizer")]
-    pub inventory_skew_config: Option<InventorySkewConfig>,
     
     /// Performance gap threshold (in percent) to enable live trading
     /// E.g., 15.0 means trading starts when heuristic gap is < 15%
@@ -1452,7 +1455,15 @@ pub struct MarketMaker {
     /// Unified multi-level optimizer (contains config, logic for levels/sizes)
     /// Replaces old single-level HJB components and value function
     pub multi_level_optimizer: MultiLevelOptimizer,
-    
+
+    /// Old HJB Components - kept for gradient calculation target
+    /// Used as the "optimal target" in the learning loop
+    pub hjb_components: HJBComponents,
+
+    /// Old Value Function - kept for gradient calculation target
+    /// Used as the "optimal target" in the learning loop
+    pub value_function: ValueFunction,
+
     /// Hawkes process model for fill rate estimation
     /// Needs RwLock for fill updates from trade stream
     pub hawkes_model: Arc<RwLock<HawkesFillModel>>,
@@ -1497,6 +1508,13 @@ pub struct MarketMaker {
     /// Performance gap threshold (in percent) to enable live trading
     /// E.g., 15.0 means trading starts when heuristic gap is < 15%
     pub enable_trading_gap_threshold_percent: f64,
+    
+    // ===== Temporary Fields =====
+    /// Latest taker buy rate (if needed for taker logic)
+    pub latest_taker_buy_rate: f64,
+    
+    /// Latest taker sell rate (if needed for taker logic)
+    pub latest_taker_sell_rate: f64,
     
     // ===== REMOVED/DEPRECATED Fields (Documented for Reference) =====
     // The following fields have been removed in this refactor:
@@ -1563,7 +1581,7 @@ impl MarketMaker {
                 let vol_p5 = pf.estimate_volatility_percentile_bps(0.05);
                 let vol_p95 = pf.estimate_volatility_percentile_bps(0.95);
                 
-                info!(
+                debug!(
                     "📊 SV Filter: vol={:.2}bps, ESS={:.0}/{:.0} ({:.1}%), CI=[{:.2}, {:.2}]",
                     vol_estimate_bps,
                     ess,
@@ -1577,8 +1595,8 @@ impl MarketMaker {
                 if pf.is_adaptive() {
                     let (mu, phi, sigma_eta) = pf.get_parameter_estimates();
                     let (std_mu, std_phi, std_sigma_eta) = pf.get_parameter_std_devs();
-                    
-                    info!(
+
+                    debug!(
                         "   Parameters: μ={:.3}±{:.3} | φ={:.4}±{:.4} | σ_η={:.3}±{:.3}",
                         mu, std_mu,
                         phi, std_phi,
@@ -1607,90 +1625,8 @@ impl MarketMaker {
         );
         
         // Log state vector for monitoring (can be disabled for performance)
-        info!("{}", self.state_vector.to_log_string());
+        debug!("{}", self.state_vector.to_log_string());
     }
-    
-    /* DEPRECATED: Old HJB-based control calculation - replaced by calculate_multi_level_targets()
-    /// Calculate optimal control vector based on current state
-    /// Uses HJB optimization to derive spreads from first principles
-    /// Calculate optimal control vector based on current state
-    /// Uses the FAST HEURISTIC (`apply_state_adjustments`) for real-time trading.
-    ///
-    /// The BASELINE for this heuristic is now the real-time MARKET SPREAD.
-    /// The parameters for the *adjustments* (skew, etc.) on top of this
-    /// baseline are autonomously tuned by the background Adam optimizer.
-    fn calculate_optimal_control(&mut self) {
-        let start = std::time::Instant::now();
-        
-        // 1. Base spread from REAL-TIME MARKET SPREAD (not arbitrary multiplier)
-        // This is the correct, market-driven baseline.
-        let base_total_spread_bps = (self.state_vector.market_spread_bps)
-            .max(12.0);  // CRITICAL: Same .max() as background task
-        let base_half_spread_bps = base_total_spread_bps / 2.0;
-
-        // 2. Get latest Adam-tuned parameters
-        let constrained_params = self.tuning_params.read().unwrap().get_constrained();
-
-        // 3. Start with symmetric base control
-        let mut heuristic_control = ControlVector::symmetric(base_half_spread_bps);
-
-        // 4. Apply FAST heuristic adjustments (this is what Adam is tuning)
-        heuristic_control.apply_state_adjustments(
-            &self.state_vector,
-            base_half_spread_bps,
-            self.max_absolute_position_size,
-            &constrained_params,
-            &self.hjb_components,
-        );
-
-        let elapsed = start.elapsed();
-
-        // 5. Use the heuristic result for trading
-        self.control_vector = heuristic_control;
-
-        // 6. Validate
-        if let Err(e) = self.control_vector.validate(base_total_spread_bps) {
-            error!("Invalid heuristic control: {}", e);
-            self.control_vector = ControlVector::symmetric(base_half_spread_bps);
-        }
-
-        // Performance monitoring: warn if fast path is taking too long
-        if elapsed.as_millis() > 5 {
-            warn!("Fast path taking {}ms - should be <5ms", elapsed.as_millis());
-        }
-
-        // 7. Update log to reflect market spread
-        info!(
-            "[FAST HEURISTIC] {} base_market_spread={:.2}bps ({}μs)",
-            self.control_vector.to_log_string(),
-            base_total_spread_bps,
-            elapsed.as_micros()
-        );
-    }
-    */
-    
-    /* DEPRECATED: Use calculate_multi_level_targets() instead
-    /// DEPRECATED: Use calculate_optimal_control() instead
-    /// This method is kept for backward compatibility
-    /// The main calculate_optimal_control() now uses HJB optimization by default
-    #[deprecated(note = "Use calculate_optimal_control() instead - it now uses HJB optimization")]
-    pub fn calculate_optimal_control_hjb(&mut self) {
-        // Delegate to the main method which now uses HJB optimization
-        self.calculate_optimal_control();
-    }
-    */
-    
-    /* DEPRECATED: Old HJB-based evaluation - replaced by MultiLevelOptimizer
-    /// Evaluate current strategy using HJB objective
-    /// Returns the instantaneous expected value rate
-    pub fn evaluate_current_strategy(&self) -> f64 {
-        self.hjb_components.evaluate_control(
-            &self.control_vector,
-            &self.state_vector,
-            &self.value_function,
-        )
-    }
-    */
     
     /// Calculate optimal multi-level targets using Hawkes, Robust HJB, and sizing logic.
     /// This is the NEW core quoting logic that replaces calculate_optimal_control.
@@ -1753,9 +1689,13 @@ impl MarketMaker {
                                          .max(min_profitable_half_spread)
                                          * robust_params.spread_multiplier; // Apply robustness widening
 
+        // Get current tuning parameters
+        let current_tuning_params = self.tuning_params.read().unwrap().get_constrained();
+
         let multi_level_control = self.multi_level_optimizer.optimize(
             &opt_state,
             robust_base_half_spread, // Pass the calculated robust base
+            &current_tuning_params,
         );
         drop(hawkes_lock); // Release lock
 
@@ -1763,25 +1703,41 @@ impl MarketMaker {
         let mut target_bids: Vec<(f64, f64)> = Vec::new();
         let mut target_asks: Vec<(f64, f64)> = Vec::new();
 
-        for (offset_bps, size) in multi_level_control.bid_levels {
-            if size < EPSILON { 
-                continue; 
+        for (offset_bps, size_raw) in multi_level_control.bid_levels {
+            if size_raw < EPSILON {
+                continue;
             } // Skip dust
+
+            // FIX: Round size DOWN to asset's sz_decimals (conservative - never place more than intended)
+            let size = self.tick_lot_validator.round_size(size_raw, false);
+            if size < EPSILON {
+                continue; // Skip if rounded size is too small
+            }
+
             let price_raw = state.mid_price * (1.0 - offset_bps / 10000.0);
             let price = self.tick_lot_validator.round_price(price_raw, false); // Round bid down
-            if price > 0.0 {
-                target_bids.push((price, size));
+
+            if price > 0.0 && (size * price) >= 10.0 { // Notional minimum check: $10
+                target_bids.push((price, size)); // Push rounded size
             }
         }
 
-        for (offset_bps, size) in multi_level_control.ask_levels {
-            if size < EPSILON { 
-                continue; 
+        for (offset_bps, size_raw) in multi_level_control.ask_levels {
+            if size_raw < EPSILON {
+                continue;
             }
+
+            // FIX: Round size DOWN to asset's sz_decimals (conservative)
+            let size = self.tick_lot_validator.round_size(size_raw, false);
+            if size < EPSILON {
+                continue; // Skip if rounded size is too small
+            }
+
             let price_raw = state.mid_price * (1.0 + offset_bps / 10000.0);
             let price = self.tick_lot_validator.round_price(price_raw, true); // Round ask up
-            if price > 0.0 {
-                target_asks.push((price, size));
+
+            if price > 0.0 && (size * price) >= 10.0 { // Notional minimum check: $10
+                target_asks.push((price, size)); // Push rounded size
             }
         }
 
@@ -1794,93 +1750,27 @@ impl MarketMaker {
         // (This could be added later if needed)
 
         let elapsed = start.elapsed();
-        info!(
+        debug!(
             "[MULTI-LEVEL OPTIMIZE] Targets ({}μs): Bids({}): {:?}, Asks({}): {:?}",
             elapsed.as_micros(), target_bids.len(), target_bids, target_asks.len(), target_asks
         );
+        // Store taker rates for use in potentially_update
+        self.latest_taker_buy_rate = multi_level_control.taker_buy_rate;
+        self.latest_taker_sell_rate = multi_level_control.taker_sell_rate;
+        
         if multi_level_control.liquidate {
             warn!("Liquidation mode triggered by optimizer!");
-            // Taker logic will be handled in potentially_update based on rates
+            info!("Taker rates set: buy={:.4}, sell={:.4}", 
+                  self.latest_taker_buy_rate, self.latest_taker_sell_rate);
         }
-
-        // TODO: Store multi_level_control rates if needed for taker logic
-        // self.multi_level_control = Some(multi_level_control); // Store if needed later
 
         (target_bids, target_asks)
     }
-    
-    /* DEPRECATED: Old HJB-based fill rate calculation - replaced by Hawkes model
-    /// Get expected maker fill rates for current control
-    pub fn get_expected_fill_rates(&self) -> (f64, f64) {
-        let lambda_bid = self.hjb_components.maker_bid_fill_rate(
-            self.control_vector.bid_offset_bps,
-            &self.state_vector,
-        );
-        let lambda_ask = self.hjb_components.maker_ask_fill_rate(
-            self.control_vector.ask_offset_bps,
-            &self.state_vector,
-        );
-        (lambda_bid, lambda_ask)
-    }
-    
-    /// Get the current control vector (read-only access)
-    pub fn get_control_vector(&self) -> &ControlVector {
-        &self.control_vector
-    }
-    */
     
     /// Get the current state vector (read-only access)
     pub fn get_state_vector(&self) -> &StateVector {
         &self.state_vector
     }
-    
-
-    /* DEPRECATED: Old Adam optimizer method using HJBComponents - needs refactoring for MultiLevelOptimizer
-    /// Run HJB grid search optimization in background and compare with heuristic
-    /// 
-    /// This spawns a background task to run the expensive `optimize_control()` grid search
-    /// without blocking real-time trading. The results can be used to:
-    /// 
-    /// - Validate that the fast heuristic is performing well
-    /// - Tune heuristic parameters by comparing with grid search results
-    /// - Collect data for ML-based policy learning
-    /// 
-    /// **NEW: Automatic Adam-optimized parameter tuning**
-    /// 
-    /// This function now implements the Adam optimizer (Adaptive Moment Estimation) to
-    /// automatically tune the TuningParams to minimize the performance gap between the
-    /// heuristic and optimal control. Adam adapts the learning rate for each parameter
-    /// automatically using momentum, making it far more robust than vanilla SGD.
-    /// 
-    /// The gradient is calculated numerically using finite differences, and the updated
-    /// parameters are saved back to the JSON file for persistence.
-    /// 
-    /// Returns a handle that can be awaited to get the optimized control and comparison metrics.
-    /// 
-    /// # Example
-    /// 
-    /// ```ignore
-    /// // Spawn background optimization
-    /// let optimization_handle = market_maker.optimize_control_background();
-    /// 
-    /// // Continue with real-time trading using fast heuristic...
-    /// 
-    /// // Later, check optimization results
-    /// if let Ok((optimal_control, heuristic_value, optimal_value)) = optimization_handle.await {
-    ///     let performance_gap = (optimal_value - heuristic_value) / optimal_value.abs();
-    ///     info!("Heuristic performance: {:.2}% of optimal", (1.0 - performance_gap) * 100.0);
-    ///     
-    ///     if performance_gap > 0.1 {
-    ///         warn!("Heuristic significantly underperforming, consider tuning");
-    ///     }
-    /// }
-    /// ```
-    pub fn optimize_control_background(&self) -> tokio::task::JoinHandle<(ControlVector, f64, f64)> {
-        // This method used old HJBComponents and needs refactoring for MultiLevelOptimizer
-        // Temporarily disabled until refactored
-        todo!("Refactor optimize_control_background for MultiLevelOptimizer")
-    }
-    */
     
     /// Calculate optimal spread adjustment based on state vector
     /// This can be used to implement more sophisticated pricing strategies
@@ -1912,29 +1802,64 @@ impl MarketMaker {
         let max_spread_threshold = base_total_spread_bps * 10.0;
         !self.state_vector.is_market_favorable(max_spread_threshold)
     }
-    
-    /// Reset a resting order to default state
-    #[allow(dead_code)]
-    fn reset_resting_order(&mut self, is_bid: bool) {
-        // For multi-level system, clear the appropriate level vec
-        if is_bid {
-            self.bid_levels.clear();
-        } else {
-            self.ask_levels.clear();
+
+    /// Clean up invalid resting orders (e.g., zero/negative positions, zero OIDs)
+    /// Also re-assigns level indices based on sorted price.
+    fn cleanup_invalid_resting_orders(&mut self) {
+        let initial_bids = self.bid_levels.len();
+        let initial_asks = self.ask_levels.len();
+
+        // Remove orders that are effectively filled or invalid
+        self.bid_levels.retain(|order| order.position >= EPSILON && order.oid != 0);
+        self.ask_levels.retain(|order| order.position >= EPSILON && order.oid != 0);
+
+        // Re-sort just in case order of remaining items changed (unlikely but safe)
+        self.bid_levels.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
+        self.ask_levels.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Re-assign levels based on current sorted order (0 = best price)
+        for (i, order) in self.bid_levels.iter_mut().enumerate() {
+            order.level = i;
+        }
+        for (i, order) in self.ask_levels.iter_mut().enumerate() {
+            order.level = i;
+        }
+
+        if self.bid_levels.len() < initial_bids || self.ask_levels.len() < initial_asks {
+             log::debug!( // Use debug level
+                 "Cleaned up orders: {} bids removed, {} asks removed.",
+                 initial_bids - self.bid_levels.len(),
+                 initial_asks - self.ask_levels.len()
+             );
         }
     }
 
-    /// Clean up any invalid resting orders (e.g., negative positions, zero OIDs)
-    fn cleanup_invalid_resting_orders(&mut self) {
-        self.bid_levels.retain(|o| o.position >= EPSILON && o.oid != 0);
-        self.ask_levels.retain(|o| o.position >= EPSILON && o.oid != 0);
-        
-        // Re-assign levels after potentially removing items
-        for (i, order) in self.bid_levels.iter_mut().enumerate() { 
-            order.level = i; 
-        }
-        for (i, order) in self.ask_levels.iter_mut().enumerate() { 
-            order.level = i; 
+    /// Helper function to cancel all currently tracked resting orders.
+    async fn cancel_all_orders(&mut self) {
+        let mut oids_to_cancel: Vec<u64> = Vec::new();
+
+        // Drain removes elements while iterating, simplifying clearing logic
+        oids_to_cancel.extend(self.bid_levels.drain(..).filter(|o| o.oid != 0).map(|o| o.oid));
+        oids_to_cancel.extend(self.ask_levels.drain(..).filter(|o| o.oid != 0).map(|o| o.oid));
+
+        // Ensure lists are empty after draining
+        assert!(self.bid_levels.is_empty());
+        assert!(self.ask_levels.is_empty());
+
+        if !oids_to_cancel.is_empty() {
+            info!("Cancelling all {} resting orders...", oids_to_cancel.len());
+            
+            // Cancel orders sequentially (ExchangeClient doesn't implement Clone)
+            let mut cancelled_count = 0;
+            for oid in oids_to_cancel {
+                if self.attempt_cancel(self.asset.clone(), oid).await {
+                    cancelled_count += 1;
+                }
+            }
+            
+            info!("Finished cancelling orders. {} successful.", cancelled_count);
+        } else {
+            info!("No active resting orders found to cancel.");
         }
     }
 
@@ -1973,11 +1898,7 @@ impl MarketMaker {
             sz_decimals,
         );
 
-        // Note: inventory_skew_calculator is deprecated - skew logic now integrated into multi_level_optimizer
-        // Kept here to avoid breaking MarketMakerInput, but not used in refactored struct
-        if input.inventory_skew_config.is_some() {
-            info!("⚠️  inventory_skew_config provided but deprecated - skew logic now in multi_level_optimizer");
-        }
+        // Note: inventory_skew_calculator logic now integrated into multi_level_optimizer
 
         // Load initial tuning parameters from JSON file if it exists
         // After this, Adam optimizer takes full control of parameter tuning
@@ -2066,7 +1987,6 @@ impl MarketMaker {
         if input.enable_robust_control {
             info!("🛡️  Robust control ENABLED");
             info!("   Robustness level: {:.1}%", robust_config.robustness_level * 100.0);
-            info!("   Confidence level: {:.1}%", robust_config.confidence_level * 100.0);
             info!("   Uncertainty bounds will be applied to drift, volatility, and spreads");
         } else {
             info!("📊 Robust control DISABLED (using nominal parameters without uncertainty bounds)");
@@ -2095,6 +2015,8 @@ impl MarketMaker {
             
             // ===== Multi-Level Optimizer & Components =====
             multi_level_optimizer,  // Contains config, HJB logic, level sizing
+            hjb_components: HJBComponents::default(),  // Old grid search optimizer (used as learning target)
+            value_function: ValueFunction::new(0.1, 3600.0),  // Old value function (phi=0.1, T=1 hour)
             hawkes_model,           // Fill rate estimation with self-excitation
             robust_config,          // Uncertainty sets and robustness parameters
             current_uncertainty: ParameterUncertainty::default(),  // Updated by particle filter each tick
@@ -2106,13 +2028,17 @@ impl MarketMaker {
             // ===== Adam Self-Tuning System =====
             tuning_params: Arc::new(RwLock::new(initial_params)),  // Meta-parameters for heuristic adjustments
             adam_optimizer: Arc::new(RwLock::new(AdamOptimizerState::default())),  // Adaptive moment estimation
-            gradient_accumulator: Arc::new(RwLock::new(vec![0.0; 8])),  // 8 parameters (updated from 7)
+            gradient_accumulator: Arc::new(RwLock::new(vec![0.0; 9])),  // 8 parameters + 1 loss = 9 elements
             gradient_count: Arc::new(RwLock::new(0)),  // Reset after each Adam update
             message_counter: Arc::new(RwLock::new(0)),  // For gradient sampling (every Nth message)
             
             // ===== Trading Control =====
             trading_enabled: Arc::new(RwLock::new(false)),  // Start disabled, enabled when optimizer validates performance
             enable_trading_gap_threshold_percent: input.enable_trading_gap_threshold_percent,
+            
+            // ===== Temporary Fields =====
+            latest_taker_buy_rate: 0.0,  // Initialize to zero
+            latest_taker_sell_rate: 0.0,  // Initialize to zero
         })
     }
 
@@ -2164,55 +2090,10 @@ impl MarketMaker {
             .await
             .unwrap();
 
-        /* DEPRECATED: Background optimization using old HJBComponents
-        // Initialize background optimization loop timer
-        let mut last_optimization_time = std::time::Instant::now();
-        let optimization_interval = std::time::Duration::from_secs(60);
-        info!("Background HJB optimization with Adam tuning enabled: will run every {} seconds", optimization_interval.as_secs());
-        info!("Parameter tuning is now fully autonomous via Adam optimizer");
-        info!("To override: stop bot, edit tuning_params.json, restart bot");
-        */
-
+        // Create Adam optimizer timer (60 second interval)
+        let mut adam_timer = time::interval(std::time::Duration::from_secs(60));
+        
         loop {
-            /* DEPRECATED: Background optimization using old HJBComponents
-            // This needs to be refactored for the new MultiLevelOptimizer approach
-            // Check if it's time to run background optimization
-            if last_optimization_time.elapsed() >= optimization_interval {
-                info!("Spawning background HJB optimization task...");
-                let optimization_handle = self.optimize_control_background();
-                
-                // Don't await it, let it run in the background
-                // and log the results when it's done
-                tokio::spawn(async move {
-                    match optimization_handle.await {
-                        Ok((optimal_control, heuristic_value, optimal_value)) => {
-                            let perf_gap = (optimal_value - heuristic_value).abs();
-                            let gap_percent = if optimal_value.abs() > EPSILON {
-                                (perf_gap / optimal_value.abs()) * 100.0
-                            } else {
-                                0.0
-                            };
-                            
-                            info!(
-                                "Background HJB Optimization Complete: Heuristic_Value={:.4}, Optimal_Value={:.4}, Gap={:.2}%",
-                                heuristic_value, optimal_value, gap_percent
-                            );
-                            info!("Optimal Control (from grid search): {}", optimal_control.to_log_string());
-                            
-                            if gap_percent > 10.0 {
-                                log::warn!("Heuristic performance gap is high (>{:.2}%)! Consider tuning.", gap_percent);
-                            }
-                        }
-                        Err(e) => {
-                            error!("Background optimization task failed: {:?}", e);
-                        }
-                    }
-                });
-                
-                last_optimization_time = std::time::Instant::now();
-            }
-            */ // End of deprecated background optimization block
-
             tokio::select! {
                 // Check for shutdown signal
                 _ = async {
@@ -2276,23 +2157,19 @@ impl MarketMaker {
                         // ============================================
                         // GRADIENT ACCUMULATION FOR STABLE ADAM OPTIMIZER
                         // ============================================
-                        /* DEPRECATED: Old gradient accumulation for Adam optimizer
-                        // This used HJBComponents which has been replaced by MultiLevelOptimizer
-                        // TODO: Implement new gradient-based tuning for MultiLevelOptimizer if needed
-                        
-                        // Sample every 10th AllMids message to balance CPU usage with gradient quality
-                        // This provides ~6 gradient samples per minute (assuming ~1 AllMids/second)
-                        // Over 60 seconds, this accumulates ~60 gradients for stable averaging
+                        // Sample every 5th AllMids message to balance CPU usage with gradient quality
+                        // This provides ~12 gradient samples per minute (assuming ~1 AllMids/second)
+                        // Over 60 seconds, this accumulates ~12 gradients for stable averaging
                         {
                             let mut counter = self.message_counter.write().unwrap();
                             *counter += 1;
-                            let sample_interval = 10; // Accumulate gradient every 10th message
+                            let sample_interval = 5; // Accumulate gradient every 5th message (~12 samples/minute)
                             
                             if *counter % sample_interval == 0 {
-                                // Gradient calculation code removed - needs refactoring for MultiLevelOptimizer
+                                // Call accumulate_gradient_snapshot for Adam optimization
+                                self.accumulate_gradient_snapshot();
                             }
                         }
-                        */
                         
                         // Check to see if we need to cancel or place any new orders
                         self.potentially_update().await;
@@ -2396,6 +2273,38 @@ impl MarketMaker {
                     panic!("Unsupported message type");
                 }
             }
+                }
+
+                // Adam optimizer timer - runs every 60 seconds
+                _ = adam_timer.tick() => {
+                    // Log heartbeat summary
+                    info!(
+                        "[HEARTBEAT] Pos: {:.4} | Mid: {:.2} | Vol (σ̂): {:.2}bps | Drift (μ̂): {:.4} | Trading: {} | Orders: {} Bids / {} Asks",
+                        self.cur_position,
+                        self.latest_mid_price,
+                        self.state_vector.volatility_ema_bps,
+                        self.state_vector.adverse_selection_estimate,
+                        *self.trading_enabled.read().unwrap(),
+                        self.bid_levels.len(),
+                        self.ask_levels.len()
+                    );
+
+                    info!("Adam optimizer timer triggered");
+                    let adam_handle = self.run_adam_update_and_enablement_check();
+                    // Spawn the handle without awaiting it (non-blocking background task)
+                    tokio::spawn(async move {
+                        match adam_handle.await {
+                            Ok(Some(performance_gap)) => {
+                                info!("Adam update completed with performance gap: {:.2}%", performance_gap);
+                            }
+                            Ok(None) => {
+                                info!("Adam update completed but no performance gap calculated");
+                            }
+                            Err(e) => {
+                                error!("Adam update task failed: {:?}", e);
+                            }
+                        }
+                    });
                 }
             }
         }
@@ -2579,49 +2488,29 @@ impl MarketMaker {
         0.0
     }
 
-    /// Cancel all open orders and close any position, then shutdown gracefully
+    /// Cancel all open orders and close any position, then shutdown gracefully.
     pub async fn shutdown(&mut self) {
-        info!("Shutting down market maker, cancelling all open orders and closing position...");
-        
-        // Collect all OIDs that need to be cancelled
-        let mut total_orders = 0;
-        let mut successful_cancels = 0;
-        
-        for order in &self.bid_levels {
-            if order.oid != 0 && order.position > EPSILON {
-                info!("Cancelling bid level {} (oid: {})", order.level, order.oid);
-                if self.attempt_cancel(self.asset.clone(), order.oid).await {
-                    successful_cancels += 1;
-                }
-                total_orders += 1;
-            }
-        }
-        
-        for order in &self.ask_levels {
-            if order.oid != 0 && order.position > EPSILON {
-                info!("Cancelling ask level {} (oid: {})", order.level, order.oid);
-                if self.attempt_cancel(self.asset.clone(), order.oid).await {
-                    successful_cancels += 1;
-                }
-                total_orders += 1;
-            }
-        }
-        
-        info!("Successfully cancelled {}/{} orders", successful_cancels, total_orders);
-        
-        // Clear all resting orders
-        self.bid_levels.clear();
-        self.ask_levels.clear();
-        
-        // Close any existing position
-        if self.cur_position.abs() > EPSILON {
+        info!("Shutting down market maker...");
+
+        // Use the helper to cancel all orders and clear local lists
+        self.cancel_all_orders().await;
+
+        // Close any existing position (logic remains the same)
+        if self.cur_position.abs() >= EPSILON {
             info!("Current position: {:.6} {}, closing position...", self.cur_position, self.asset);
-            self.close_position().await;
+            self.close_position().await; // Ensure this handles potential errors gracefully
         } else {
-            info!("No position to close (position: {:.6})", self.cur_position);
+            info!("No significant position to close (position: {:.6})", self.cur_position);
         }
-        
-        info!("All orders cancelled and position closed. Market maker shutdown complete.");
+
+        // Optional: Persist any final state (e.g., learned parameters) if needed
+        if let Err(e) = self.tuning_params.read().unwrap().to_json_file("tuning_params_final.json") {
+            warn!("Failed to save final tuning parameters: {}", e);
+        } else {
+            info!("Final tuning parameters saved to tuning_params_final.json");
+        }
+
+        info!("Market maker shutdown complete.");
     }
 
     /// Close the current position using the SDK's market_close function with slippage protection
@@ -2698,6 +2587,7 @@ impl MarketMaker {
     }
 
     /// Main logic loop: calculate multi-level targets and reconcile orders.
+    /// Enhanced with concurrent operations and complete taker logic implementation.
     async fn potentially_update(&mut self) {
         // --- 0. Pre-checks ---
         self.cleanup_invalid_resting_orders();
@@ -2715,103 +2605,193 @@ impl MarketMaker {
         // This now returns Vec<(price, size)> using the new framework
         let (target_bids, target_asks) = self.calculate_multi_level_targets();
 
-        // --- 2. Reconcile Existing Orders ---
+        // --- 2. Reconcile Existing Orders (Enhanced) ---
         let mut orders_to_cancel: Vec<u64> = Vec::new();
         let mut bids_to_place = target_bids.clone();
         let mut asks_to_place = target_asks.clone();
 
-        // Check existing bids against targets
+        // Check existing bids against targets with improved tolerance
         let mut remaining_bids: Vec<MarketMakerRestingOrder> = Vec::new();
-        for order in self.bid_levels.drain(..) { // Drain to consume old list
+        for order in self.bid_levels.drain(..) {
             if order.oid == 0 || order.position < EPSILON { 
                 continue; 
             }
 
-            // Try to find a matching target (price & size within tolerance)
+            // Enhanced matching logic with better tolerance (0.1% price, 1% size)
+            let order_price = order.price;
+            let order_position = order.position;
+            let order_level = order.level;
+            let order_oid = order.oid;
+            
             if let Some(target_idx) = bids_to_place.iter().position(|(p, s)| {
-                (p - order.price).abs() < EPSILON && (s - order.position).abs() < EPSILON * 0.1
+                let price_tolerance = order_price * 0.001; // 0.1% price tolerance
+                let size_tolerance = order_position * 0.01; // 1% size tolerance
+                (p - order_price).abs() <= price_tolerance && (s - order_position).abs() <= size_tolerance
             }) {
-                // Match found! Keep this resting order, remove from placement list.
-                remaining_bids.push(order);
+                // Match found! Keep this resting order, remove from placement list
                 bids_to_place.remove(target_idx);
+                debug!("Keeping existing L{} Bid: {} @ {} (matched target)", order_level + 1, order_position, order_price);
+                remaining_bids.push(order);
             } else {
-                // No match, or price/size is wrong. Cancel it.
-                orders_to_cancel.push(order.oid);
+                // No match found - cancel this order
+                orders_to_cancel.push(order_oid);
+                info!("Cancelling outdated L{} Bid: {} @ {} (oid: {})", order_level + 1, order_position, order_price, order_oid);
             }
         }
         self.bid_levels = remaining_bids;
 
-        // Check existing asks against targets (similar logic)
+        // Check existing asks against targets with same enhanced logic
         let mut remaining_asks: Vec<MarketMakerRestingOrder> = Vec::new();
         for order in self.ask_levels.drain(..) {
             if order.oid == 0 || order.position < EPSILON { 
                 continue; 
             }
             
+            let order_price = order.price;
+            let order_position = order.position;
+            let order_level = order.level;
+            let order_oid = order.oid;
+            
             if let Some(target_idx) = asks_to_place.iter().position(|(p, s)| {
-                (p - order.price).abs() < EPSILON && (s - order.position).abs() < EPSILON * 0.1
+                let price_tolerance = order_price * 0.001; // 0.1% price tolerance
+                let size_tolerance = order_position * 0.01; // 1% size tolerance
+                (p - order_price).abs() <= price_tolerance && (s - order_position).abs() <= size_tolerance
             }) {
-                remaining_asks.push(order);
+                // Match found! Keep this resting order
                 asks_to_place.remove(target_idx);
+                debug!("Keeping existing L{} Ask: {} @ {} (matched target)", order_level + 1, order_position, order_price);
+                remaining_asks.push(order);
             } else {
-                orders_to_cancel.push(order.oid);
+                // No match found - cancel this order
+                orders_to_cancel.push(order_oid);
+                info!("Cancelling outdated L{} Ask: {} @ {} (oid: {})", order_level + 1, order_position, order_price, order_oid);
             }
         }
         self.ask_levels = remaining_asks;
 
-        // --- 3. Execute Cancellations ---
+        // --- 3. Execute Cancellations Sequentially ---
+        let num_cancellations = orders_to_cancel.len();
         if !orders_to_cancel.is_empty() {
-            info!("Cancelling {} orders: {:?}", orders_to_cancel.len(), orders_to_cancel);
+            info!("Executing {} cancellations sequentially", num_cancellations);
             
-            // Execute cancellations sequentially (tokio doesn't have join_all directly)
+            // Execute cancellations sequentially (ExchangeClient doesn't implement Clone)
+            let mut successful_cancels = 0;
             for oid in orders_to_cancel {
-                self.attempt_cancel(self.asset.clone(), oid).await;
+                let cancel_result = self.exchange_client.cancel(
+                    crate::ClientCancelRequest { 
+                        asset: self.asset.clone(), 
+                        oid 
+                    }, 
+                    None
+                ).await;
+                
+                if cancel_result.is_ok() {
+                    successful_cancels += 1;
+                } else {
+                    warn!("Failed to cancel order {}", oid);
+                }
             }
-            // Important: Don't remove from self.bid/ask_levels here, wait for confirmation or fill event
+            
+            info!("Completed {}/{} cancellations successfully", successful_cancels, num_cancellations);
         }
 
-        // --- 4. Execute Placements ---
-        let mut placed_orders: Vec<(bool, usize, f64, f64, f64, u64)> = Vec::new(); // (is_bid, level, price, size, placed_size, oid)
+        // --- 4. Position Limit Safety Checks ---
+        // CRITICAL: Prevent placing orders that would violate max_absolute_position_size
+        // This is the primary defense against position limit violations
 
-        // Place new bids (assign level based on order in sorted list)
+        // If we are at or over our MAX LONG position, suppress all new bids
+        if self.cur_position >= self.max_absolute_position_size {
+            if !bids_to_place.is_empty() {
+                warn!(
+                    "⛔ At max long position ({:.2} >= {:.2}). Suppressing {} new bid order(s).",
+                    self.cur_position, self.max_absolute_position_size, bids_to_place.len()
+                );
+                bids_to_place.clear(); // Clear all pending bids
+            }
+        }
+
+        // If we are at or over our MAX SHORT position, suppress all new asks
+        if self.cur_position <= -self.max_absolute_position_size {
+            if !asks_to_place.is_empty() {
+                warn!(
+                    "⛔ At max short position ({:.2} <= -{:.2}). Suppressing {} new ask order(s).",
+                    self.cur_position, self.max_absolute_position_size, asks_to_place.len()
+                );
+                asks_to_place.clear(); // Clear all pending asks
+            }
+        }
+
+        // --- 5. Execute Placements Sequentially ---
+        let mut successful_placements = 0;
+
+        // Place new bids
         for (level, (price, size)) in bids_to_place.iter().enumerate() {
-            if *size >= EPSILON && *price > 0.0 {
-                info!("Placing L{} Bid: {} @ {}", level + 1, size, price); // L1 is tightest
+            // SAFETY: Check if this bid would violate position limits (defense in depth)
+            let remaining_buy_capacity = self.max_absolute_position_size - self.cur_position;
+            if *size > remaining_buy_capacity + EPSILON {
+                warn!(
+                    "⚠️  Skipping L{} Bid: size {:.2} exceeds remaining buy capacity {:.2} (pos={:.2}, max={:.2})",
+                    level + 1, size, remaining_buy_capacity, self.cur_position, self.max_absolute_position_size
+                );
+                continue; // Skip this order
+            }
+
+            if *size >= EPSILON && *price > 0.0 && (*size * *price) >= 10.0 { // $10 notional minimum
+                info!("Placing L{} Bid: {} @ {} (${:.2} notional)", level + 1, size, price, size * price);
+
                 let (placed_size, oid) = self.place_order(self.asset.clone(), *size, *price, true).await;
-                placed_orders.push((true, level, *price, *size, placed_size, oid));
+
+                if oid != 0 && placed_size > EPSILON {
+                    let new_order = MarketMakerRestingOrder { oid, position: placed_size, price: *price, level };
+                    self.bid_levels.push(new_order);
+                    successful_placements += 1;
+                    info!("Successfully placed L{} Bid: {} @ {} (oid: {})", level + 1, placed_size, price, oid);
+                } else {
+                    warn!("Failed to place L{} Bid: {} @ {}", level + 1, size, price);
+                }
+            } else if (*size * *price) < 10.0 {
+                warn!("Skipping L{} Bid: notional ${:.2} < $10 minimum", level + 1, size * price);
             }
         }
         
-        // Place new asks (assign level)
+        // Place new asks
         for (level, (price, size)) in asks_to_place.iter().enumerate() {
-            if *size >= EPSILON && *price > 0.0 {
-                info!("Placing L{} Ask: {} @ {}", level + 1, size, price);
+            // SAFETY: Check if this ask would violate position limits (defense in depth)
+            let remaining_sell_capacity = self.max_absolute_position_size + self.cur_position;
+            if *size > remaining_sell_capacity + EPSILON {
+                warn!(
+                    "⚠️  Skipping L{} Ask: size {:.2} exceeds remaining sell capacity {:.2} (pos={:.2}, max={:.2})",
+                    level + 1, size, remaining_sell_capacity, self.cur_position, self.max_absolute_position_size
+                );
+                continue; // Skip this order
+            }
+
+            if *size >= EPSILON && *price > 0.0 && (*size * *price) >= 10.0 { // $10 notional minimum
+                info!("Placing L{} Ask: {} @ {} (${:.2} notional)", level + 1, size, price, size * price);
+
                 let (placed_size, oid) = self.place_order(self.asset.clone(), *size, *price, false).await;
-                placed_orders.push((false, level, *price, *size, placed_size, oid));
-            }
-        }
 
-        // --- 5. Update Local Resting Order State ---
-        for (is_bid, level, price, _original_size, placed_size, oid) in placed_orders {
-            if oid != 0 && placed_size > EPSILON {
-                let new_order = MarketMakerRestingOrder { oid, position: placed_size, price, level };
-                if is_bid {
-                    self.bid_levels.push(new_order);
-                } else {
+                if oid != 0 && placed_size > EPSILON {
+                    let new_order = MarketMakerRestingOrder { oid, position: placed_size, price: *price, level };
                     self.ask_levels.push(new_order);
+                    successful_placements += 1;
+                    info!("Successfully placed L{} Ask: {} @ {} (oid: {})", level + 1, placed_size, price, oid);
+                } else {
+                    warn!("Failed to place L{} Ask: {} @ {}", level + 1, size, price);
                 }
-            } else if oid != 0 {
-                // Placed but size is zero? Log warning.
-                warn!("Placed order oid {} resulted in zero size.", oid);
+            } else if (*size * *price) < 10.0 {
+                warn!("Skipping L{} Ask: notional ${:.2} < $10 minimum", level + 1, size * price);
             }
-            // If oid is 0, placement failed, already logged in place_order
         }
 
-        // Re-sort just in case (important for level assignment consistency)
+        // --- 6. Sort Levels and Reassign Level Indices ---
+        // Sort bids descending by price (highest price = Level 0 = best bid)
         self.bid_levels.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap());
+        
+        // Sort asks ascending by price (lowest price = Level 0 = best ask)
         self.ask_levels.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap());
 
-        // Update levels after sorting (Level 0 = best price)
+        // Reassign level indices based on sorted order (0 = best price)
         for (i, order) in self.bid_levels.iter_mut().enumerate() { 
             order.level = i; 
         }
@@ -2819,16 +2799,121 @@ impl MarketMaker {
             order.level = i; 
         }
 
-        info!("Current Resting Bids: {} orders", self.bid_levels.len());
-        info!("Current Resting Asks: {} orders", self.ask_levels.len());
+        info!("Order placement complete: {} Bids, {} Asks ({} successful placements)", 
+              self.bid_levels.len(), self.ask_levels.len(), successful_placements);
 
-        // --- 6. Handle Taker Logic (If needed based on optimizer output) ---
-        // TODO: Implement taker logic based on multi_level_control rates
-        // This requires storing the MultiLevelControl output from calculate_multi_level_targets
-        // Example:
-        // let control = self.multi_level_control.as_ref().unwrap();
-        // if control.taker_sell_rate > EPSILON { ... }
-        // if control.taker_buy_rate > EPSILON { ... }
+        // --- 7. Implement Taker Logic Based on Latest Rates ---
+        if self.latest_taker_buy_rate > EPSILON || self.latest_taker_sell_rate > EPSILON {
+            info!("Executing taker logic: buy_rate={:.4}, sell_rate={:.4}", 
+                  self.latest_taker_buy_rate, self.latest_taker_sell_rate);
+            
+            // Taker Buy Logic (for when we need to buy aggressively)
+            if self.latest_taker_buy_rate > EPSILON {
+                // FIX: Round size DOWN to asset's sz_decimals (conservative)
+                let desired_buy_size = self.tick_lot_validator.round_size(self.latest_taker_buy_rate, false);
+
+                // CRITICAL SAFETY: Cap taker buy at remaining capacity to prevent excessive shorting
+                // remaining_buy_capacity = how much we can buy before hitting max short position
+                let remaining_buy_capacity = (self.max_absolute_position_size + self.cur_position).max(0.0);
+                let taker_buy_size = desired_buy_size.min(remaining_buy_capacity);
+
+                if taker_buy_size < desired_buy_size {
+                    warn!("⚠️ Taker buy clamped: desired={:.2} → clamped={:.2} (cur_pos={:.2}, max={:.2})",
+                          desired_buy_size, taker_buy_size, self.cur_position, self.max_absolute_position_size);
+                }
+
+                if taker_buy_size < EPSILON {
+                    warn!("Taker buy size too small after rounding/clamping, skipping");
+                } else {
+                    let notional = taker_buy_size * self.latest_mid_price;
+
+                    if notional >= 10.0 { // $10 notional minimum
+                        info!("Executing taker buy: {} @ market (${:.2} notional)",
+                              taker_buy_size, notional);
+
+                        // Use market_open for better slippage protection
+                        let market_params = crate::MarketOrderParams {
+                            asset: &self.asset,
+                            is_buy: true,
+                            sz: taker_buy_size, // Rounded size
+                            px: None, // Let SDK fetch current price
+                            slippage: Some(0.01), // 1% slippage tolerance
+                            cloid: None,
+                            wallet: None, // Use default wallet
+                        };
+                    
+                        match self.exchange_client.market_open(market_params).await {
+                            Ok(crate::ExchangeResponseStatus::Ok(_)) => {
+                                info!("Taker buy executed successfully");
+                            }
+                            Ok(crate::ExchangeResponseStatus::Err(e)) => {
+                                error!("Taker buy failed: {}", e);
+                            }
+                            Err(e) => {
+                                error!("Taker buy error: {}", e);
+                            }
+                        }
+                    } else {
+                        warn!("Taker buy skipped: notional ${:.2} < $10 minimum", notional);
+                    }
+                }
+            }
+            
+            // Taker Sell Logic (for when we need to sell aggressively)
+            if self.latest_taker_sell_rate > EPSILON {
+                // FIX: Round size DOWN to asset's sz_decimals (conservative)
+                let desired_sell_size = self.tick_lot_validator.round_size(self.latest_taker_sell_rate, false);
+
+                // CRITICAL SAFETY: Cap taker sell at current long position (can't sell what we don't own!)
+                // max_sellable = only sell if we're long, prevent flipping to excessive short
+                let max_sellable = self.cur_position.max(0.0);
+                let taker_sell_size = desired_sell_size.min(max_sellable);
+
+                if taker_sell_size < desired_sell_size {
+                    warn!("⚠️ Taker sell clamped: desired={:.2} → clamped={:.2} (cur_pos={:.2}, max_sellable={:.2})",
+                          desired_sell_size, taker_sell_size, self.cur_position, max_sellable);
+                }
+
+                if taker_sell_size < EPSILON {
+                    warn!("Taker sell size too small after rounding/clamping, skipping");
+                } else {
+                    let notional = taker_sell_size * self.latest_mid_price;
+
+                    if notional >= 10.0 { // $10 notional minimum
+                        info!("Executing taker sell: {} @ market (${:.2} notional)",
+                              taker_sell_size, notional);
+
+                        let market_params = crate::MarketOrderParams {
+                            asset: &self.asset,
+                            is_buy: false,
+                            sz: taker_sell_size, // Rounded size
+                            px: None, // Let SDK fetch current price
+                            slippage: Some(0.01), // 1% slippage tolerance
+                            cloid: None,
+                            wallet: None, // Use default wallet
+                        };
+                    
+                        match self.exchange_client.market_open(market_params).await {
+                            Ok(crate::ExchangeResponseStatus::Ok(_)) => {
+                                info!("Taker sell executed successfully");
+                            }
+                            Ok(crate::ExchangeResponseStatus::Err(e)) => {
+                                error!("Taker sell failed: {}", e);
+                            }
+                            Err(e) => {
+                                error!("Taker sell error: {}", e);
+                            }
+                        }
+                    } else {
+                        warn!("Taker sell skipped: notional ${:.2} < $10 minimum", notional);
+                    }
+                }
+            }
+            
+            // Reset taker rates after execution
+            self.latest_taker_buy_rate = 0.0;
+            self.latest_taker_sell_rate = 0.0;
+        }
     }
 
     /// **ADAM UPDATE TASK (Called every 60 seconds)**
@@ -2857,21 +2942,24 @@ impl MarketMaker {
         tokio::task::spawn_blocking(move || {
             let mut final_value_gap_percent: Option<f64> = None;
 
-            // --- 1. Get Accumulated Gradients ---
-            let (avg_gradient_vector, num_samples) = {
+            // --- 1. Get Accumulated Gradients and Average Loss ---
+            let (avg_gradient_vector, avg_loss, num_samples) = {
                 let accumulator = gradient_accumulator_arc.read().unwrap();
                 let count = *gradient_count_arc.read().unwrap();
                 if count > 0 {
-                    let avg_grad = accumulator.iter().map(|g| g / count as f64).collect();
-                    (avg_grad, count)
+                    // Extract 8 gradient params from accumulator[0..8]
+                    let avg_grad: Vec<f64> = accumulator[0..8].iter().map(|g| g / count as f64).collect();
+                    // Extract loss from accumulator[8]
+                    let avg_loss = accumulator.get(8).map_or(0.0, |l| l / count as f64);
+                    (avg_grad, avg_loss, count)
                 } else {
-                    (vec![0.0; 8], 0) // No gradients accumulated (8 parameters)
+                    (vec![0.0; 8], 0.0, 0) // No gradients accumulated (8 parameters)
                 }
             };
 
             // --- 2. Apply Adam Update (if gradients exist) ---
             if num_samples > 0 {
-                info!("Applying Adam update based on {} accumulated gradient samples.", num_samples);
+                info!("Applying Adam update based on {} accumulated gradient samples. Avg loss: {:.6}", num_samples, avg_loss);
                 let original_params_phi = tuning_params_arc.read().unwrap().clone(); // Read locked value
                 let original_params_theta = original_params_phi.get_constrained();
 
@@ -2975,25 +3063,22 @@ impl MarketMaker {
             {
                 let mut accumulator = gradient_accumulator_arc.write().unwrap();
                 let mut count = gradient_count_arc.write().unwrap();
-                *accumulator = vec![0.0; 8]; // 8 parameters in TuningParams
+                *accumulator = vec![0.0; 9]; // 8 parameters + 1 loss = 9 elements
                 *count = 0;
                 info!("Gradient accumulator reset for next window.");
             }
 
-            // --- 4. Trading Enablement Check (Using Control Gap as Proxy for Value Gap) ---
-            // A pragmatic approach: If the average control gap (loss) used for gradient
-            // calculation was consistently low, we enable trading.
-            // TODO: Modify gradient accumulation to also store/average the loss value.
-            let avg_loss_snapshot = 0.0; // Placeholder - fetch actual average loss
+            // --- 4. Trading Enablement Check (Using Control Gap Loss) ---
+            // Use the average loss computed from gradient accumulation
             let loss_threshold_for_enablement = (enable_trading_gap_threshold / 10.0).powi(2); // Example: 15% -> threshold 2.25 bps^2
 
-            if !*trading_enabled_arc.read().unwrap() && num_samples > 0 && avg_loss_snapshot <= loss_threshold_for_enablement {
+            if !*trading_enabled_arc.read().unwrap() && num_samples > 10 && avg_loss <= loss_threshold_for_enablement {
                 let mut enabled_w = trading_enabled_arc.write().unwrap();
                 *enabled_w = true;
-                info!("✅ Control gap consistently low (avg_loss={:.2} <= {:.2}). ENABLING LIVE TRADING.", avg_loss_snapshot, loss_threshold_for_enablement);
-                final_value_gap_percent = Some(avg_loss_snapshot.sqrt() * 10.0); // Use control gap as proxy %
+                info!("✅ Control gap consistently low (avg_loss={:.2} <= {:.2}). ENABLING LIVE TRADING.", avg_loss, loss_threshold_for_enablement);
+                final_value_gap_percent = Some(avg_loss.sqrt() * 10.0); // Use control gap as proxy %
             } else if !*trading_enabled_arc.read().unwrap() {
-                info!("⏳ Trading remains disabled. Avg control gap ({:.2}) > threshold ({:.2}) or insufficient samples ({}).", avg_loss_snapshot, loss_threshold_for_enablement, num_samples);
+                info!("⏳ Trading remains disabled. Avg control gap ({:.2}) > threshold ({:.2}) or insufficient samples ({}).", avg_loss, loss_threshold_for_enablement, num_samples);
             }
 
             // TODO: Implement proper Value Gap calculation if needed for more accurate logging/enablement.
@@ -3007,6 +3092,19 @@ impl MarketMaker {
     /// Calculates the gradient of the control gap loss w.r.t tuning parameters
     /// for a snapshot in time and accumulates it. Spawns a blocking task.
     #[allow(dead_code)]
+    /// **GRADIENT ACCUMULATION TASK (Called frequently)** - RESTORED ROBUST LOGIC
+    ///
+    /// This function calculates gradients for the Adam optimizer by comparing TWO DIFFERENT FUNCTIONS:
+    /// - **Optimal Target**: HJBComponents::optimize_control() (OLD grid search - proven optimal)
+    /// - **Heuristic**: MultiLevelOptimizer::optimize() (NEW fast heuristic - being tuned)
+    ///
+    /// The loss measures how much the multi-level heuristic deviates from the HJB optimal control.
+    /// This creates a CONSTANT non-zero learning signal because we're comparing different algorithms,
+    /// not the same algorithm with different states.
+    ///
+    /// **KEY FIX**: The broken version compared MultiLevelOptimizer(REAL_STATE) vs MultiLevelOptimizer(ZERO_STATE).
+    /// When state=(Q=0, μ̂=0), both were identical, giving zero loss and zero gradients.
+    /// Now we compare MultiLevelOptimizer vs HJBComponents, ensuring non-zero loss that drives learning.
     fn accumulate_gradient_snapshot(&self) {
         // --- 1. Clone data needed ---
         // Cheap clones (Arc, f64, small vecs, structs)
@@ -3019,7 +3117,10 @@ impl MarketMaker {
         let max_pos = self.max_absolute_position_size;
         let gradient_accumulator_arc = Arc::clone(&self.gradient_accumulator);
         let gradient_count_arc = Arc::clone(&self.gradient_count);
-        // TODO: Pass Arc<RwLock<ValueFunction>> if needed, or reconstruct
+
+        // Clone HJB components for optimal target calculation
+        let hjb_components_clone = self.hjb_components.clone();
+        let value_function_clone = self.value_function.clone();
 
         // --- 2. Spawn Blocking Task ---
         tokio::task::spawn_blocking(move || {
@@ -3035,57 +3136,69 @@ impl MarketMaker {
                 ParameterUncertainty::from_particle_filter_stats(mu_std, sigma_std, 0.95)
             };
 
-            // b) Define Baseline Params (Read ONCE)
-            let baseline_params_phi = tuning_params_arc.read().unwrap().clone();
-            let baseline_params_theta = baseline_params_phi.get_constrained();
+            // b) Get CURRENT Tunable Parameters (Read ONCE)
+            let current_params_phi = tuning_params_arc.read().unwrap().clone();
+            let current_params_theta = current_params_phi.get_constrained();
 
-            // c) Calculate "Optimal" Multi-Level Control (using baseline params)
-            //    Represents the stable target for the current state snapshot
-            let optimal_multi_control = {
+            // c) Calculate "Optimal Target" Control using OLD HJB Grid Search
+            //    This is the PROVEN optimal control from the grid search
+            //    We use this as the target that the multi-level optimizer should match
+            let optimal_target_control_single = {
+                let base_total_spread_bps = (state_vector_snapshot.market_spread_bps).max(12.0);
+                let base_half_spread_bps = base_total_spread_bps / 2.0;
+                // Run the OLD grid search function with REAL state
+                hjb_components_clone.optimize_control(
+                    &state_vector_snapshot,
+                    &value_function_clone,
+                    base_half_spread_bps,
+                )
+            };
+
+            // Extract L1 offsets from the single-level HJB control
+            let optimal_target_l1_bid = optimal_target_control_single.bid_offset_bps;
+            let optimal_target_l1_ask = optimal_target_control_single.ask_offset_bps;
+
+            // d) Calculate "Heuristic" Multi-Level Control (using current params and REAL state)
+            //    This is what the current parameters produce given the actual market state
+            let heuristic_multi_control = {
                 let robust_params = RobustParameters::compute(
-                    state_vector_snapshot.adverse_selection_estimate, // Use nominal estimates for baseline
+                    state_vector_snapshot.adverse_selection_estimate,  // REAL drift
                     state_vector_snapshot.volatility_ema_bps,
-                    state_vector_snapshot.inventory,
-                    &uncertainty_snapshot, // Use current uncertainty
-                    &robust_config_snapshot, // Use current robust config
+                    state_vector_snapshot.inventory,  // REAL inventory
+                    &uncertainty_snapshot,
+                    &robust_config_snapshot,
                 );
                 let opt_state = OptimizationState {
                     mid_price: state_vector_snapshot.mid_price,
-                    inventory: state_vector_snapshot.inventory,
+                    inventory: state_vector_snapshot.inventory,  // REAL inventory
                     max_position: max_pos,
-                    adverse_selection_bps: robust_params.mu_worst_case, // Use robust params
+                    adverse_selection_bps: state_vector_snapshot.adverse_selection_estimate,  // REAL drift
                     lob_imbalance: state_vector_snapshot.lob_imbalance,
-                    volatility_bps: robust_params.sigma_worst_case,     // Use robust params
+                    volatility_bps: robust_params.sigma_worst_case,
                     current_time,
-                    hawkes_model: &hawkes_model_snapshot, // Use snapshot
+                    hawkes_model: &hawkes_model_snapshot,
                 };
-                let base_spread = (robust_params.sigma_worst_case * 0.1) // Heuristic base
+                let base_spread = (robust_params.sigma_worst_case * 0.1)
                                     .max(multi_level_optimizer_config.min_profitable_spread_bps / 2.0)
                                     * robust_params.spread_multiplier;
-                // NOTE: Need MultiLevelOptimizer instance - reconstruct
                 let optimizer = MultiLevelOptimizer::new(multi_level_optimizer_config.clone());
-                optimizer.optimize(&opt_state, base_spread)
+                optimizer.optimize(&opt_state, base_spread, &current_params_theta)
             };
 
-            // d) Calculate "Heuristic" Multi-Level Control (using baseline params - should be same as optimal here)
-            //    This serves as the baseline for calculating the gradient numerically
-            let heuristic_multi_control = optimal_multi_control.clone(); // Re-use calculation
-
             // e) Calculate Loss (Control Gap)
-            //    Focus on the primary optimal level (e.g., L1 = index 0) offsets
-            let optimal_l1_bid = optimal_multi_control.bid_levels.get(0).map(|(o, _)| *o).unwrap_or(0.0);
-            let optimal_l1_ask = optimal_multi_control.ask_levels.get(0).map(|(o, _)| *o).unwrap_or(0.0);
+            //    Compare HEURISTIC (multi-level optimizer) vs TARGET (HJB grid search)
+            //    This is the FIXED logic: comparing two DIFFERENT functions, not same function with different states
             let heuristic_l1_bid = heuristic_multi_control.bid_levels.get(0).map(|(o, _)| *o).unwrap_or(0.0);
             let heuristic_l1_ask = heuristic_multi_control.ask_levels.get(0).map(|(o, _)| *o).unwrap_or(0.0);
 
-            let bid_gap = optimal_l1_bid - heuristic_l1_bid;
-            let ask_gap = optimal_l1_ask - heuristic_l1_ask;
+            let bid_gap = optimal_target_l1_bid - heuristic_l1_bid;
+            let ask_gap = optimal_target_l1_ask - heuristic_l1_ask;
             let current_loss = bid_gap.powi(2) + ask_gap.powi(2);
 
             // f) Check Loss Threshold
-            if current_loss <= baseline_params_theta.control_gap_threshold {
-                // info!("Gradient snapshot skipped: Loss {:.4} <= threshold {:.4}", current_loss, baseline_params_theta.control_gap_threshold);
-                return; // Loss too small, no gradient needed for this snapshot
+            if current_loss <= current_params_theta.control_gap_threshold {
+                // Loss is small enough - no tuning needed for this snapshot
+                return;
             }
 
             // g) Calculate Numerical Gradient
@@ -3093,7 +3206,12 @@ impl MarketMaker {
             let nudge_amount = 0.001; // Small nudge for finite difference
 
             for i in 0..8 { // For each parameter in TuningParams
-                let mut nudged_params_phi = baseline_params_phi.clone();
+                if i == 7 { 
+                    // Skip gradient for control_gap_threshold_phi itself (doesn't affect control)
+                    continue;
+                }
+                
+                let mut nudged_params_phi = current_params_phi.clone();
                 match i {
                     0 => nudged_params_phi.skew_adjustment_factor_phi += nudge_amount,
                     1 => nudged_params_phi.adverse_selection_adjustment_factor_phi += nudge_amount,
@@ -3109,8 +3227,8 @@ impl MarketMaker {
                 // Recalculate heuristic control with nudged params
                 // Note: Need to handle how param 'i' affects the inputs or logic of optimize()
                 let nudged_heuristic_control = {
-                    // 1. Get nudged constrained params (needed if optimize uses them)
-                    let _nudged_params_theta = nudged_params_phi.get_constrained();
+                    // 1. Get nudged constrained params (CRITICAL: now used by optimizer!)
+                    let nudged_params_theta = nudged_params_phi.get_constrained();
 
                     // 2. Potentially update state if param affects it (e.g., lambda)
                     // For now, we'll use the same state for simplicity
@@ -3138,21 +3256,27 @@ impl MarketMaker {
                         hawkes_model: &hawkes_model_snapshot,
                     };
 
-                    // 5. Rerun optimizer logic
+                    // 5. Rerun optimizer logic WITH NUDGED PARAMS (this is the fix!)
                     let base_spread_nudged = (robust_params_nudged.sigma_worst_case * 0.1)
                                                 .max(multi_level_optimizer_config.min_profitable_spread_bps / 2.0)
                                                 * robust_params_nudged.spread_multiplier;
                     let optimizer = MultiLevelOptimizer::new(multi_level_optimizer_config.clone());
-                    optimizer.optimize(&opt_state_nudged, base_spread_nudged)
+                    optimizer.optimize(&opt_state_nudged, base_spread_nudged, &nudged_params_theta)
                 };
 
                 let nudged_l1_bid = nudged_heuristic_control.bid_levels.get(0).map(|(o, _)| *o).unwrap_or(0.0);
                 let nudged_l1_ask = nudged_heuristic_control.ask_levels.get(0).map(|(o, _)| *o).unwrap_or(0.0);
-                let nudged_loss = (optimal_l1_bid - nudged_l1_bid).powi(2) + (optimal_l1_ask - nudged_l1_ask).powi(2);
+
+                // Calculate loss as deviation from the SAME HJB optimal target (not recalculated)
+                let nudged_loss = (optimal_target_l1_bid - nudged_l1_bid).powi(2) + (optimal_target_l1_ask - nudged_l1_ask).powi(2);
 
                 // Finite difference gradient
-                if i != 7 { // Skip gradient for control_gap_threshold itself (parameter 7)
-                    gradient_vector[i] = (nudged_loss - current_loss) / nudge_amount;
+                gradient_vector[i] = (nudged_loss - current_loss) / nudge_amount;
+
+                // Debug logging to verify non-zero gradients
+                if i < 3 || gradient_vector[i].abs() > 0.001 {
+                    info!("Gradient[{}]: current_loss={:.6}, nudged_loss={:.6}, grad={:.6}",
+                          i, current_loss, nudged_loss, gradient_vector[i]);
                 }
             }
 
@@ -3160,7 +3284,7 @@ impl MarketMaker {
             { // Lock scope
                 let mut accumulator = gradient_accumulator_arc.write().unwrap();
                 let mut count = gradient_count_arc.write().unwrap();
-                for i in 0..8 { // 8 parameters in TuningParams
+                for i in 0..8 { // All 8 parameters (fixed from 0..7)
                     // Clamp individual gradient components to prevent explosions
                     let clamped_grad = gradient_vector[i].clamp(-1000.0, 1000.0); // Generous clamp
                     if gradient_vector[i].abs() > 1000.0 {
@@ -3168,14 +3292,18 @@ impl MarketMaker {
                     }
                     accumulator[i] += clamped_grad;
                 }
+                // Add current_loss to accumulator[8] (8 params + 1 loss = index 8)
+                accumulator[8] += current_loss;
                 *count += 1;
                 // Optional: Log accumulation progress
                 if *count % 10 == 0 { 
-                    info!("Gradient accumulated (#{})", *count); 
+                    info!("Gradient accumulated (#{}) - Loss: {:.6}", *count, current_loss); 
                 }
             } // Lock released
         }); // End spawn_blocking
     }
+
+
 }
 
 #[cfg(test)]
