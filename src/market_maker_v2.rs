@@ -1461,9 +1461,13 @@ pub struct MarketMaker {
     /// Current position (positive = long, negative = short)
     pub cur_position: f64,
     
-    /// Latest mid price from market data
+    /// Latest mid price from AllMids stream (kept for logging/debugging only)
     pub latest_mid_price: f64,
-    
+
+    /// Latest mid price calculated from L2Book BBO (used for order pricing)
+    /// This is the authoritative mid-price for order placement
+    pub latest_l2_mid_price: f64,
+
     /// Latest order book snapshot (needed for BBO and imbalance)
     pub latest_book: Option<OrderBook>,
     
@@ -1660,17 +1664,24 @@ impl MarketMaker {
         // Step 2: Update rest of state vector with market data
         let constrained_params = self.tuning_params.read().unwrap().get_constrained();
         let mut online_model = self.online_adverse_selection_model.write().unwrap();
-        self.state_vector.update(
-            self.latest_mid_price,
-            self.cur_position,
-            None, // book_analysis removed - analysis done inline now
-            self.latest_book.as_ref(),
-            &constrained_params,
-            &mut *online_model,
-        );
-        
-        // Log state vector for monitoring (can be disabled for performance)
-        debug!("{}", self.state_vector.to_log_string());
+
+        // CRITICAL: Use L2Book mid-price (not AllMids) for order pricing
+        // Skip update if L2Book mid not yet available
+        if self.latest_l2_mid_price > 0.0 {
+            self.state_vector.update(
+                self.latest_l2_mid_price,  // CHANGED: Use L2Book mid (accurate to BBO)
+                self.cur_position,
+                None, // book_analysis removed - analysis done inline now
+                self.latest_book.as_ref(),
+                &constrained_params,
+                &mut *online_model,
+            );
+
+            // Log state vector for monitoring (can be disabled for performance)
+            debug!("{}", self.state_vector.to_log_string());
+        } else {
+            debug!("⏸️  Skipping state_vector.update(): L2Book mid not yet available");
+        }
     }
     
     /// Calculate optimal multi-level targets using Hawkes, Robust HJB, and sizing logic.
@@ -2074,6 +2085,7 @@ impl MarketMaker {
             // ===== Real-Time State =====
             cur_position: 0.0,
             latest_mid_price: -1.0,
+            latest_l2_mid_price: -1.0,  // Initialized to -1.0, updated from L2Book
             latest_book: None,
             state_vector: StateVector::new(),  // Initialized with defaults, updated on first AllMids message
             
@@ -2190,17 +2202,21 @@ impl MarketMaker {
                     if let Some(book) = OrderBook::from_l2_data(&l2_book.data) {
                         self.latest_book = Some(book.clone());
 
-                        // DEBUG: Calculate mid from L2Book
+                        // Calculate mid from L2Book BBO and store as authoritative mid-price
                         if !book.bids.is_empty() && !book.asks.is_empty() {
                             if let (Ok(best_bid), Ok(best_ask)) = (
                                 book.bids[0].px.parse::<f64>(),
                                 book.asks[0].px.parse::<f64>()
                             ) {
                                 let l2_mid = (best_bid + best_ask) / 2.0;
+
+                                // CRITICAL: Update L2Book mid-price (used for order pricing)
+                                self.latest_l2_mid_price = l2_mid;
+
                                 let allmids_mid = self.latest_mid_price;
                                 let diff_bps = ((l2_mid - allmids_mid) / allmids_mid * 10000.0).abs();
 
-                                // Log if there's significant divergence
+                                // Log if there's significant divergence (DEBUG only)
                                 if diff_bps > 5.0 {  // More than 5 bps difference
                                     warn!(
                                         "🔴 MID DIVERGENCE: L2Book={:.3} vs AllMids={:.3} (Δ {:.1}bps) | BBO: {:.3} x {:.3}",
@@ -2318,7 +2334,8 @@ impl MarketMaker {
 
                             // DEBUG: Enhanced fill notification logging
                             let fill_price: f64 = fill.px.parse().unwrap_or(0.0);
-                            let current_mid = self.latest_mid_price;
+                            // Use L2Book mid (where fills actually occur) for accurate offset calculation
+                            let current_mid = self.latest_l2_mid_price;
                             let side_str = if is_bid_fill { "BUY" } else { "SELL" };
 
                             // Calculate how far from mid the fill happened
@@ -2422,11 +2439,23 @@ impl MarketMaker {
                         }
 
                         // Re-assign levels after potential removals
-                        for (i, order) in self.bid_levels.iter_mut().enumerate() { 
-                            order.level = i; 
+                        for (i, order) in self.bid_levels.iter_mut().enumerate() {
+                            order.level = i;
                         }
-                        for (i, order) in self.ask_levels.iter_mut().enumerate() { 
-                            order.level = i; 
+                        for (i, order) in self.ask_levels.iter_mut().enumerate() {
+                            order.level = i;
+                        }
+
+                        // CRITICAL: Check if position limit was exceeded after fills
+                        if position_changed && self.cur_position.abs() > self.max_absolute_position_size {
+                            error!(
+                                "⛔ POSITION LIMIT EXCEEDED AFTER FILL: cur_position={:.2} > max={:.2}",
+                                self.cur_position.abs(), self.max_absolute_position_size
+                            );
+                            warn!("⚠️  This indicates orders were placed that violated position limits");
+                            warn!("⚠️  Bot will now attempt to flatten excess position via potentially_update()");
+                            // Note: potentially_update() will suppress new orders in the violating direction
+                            // and taker logic may help reduce position
                         }
 
                         // Trigger state update and potentially new quotes if needed
@@ -2763,8 +2792,9 @@ impl MarketMaker {
             info!("⏳ Trading disabled (performance gap). Skipping order management.");
             return;
         }
-        if self.latest_mid_price <= 0.0 {
-            warn!("Mid price not available. Skipping order management.");
+        // CRITICAL: Check L2Book mid-price (not AllMids) since that's what we use for pricing
+        if self.latest_l2_mid_price <= 0.0 {
+            warn!("L2Book mid price not available. Skipping order management.");
             return;
         }
 
@@ -2955,7 +2985,22 @@ impl MarketMaker {
             }
         }
 
-        // --- 4. Position Limit Safety Checks ---
+        // --- 4. Inventory Sync Validation ---
+        // CRITICAL: Ensure state_vector.inventory matches cur_position
+        // This is essential for correct risk management and order sizing
+        let inventory_divergence = (self.state_vector.inventory - self.cur_position).abs();
+        if inventory_divergence > EPSILON {
+            warn!(
+                "⚠️  INVENTORY SYNC DIVERGENCE: state_vector.inventory={:.4} vs cur_position={:.4} (Δ={:.4})",
+                self.state_vector.inventory, self.cur_position, inventory_divergence
+            );
+            // Force sync - this should never be needed if update_state_vector is called correctly
+            // but provides defense in depth
+            warn!("🔧 Force-syncing state_vector.inventory to cur_position");
+            self.state_vector.inventory = self.cur_position;
+        }
+
+        // --- 5. Position Limit Safety Checks ---
         // CRITICAL: Prevent placing orders that would violate max_absolute_position_size
         // This is the primary defense against position limit violations
 
