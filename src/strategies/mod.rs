@@ -31,6 +31,9 @@ pub mod hjb_strategy;
 // Component-based architecture for strategies
 pub mod components;
 
+// Private implementation module for HJB strategy
+mod hjb_impl;
+
 // Future strategies can be added here:
 // pub mod grid_strategy;
 // pub mod momentum_strategy;
