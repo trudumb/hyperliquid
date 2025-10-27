@@ -44,3 +44,5 @@ parking_lot = "0.12"  # Faster RwLock implementation
 ratatui = "0.29"
 crossterm = "0.28"
 bytes = "1.0"  # Zero-copy buffer management for HFT optimizations
+crossbeam = "0.8"  # Lock-free data structures for HFT
+flume = "0.11"  # Faster than tokio::mpsc for message passing
