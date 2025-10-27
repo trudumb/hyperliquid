@@ -50,12 +50,35 @@ fn render_position_panel(frame: &mut Frame, area: Rect, state: &DashboardState) 
         Color::White
     };
 
-    let pnl_color = if state.unrealized_pnl > 0.0 {
+    let unrealized_pnl_color = if state.unrealized_pnl > 0.0 {
         Color::Green
     } else if state.unrealized_pnl < 0.0 {
         Color::Red
     } else {
         Color::White
+    };
+
+    let realized_pnl_color = if state.realized_pnl > 0.0 {
+        Color::Green
+    } else if state.realized_pnl < 0.0 {
+        Color::Red
+    } else {
+        Color::White
+    };
+
+    let total_pnl_color = if state.total_session_pnl > 0.0 {
+        Color::Green
+    } else if state.total_session_pnl < 0.0 {
+        Color::Red
+    } else {
+        Color::White
+    };
+
+    // Calculate session PnL % relative to starting equity
+    let session_pnl_pct = if state.session_start_equity > 0.0 {
+        (state.total_session_pnl / state.session_start_equity) * 100.0
+    } else {
+        0.0
     };
 
     let lines = vec![
@@ -65,9 +88,7 @@ fn render_position_panel(frame: &mut Frame, area: Rect, state: &DashboardState) 
                 format!("{:.4} HYPE", state.cur_position),
                 Style::default().fg(position_color).add_modifier(Modifier::BOLD),
             ),
-        ]),
-        Line::from(vec![
-            Span::raw("Entry Price: "),
+            Span::raw(" @ "),
             Span::styled(
                 format!("${:.3}", state.avg_entry_price),
                 Style::default().fg(Color::Cyan),
@@ -77,11 +98,37 @@ fn render_position_panel(frame: &mut Frame, area: Rect, state: &DashboardState) 
             Span::raw("Unrealized PnL: "),
             Span::styled(
                 format!("${:.2}", state.unrealized_pnl),
-                Style::default().fg(pnl_color).add_modifier(Modifier::BOLD),
+                Style::default().fg(unrealized_pnl_color).add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(vec![
-            Span::raw("Sharpe Ratio: "),
+            Span::raw("Realized PnL: "),
+            Span::styled(
+                format!("${:.2}", state.realized_pnl),
+                Style::default().fg(realized_pnl_color),
+            ),
+            Span::raw(" | Fees: "),
+            Span::styled(
+                format!("${:.2}", state.total_fees),
+                Style::default().fg(Color::Red),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("Session PnL: "),
+            Span::styled(
+                format!("${:.2} ({:+.2}%)", state.total_session_pnl, session_pnl_pct),
+                Style::default().fg(total_pnl_color).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("Account Equity: "),
+            Span::styled(
+                format!("${:.2}", state.account_equity),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("Sharpe: "),
             Span::styled(
                 format!("{:.2}", state.sharpe_ratio),
                 Style::default().fg(
@@ -94,18 +141,9 @@ fn render_position_panel(frame: &mut Frame, area: Rect, state: &DashboardState) 
                     } else {
                         Color::Red
                     }
-                ).add_modifier(Modifier::BOLD),
+                ),
             ),
-        ]),
-        Line::from(vec![
-            Span::raw("Account Equity: "),
-            Span::styled(
-                format!("${:.2}", state.account_equity),
-                Style::default().fg(Color::Yellow),
-            ),
-        ]),
-        Line::from(vec![
-            Span::raw("L2 Mid: "),
+            Span::raw(" | L2 Mid: "),
             Span::styled(
                 format!("${:.3}", state.l2_mid_price),
                 Style::default().fg(Color::White),

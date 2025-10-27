@@ -106,17 +106,20 @@ async fn main() {
     info!("  - TUI Dashboard for real-time monitoring");
     info!("====================================");
 
-    // Spawn TUI dashboard task
+    // Set up shutdown signal channel for market maker
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    
+    // Set up shutdown signal channel for TUI
+    let (tui_shutdown_tx, tui_shutdown_rx) = tokio::sync::oneshot::channel();
+
+    // Spawn TUI dashboard task with shutdown signal
     let tui_handle = tokio::spawn(async move {
-        if let Err(e) = run_tui(tui_state_rx).await {
+        if let Err(e) = run_tui(tui_state_rx, tui_shutdown_rx).await {
             eprintln!("TUI error: {}", e);
         }
     });
 
-    // Set up shutdown signal channel
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-
-    // Set up Ctrl+C handler (TUI handles this too with 'q' key)
+    // Set up Ctrl+C handler
     tokio::spawn(async move {
         signal::ctrl_c().await.expect("Failed to install Ctrl+C handler");
         info!("Received Ctrl+C signal, sending shutdown signal...");
@@ -127,6 +130,9 @@ async fn main() {
     info!("Starting V2 market maker with multi-level optimization and TUI dashboard...");
     market_maker.start_with_shutdown_signal(Some(shutdown_rx)).await;
 
+    // Signal TUI to shut down after market maker finishes
+    let _ = tui_shutdown_tx.send(());
+    
     // Wait for TUI to finish
     let _ = tui_handle.await;
 

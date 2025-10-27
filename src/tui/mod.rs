@@ -18,7 +18,10 @@ use self::dashboard::render_dashboard;
 
 /// Main TUI event loop
 /// Runs in a separate tokio task and renders the dashboard at ~10 FPS
-pub async fn run_tui(mut state_rx: watch::Receiver<DashboardState>) -> io::Result<()> {
+pub async fn run_tui(
+    mut state_rx: watch::Receiver<DashboardState>,
+    mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+) -> io::Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -26,7 +29,7 @@ pub async fn run_tui(mut state_rx: watch::Receiver<DashboardState>) -> io::Resul
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_app(&mut terminal, &mut state_rx).await;
+    let result = run_app(&mut terminal, &mut state_rx, &mut shutdown_rx).await;
 
     // Restore terminal
     disable_raw_mode()?;
@@ -44,6 +47,7 @@ pub async fn run_tui(mut state_rx: watch::Receiver<DashboardState>) -> io::Resul
 async fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     state_rx: &mut watch::Receiver<DashboardState>,
+    shutdown_rx: &mut tokio::sync::oneshot::Receiver<()>,
 ) -> io::Result<()> {
     let mut last_state = state_rx.borrow().clone();
 
@@ -51,17 +55,29 @@ async fn run_app<B: ratatui::backend::Backend>(
         // Render current state
         terminal.draw(|f| render_dashboard(f, &last_state))?;
 
-        // Check for keyboard input (non-blocking with 100ms timeout)
-        if event::poll(std::time::Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => {
-                        return Ok(());
+        // Use tokio::select to handle both events and shutdown signal
+        tokio::select! {
+            // Check for shutdown signal
+            result = &mut *shutdown_rx => {
+                let _ = result; // Consume the result
+                return Ok(());
+            }
+            
+            // Check for keyboard input with timeout
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                // Poll for keyboard events
+                if event::poll(std::time::Duration::from_millis(0))? {
+                    if let Event::Key(key) = event::read()? {
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Esc => {
+                                return Ok(());
+                            }
+                            KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                                return Ok(());
+                            }
+                            _ => {}
+                        }
                     }
-                    KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
-                        return Ok(());
-                    }
-                    _ => {}
                 }
             }
         }

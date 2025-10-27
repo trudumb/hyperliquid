@@ -1794,6 +1794,35 @@ pub struct MarketMaker {
     /// Last equity value for calculating returns
     pub last_equity: f64,
 
+    // ===== PnL Tracking (Session-Based) =====
+    /// Account equity when the bot started (this session)
+    /// Fetched from Hyperliquid API on initialization
+    pub session_start_equity: f64,
+
+    /// Total realized PnL accumulated this session (excluding fees)
+    /// Updated on every position-reducing fill
+    pub total_realized_pnl: f64,
+
+    /// Total trading fees paid this session
+    /// Accumulated from fill.fee on every fill
+    pub total_fees_paid: f64,
+
+    /// Cost basis of current position in USD
+    /// For long: total USD spent to acquire position
+    /// For short: total USD received from selling
+    pub position_cost_basis: f64,
+
+    /// Size of position when cost basis was last established
+    /// Used to calculate average entry price: cost_basis / entry_size
+    pub position_entry_size: f64,
+
+    /// Last fetched account equity from Hyperliquid API
+    /// Updated periodically (every 30-60s) via background task
+    pub last_fetched_account_equity: f64,
+
+    /// Timestamp of last account equity fetch (for rate limiting)
+    pub last_equity_fetch_time: f64,
+
     // ===== REMOVED/DEPRECATED Fields (Documented for Reference) =====
     // The following fields have been removed in this refactor:
     //
@@ -1886,22 +1915,148 @@ impl MarketMaker {
         sharpe
     }
 
+    /// Process fill and update PnL tracking (cost basis, realized PnL, fees)
+    /// Called for every fill event to maintain accurate accounting
+    ///
+    /// # Arguments
+    /// * `fill_price` - Execution price of the fill
+    /// * `fill_size` - Size of the fill (always positive)
+    /// * `is_buy` - true if we bought (bid fill), false if we sold (ask fill)
+    /// * `fee` - Trading fee paid for this fill
+    fn process_fill_pnl(&mut self, fill_price: f64, fill_size: f64, is_buy: bool, fee: f64) {
+        // Accumulate fees
+        self.total_fees_paid += fee;
+
+        let old_position = self.cur_position;
+        let new_position = if is_buy {
+            old_position + fill_size
+        } else {
+            old_position - fill_size
+        };
+
+        // Determine if this fill is opening/increasing position or closing/reducing position
+        let old_sign = old_position.signum();
+
+        // Calculate realized PnL if position is being reduced or flipped
+        if old_position.abs() > EPSILON {
+            // We had an existing position
+            let avg_entry_price = self.position_cost_basis / self.position_entry_size;
+
+            if (old_sign > 0.0 && !is_buy) || (old_sign < 0.0 && is_buy) {
+                // Position is being reduced or flipped (selling from long or buying from short)
+                let size_closed = fill_size.min(old_position.abs());
+
+                // Calculate realized PnL on the closed portion
+                let realized_pnl = if old_sign > 0.0 {
+                    // Was long, selling: profit = (sell_price - avg_entry) * size
+                    (fill_price - avg_entry_price) * size_closed
+                } else {
+                    // Was short, buying: profit = (avg_entry - buy_price) * size
+                    (avg_entry_price - fill_price) * size_closed
+                };
+
+                self.total_realized_pnl += realized_pnl;
+
+                debug!(
+                    "💵 Realized PnL: ${:.2} (closed {:.4} @ {:.2}, avg_entry={:.2})",
+                    realized_pnl, size_closed, fill_price, avg_entry_price
+                );
+
+                // Update cost basis proportionally
+                if size_closed >= old_position.abs() - EPSILON {
+                    // Position fully closed or flipped
+                    if new_position.abs() > EPSILON {
+                        // Position flipped - new cost basis starts fresh
+                        let size_opened = fill_size - size_closed;
+                        self.position_cost_basis = fill_price * size_opened;
+                        self.position_entry_size = new_position;
+                    } else {
+                        // Position fully closed
+                        self.position_cost_basis = 0.0;
+                        self.position_entry_size = 0.0;
+                    }
+                } else {
+                    // Partial close - reduce cost basis proportionally
+                    let remaining_fraction = (old_position.abs() - size_closed) / old_position.abs();
+                    self.position_cost_basis *= remaining_fraction;
+                    self.position_entry_size = new_position;
+                }
+            } else {
+                // Position is being increased (buying more when long, selling more when short)
+                self.position_cost_basis += fill_price * fill_size;
+                self.position_entry_size = new_position;
+            }
+        } else {
+            // Opening new position from flat
+            self.position_cost_basis = fill_price * fill_size;
+            self.position_entry_size = new_position;
+        }
+
+        debug!(
+            "📊 PnL Update: pos={:.4} → {:.4}, cost_basis=${:.2}, entry_size={:.4}, realized_pnl=${:.2}, fees=${:.2}",
+            old_position, new_position, self.position_cost_basis, self.position_entry_size,
+            self.total_realized_pnl, self.total_fees_paid
+        );
+    }
+
+    /// Fetch current account equity from Hyperliquid API
+    /// Updates last_fetched_account_equity and last_equity_fetch_time
+    /// Rate-limited to prevent excessive API calls (minimum 30s between fetches)
+    async fn update_account_equity(&mut self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+
+        // Rate limit: don't fetch more than once per 30 seconds
+        if now - self.last_equity_fetch_time < 30.0 {
+            return;
+        }
+
+        match self.info_client.user_state(self.user_address).await {
+            Ok(user_state) => {
+                let equity_str = &user_state.cross_margin_summary.account_value;
+                match equity_str.parse::<f64>() {
+                    Ok(equity) => {
+                        self.last_fetched_account_equity = equity;
+                        self.last_equity_fetch_time = now;
+                        debug!("💰 Account equity updated: ${:.2}", equity);
+                    }
+                    Err(e) => {
+                        warn!("⚠️  Failed to parse account equity '{}': {}", equity_str, e);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("⚠️  Failed to fetch account equity: {}", e);
+                warn!("   Using last known value: ${:.2}", self.last_fetched_account_equity);
+            }
+        }
+    }
+
     /// Update TUI dashboard state with current market maker state
     /// Called on every significant event (L2Book update, fills, etc.)
     fn update_tui_state(&mut self) {
         use crate::tui::state::{DashboardState, OrderLevel};
 
-        // Calculate unrealized PnL
-        let unrealized_pnl = if self.cur_position != 0.0 && self.latest_l2_mid_price > 0.0 {
-            let avg_entry = self.state_vector.mid_price;
-            (self.latest_l2_mid_price - avg_entry) * self.cur_position
+        // Calculate unrealized PnL using accurate cost basis tracking
+        let unrealized_pnl = if self.cur_position.abs() > EPSILON && self.latest_l2_mid_price > 0.0 {
+            if self.position_entry_size.abs() > EPSILON {
+                let avg_entry_price = self.position_cost_basis / self.position_entry_size;
+                (self.latest_l2_mid_price - avg_entry_price) * self.cur_position
+            } else {
+                0.0
+            }
         } else {
             0.0
         };
 
-        // Calculate current total equity (account_equity + unrealized_pnl)
-        // For now, we'll use unrealized_pnl as a proxy since account_equity is TODO
-        let current_equity = unrealized_pnl;  // TODO: Add account_equity when available
+        // Calculate total session PnL (realized + unrealized - fees)
+        let total_session_pnl = self.total_realized_pnl + unrealized_pnl - self.total_fees_paid;
+
+        // Use fetched account equity (updated every 30s)
+        let account_equity = self.last_fetched_account_equity;
+        let current_equity = account_equity;  // This is the true account value from Hyperliquid
 
         // Update equity history for Sharpe ratio calculation
         let now = std::time::SystemTime::now()
@@ -1995,12 +2150,23 @@ impl MarketMaker {
         // Get message counter
         let total_messages = *self.message_counter.read() as u64;
 
+        // Calculate accurate average entry price from cost basis
+        let avg_entry_price = if self.position_entry_size.abs() > EPSILON {
+            self.position_cost_basis / self.position_entry_size
+        } else {
+            0.0
+        };
+
         // Create dashboard state (Note: recent_fills will be populated separately on fill events)
         let dashboard_state = DashboardState {
             cur_position: self.cur_position,
-            avg_entry_price: self.state_vector.mid_price,
-            unrealized_pnl,
-            account_equity: 0.0,  // TODO: Fetch from InfoClient
+            avg_entry_price,            // Use accurate cost-basis-derived entry price
+            unrealized_pnl,             // Calculated from cost basis above
+            realized_pnl: self.total_realized_pnl,  // Session realized PnL
+            total_fees: self.total_fees_paid,       // Session fees paid
+            total_session_pnl,          // Total PnL (realized + unrealized - fees)
+            account_equity,             // Fetched from Hyperliquid API
+            session_start_equity: self.session_start_equity,  // Starting equity for session
             sharpe_ratio,
 
             l2_mid_price: self.latest_l2_mid_price,
@@ -2928,6 +3094,21 @@ impl MarketMaker {
 
         info!("✅ Background Particle Filter task initialized");
 
+        // ===== Fetch Initial Account Equity for PnL Tracking =====
+        let session_start_equity = match info_client.user_state(user_address).await {
+            Ok(user_state) => {
+                let equity_str = &user_state.cross_margin_summary.account_value;
+                let equity = equity_str.parse::<f64>().unwrap_or(0.0);
+                info!("💰 Initial account equity: ${:.2}", equity);
+                equity
+            }
+            Err(e) => {
+                warn!("⚠️  Failed to fetch initial account equity: {}", e);
+                warn!("   PnL tracking will start from 0.0 - only relative PnL will be accurate");
+                0.0
+            }
+        };
+
         let market_maker = MarketMaker {
             // ===== Core Configuration =====
             asset: input.asset,
@@ -2999,6 +3180,15 @@ impl MarketMaker {
             // ===== Performance Tracking =====
             equity_history: std::collections::VecDeque::with_capacity(1000),  // Max 1000 samples
             last_equity: 0.0,  // Initialize to zero
+
+            // ===== PnL Tracking (Session-Based) =====
+            session_start_equity,  // Fetched from API above
+            total_realized_pnl: 0.0,  // No trades yet
+            total_fees_paid: 0.0,  // No trades yet
+            position_cost_basis: 0.0,  // No position yet
+            position_entry_size: 0.0,  // No position yet
+            last_fetched_account_equity: session_start_equity,  // Use initial equity
+            last_equity_fetch_time: start_time,  // Use bot start time
         };
 
         Ok((market_maker, tui_state_rx))
@@ -3066,9 +3256,17 @@ impl MarketMaker {
 
         // Create Adam optimizer timer (60 second interval)
         let mut adam_timer = time::interval(std::time::Duration::from_secs(60));
-        
+
+        // Create account equity fetch timer (30 second interval)
+        let mut equity_timer = time::interval(std::time::Duration::from_secs(30));
+
         loop {
             tokio::select! {
+                // Periodic account equity update (every 30 seconds)
+                _ = equity_timer.tick() => {
+                    self.update_account_equity().await;
+                }
+
                 // Check for shutdown signal
                 _ = async {
                     if let Some(ref mut rx) = shutdown_rx {
@@ -3240,6 +3438,10 @@ impl MarketMaker {
                                 self.cur_position += amount;
                                 info!("Fill: bought {} {} (oid: {})", amount, self.asset.clone(), filled_oid);
 
+                                // Update PnL tracking (cost basis, realized PnL, fees)
+                                let fee: f64 = fill.fee.parse().unwrap_or(0.0);
+                                self.process_fill_pnl(fill_price, amount, true, fee);
+
                                 // First, check pending_cancel_orders HashMap (O(1) lookup for late fills)
                                 if let Some(pending_cancel) = self.pending_cancel_orders.get_mut(&filled_oid) {
                                     // Fill arrived after cancel was sent
@@ -3318,6 +3520,10 @@ impl MarketMaker {
                                 // Our Ask was filled (we sold)
                                 self.cur_position -= amount;
                                 info!("Fill: sold {} {} (oid: {})", amount, self.asset.clone(), filled_oid);
+
+                                // Update PnL tracking (cost basis, realized PnL, fees)
+                                let fee: f64 = fill.fee.parse().unwrap_or(0.0);
+                                self.process_fill_pnl(fill_price, amount, false, fee);
 
                                 // First, check pending_cancel_orders HashMap (O(1) lookup for late fills)
                                 if let Some(pending_cancel) = self.pending_cancel_orders.get_mut(&filled_oid) {
@@ -3456,15 +3662,18 @@ impl MarketMaker {
                                 let is_bid_fill = fill.side == "B";
                                 let fill_price: f64 = fill.px.parse().unwrap_or(0.0);
 
-                                // Update position
+                                // Update position and PnL tracking
+                                let fee: f64 = fill.fee.parse().unwrap_or(0.0);
                                 if is_bid_fill {
                                     self.cur_position += amount;
                                     info!("Held fill processed: bought {} {} @ {} (oid: {})",
                                           amount, self.asset, fill_price, oid);
+                                    self.process_fill_pnl(fill_price, amount, true, fee);
                                 } else {
                                     self.cur_position -= amount;
                                     info!("Held fill processed: sold {} {} @ {} (oid: {})",
                                           amount, self.asset, fill_price, oid);
+                                    self.process_fill_pnl(fill_price, amount, false, fee);
                                 }
 
                                 // Try to find this order in our tracking to update Hawkes model

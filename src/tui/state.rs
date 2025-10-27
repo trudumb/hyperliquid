@@ -8,7 +8,11 @@ pub struct DashboardState {
     pub cur_position: f64,
     pub avg_entry_price: f64,
     pub unrealized_pnl: f64,
+    pub realized_pnl: f64,       // Session realized PnL
+    pub total_fees: f64,          // Session total fees paid
+    pub total_session_pnl: f64,   // realized + unrealized - fees
     pub account_equity: f64,
+    pub session_start_equity: f64, // Account equity at session start
     pub sharpe_ratio: f64,
 
     // ===== Market Data =====
@@ -78,7 +82,11 @@ impl Default for DashboardState {
             cur_position: 0.0,
             avg_entry_price: 0.0,
             unrealized_pnl: 0.0,
+            realized_pnl: 0.0,
+            total_fees: 0.0,
+            total_session_pnl: 0.0,
             account_equity: 0.0,
+            session_start_equity: 0.0,
             sharpe_ratio: 0.0,
 
             l2_mid_price: 0.0,
