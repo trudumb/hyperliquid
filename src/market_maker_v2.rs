@@ -12,7 +12,7 @@ use crate::{
     AssetType, BaseUrl, BookAnalysis, ClientCancelRequest, ClientLimit, ClientOrder,
     ClientOrderRequest, ClientTrigger, ExchangeClient, ExchangeDataStatus, ExchangeResponseStatus, InfoClient,
     MarketCloseParams, MarketOrderParams, Message,
-    OrderBook, ParticleFilterState, AdaptiveConfig, Subscription, TickLotValidator, UserData, EPSILON,
+    OrderBook, ParticleFilterState, AdaptiveConfig, Subscription, TickLotValidator, TradeInfo, UserData, EPSILON,
     HawkesFillModel, MultiLevelConfig, MultiLevelOptimizer, OptimizationState,
     ParameterUncertainty, RobustConfig, RobustParameters,
 };
@@ -1701,6 +1701,11 @@ pub struct MarketMaker {
     /// Cleaned up periodically to prevent memory leak
     pub pending_cancel_orders: HashMap<u64, PendingCancelOrder>,
 
+    /// Holding pen for fills that arrive before orderUpdates confirms the oid mapping
+    /// Key: oid, Value: Vec of TradeInfo (fill) messages waiting to be processed
+    /// When orderUpdates arrives with cloid->oid mapping, we flush these fills
+    pub unmatched_fills: HashMap<u64, Vec<TradeInfo>>,
+
     /// Pending order placement intents (tracked for async reconciliation)
     /// Key: intent_id, Value: OrderIntent details
     pub pending_order_intents: Arc<RwLock<HashMap<u64, OrderIntent>>>,
@@ -2273,6 +2278,10 @@ impl MarketMaker {
         // Increased from 100 to handle high-frequency order placement without capacity errors
         let (order_command_tx, mut order_command_rx) = tokio::sync::mpsc::channel::<OrderCommand>(2000);
 
+        // Create HIGH-PRIORITY channel for cancellations (smaller capacity, processed first)
+        // This ensures cancels are never blocked by a saturated placement queue
+        let (cancel_command_tx, mut cancel_command_rx) = tokio::sync::mpsc::channel::<OrderCommand>(500);
+
         // Create unbounded channel for order placement results
         // Async execution task sends results back to main loop for tracking
         let (order_result_tx, order_result_rx) = tokio::sync::mpsc::unbounded_channel::<OrderPlacementResult>();
@@ -2286,21 +2295,59 @@ impl MarketMaker {
         // decoupling it from the critical path event loop
         tokio::spawn(async move {
             // Initialize rate limiter: 15 requests/second with burst of 30
-            let mut rate_limiter = TokenBucketRateLimiter::new(15.0, 30.0);
+            let rate_limiter = Arc::new(tokio::sync::Mutex::new(TokenBucketRateLimiter::new(15.0, 30.0)));
             info!("⚡ Order execution task started (rate limit: 15 req/s, burst: 30)");
+            info!("⚡ Using BIASED select for priority cancel channel");
 
-            while let Some(command) = order_command_rx.recv().await {
-                // Apply rate limiting
-                if let Some(wait_time) = rate_limiter.try_acquire() {
-                    debug!("Rate limit reached, waiting {:?}", wait_time);
-                    tokio::time::sleep(wait_time).await;
-                    // Try again after waiting
-                    if let Some(additional_wait) = rate_limiter.try_acquire() {
-                        tokio::time::sleep(additional_wait).await;
-                    }
+            loop {
+                // Use biased select to ALWAYS prioritize cancels over placements
+                // This prevents cancel starvation when the placement queue is saturated
+                let command = tokio::select! {
+                    biased;  // CRITICAL: Process branches in order - cancels first!
+
+                    // HIGH PRIORITY: Process cancels first
+                    Some(cmd) = cancel_command_rx.recv() => Some((cmd, true)),
+
+                    // LOWER PRIORITY: Process placements second
+                    Some(cmd) = order_command_rx.recv() => Some((cmd, false)),
+
+                    // Both channels closed
+                    else => None,
+                };
+
+                let Some((command, is_cancel)) = command else {
+                    warn!("⚠️  Order execution task exiting - all channels closed");
+                    break;
+                };
+
+                if is_cancel {
+                    debug!("Processing command from HIGH-PRIORITY cancel channel");
                 }
 
-                match command {
+                // Spawn each command in its own task for concurrent execution
+                // This prevents any single slow API call from blocking the channel
+                let exec_client = order_exec_exchange_client.clone();
+                let result_tx = order_result_tx.clone();
+                let limiter = rate_limiter.clone();
+
+                tokio::spawn(async move {
+                    // Apply rate limiting
+                    {
+                        let mut limiter_guard = limiter.lock().await;
+                        if let Some(wait_time) = limiter_guard.try_acquire() {
+                            debug!("Rate limit reached, waiting {:?}", wait_time);
+                            drop(limiter_guard); // Release lock before sleeping
+                            tokio::time::sleep(wait_time).await;
+                            // Try again after waiting
+                            let mut limiter_guard2 = limiter.lock().await;
+                            if let Some(additional_wait) = limiter_guard2.try_acquire() {
+                                drop(limiter_guard2);
+                                tokio::time::sleep(additional_wait).await;
+                            }
+                        }
+                    }
+
+                    match command {
                     OrderCommand::Place { request, intent_id } => {
                         debug!("Executing order placement: intent_id={}, price={}, size={}",
                                intent_id, request.limit_px, request.sz);
@@ -2322,7 +2369,7 @@ impl MarketMaker {
                                 }),
                             },
                         };
-                        let client = order_exec_exchange_client.clone();
+                        let client = exec_client.clone();
 
                         match retry_with_backoff(
                             || async {
@@ -2367,7 +2414,7 @@ impl MarketMaker {
                                                         success: true,
                                                         error_message: None,
                                                     };
-                                                    if let Err(e) = order_result_tx.send(result) {
+                                                    if let Err(e) = result_tx.send(result) {
                                                         error!("Failed to send order result for intent_id={}: {}", intent_id, e);
                                                     }
                                                 }
@@ -2380,7 +2427,7 @@ impl MarketMaker {
                                                         success: true,
                                                         error_message: None,
                                                     };
-                                                    if let Err(e) = order_result_tx.send(result) {
+                                                    if let Err(e) = result_tx.send(result) {
                                                         error!("Failed to send order result for intent_id={}: {}", intent_id, e);
                                                     }
                                                 }
@@ -2392,7 +2439,7 @@ impl MarketMaker {
                                                         success: false,
                                                         error_message: Some(err_msg.clone()),
                                                     };
-                                                    if let Err(e) = order_result_tx.send(result) {
+                                                    if let Err(e) = result_tx.send(result) {
                                                         error!("Failed to send order failure result for intent_id={}: {}", intent_id, e);
                                                     }
                                                 }
@@ -2405,7 +2452,7 @@ impl MarketMaker {
                                                         success: true,
                                                         error_message: None,
                                                     };
-                                                    if let Err(e) = order_result_tx.send(result) {
+                                                    if let Err(e) = result_tx.send(result) {
                                                         error!("Failed to send order result for intent_id={}: {}", intent_id, e);
                                                     }
                                                 }
@@ -2423,7 +2470,7 @@ impl MarketMaker {
                                         success: false,
                                         error_message: Some(format!("{:?}", response)),
                                     };
-                                    if let Err(e) = order_result_tx.send(result) {
+                                    if let Err(e) = result_tx.send(result) {
                                         error!("Failed to send order failure result for intent_id={}: {}", intent_id, e);
                                     }
                                 }
@@ -2438,7 +2485,7 @@ impl MarketMaker {
                                     success: false,
                                     error_message: Some(e.to_string()),
                                 };
-                                if let Err(send_err) = order_result_tx.send(result) {
+                                if let Err(send_err) = result_tx.send(result) {
                                     error!("Failed to send order error result for intent_id={}: {}", intent_id, send_err);
                                 }
                             }
@@ -2446,7 +2493,7 @@ impl MarketMaker {
                     }
                     OrderCommand::BatchPlace { requests, intent_ids } => {
                         if requests.is_empty() {
-                            continue;
+                            return; // Early return from spawned task
                         }
                         let num_orders = requests.len();
                         debug!("Executing batch order placement: {} orders", num_orders);
@@ -2454,7 +2501,7 @@ impl MarketMaker {
                         // Clone for retry closure
                         let requests_clone = requests.clone();
                         let intent_ids_clone = intent_ids.clone();
-                        let client = order_exec_exchange_client.clone();
+                        let client = exec_client.clone();
 
                         match retry_with_backoff(
                             || async {
@@ -2504,7 +2551,7 @@ impl MarketMaker {
 
                         let asset = request.asset.clone();
                         let oid = request.oid;
-                        let client = order_exec_exchange_client.clone();
+                        let client = exec_client.clone();
 
                         match retry_with_backoff(
                             || async {
@@ -2527,13 +2574,13 @@ impl MarketMaker {
                     }
                     OrderCommand::BatchCancel { requests } => {
                         if requests.is_empty() {
-                            continue;
+                            return; // Early return from spawned task
                         }
                         let num_cancels = requests.len();
                         debug!("Executing batch cancel: {} orders", num_cancels);
 
                         let requests_clone = requests.clone();
-                        let client = order_exec_exchange_client.clone();
+                        let client = exec_client.clone();
 
                         match retry_with_backoff(
                             || async {
@@ -2556,9 +2603,9 @@ impl MarketMaker {
                             }
                         }
                     }
-                }
-            }
-            warn!("⚠️  Order execution task exiting");
+                    } // End of match command
+                }); // End of tokio::spawn for this command
+            } // End of loop
         });
 
         info!("✅ Async order execution task initialized (channel buffer: 2000)");
@@ -2680,6 +2727,7 @@ impl MarketMaker {
             bid_levels: Vec::with_capacity(max_levels),  // Initialize empty, will be populated on first quote
             ask_levels: Vec::with_capacity(max_levels),  // Initialize empty, will be populated on first quote
             pending_cancel_orders: HashMap::new(),  // Initialize empty HashMap for tracking canceled orders
+            unmatched_fills: HashMap::new(),  // Initialize empty HashMap for holding pen
 
             // ===== Async Order Execution State =====
             pending_order_intents: Arc::new(RwLock::new(HashMap::new())),  // Track pending order placements
@@ -2752,6 +2800,18 @@ impl MarketMaker {
             .subscribe(
                 Subscription::Trades {
                     coin: self.asset.clone(),
+                },
+                sender.clone(),
+            )
+            .await
+            .unwrap();
+
+        // Subscribe to OrderUpdates to get oid->cloid mappings for fill reconciliation
+        info!("Subscribing to OrderUpdates for oid mapping");
+        self.info_client
+            .subscribe(
+                Subscription::OrderUpdates {
+                    user: self.user_address,
                 },
                 sender,
             )
@@ -3024,7 +3084,10 @@ impl MarketMaker {
                                         // Remove intent from pending
                                         self.pending_order_intents.write().remove(&intent.intent_id);
                                     } else {
-                                        warn!("Received fill for untracked bid oid: {} (not in active bids, pending_cancel, or pending_intents)", filled_oid);
+                                        // Fill arrived before orderUpdates confirmed the oid mapping
+                                        // Add to holding pen - will be processed when orderUpdates arrives
+                                        debug!("Fill arrived before oid mapping for bid oid: {}, adding to holding pen", filled_oid);
+                                        self.unmatched_fills.entry(filled_oid).or_insert_with(Vec::new).push(fill.clone());
                                     }
                                 }
                             } else {
@@ -3100,7 +3163,10 @@ impl MarketMaker {
                                         // Remove intent from pending
                                         self.pending_order_intents.write().remove(&intent.intent_id);
                                     } else {
-                                        warn!("Received fill for untracked ask oid: {} (not in active asks, pending_cancel, or pending_intents)", filled_oid);
+                                        // Fill arrived before orderUpdates confirmed the oid mapping
+                                        // Add to holding pen - will be processed when orderUpdates arrives
+                                        debug!("Fill arrived before oid mapping for ask oid: {}, adding to holding pen", filled_oid);
+                                        self.unmatched_fills.entry(filled_oid).or_insert_with(Vec::new).push(fill.clone());
                                     }
                                 }
                             }
@@ -3137,6 +3203,62 @@ impl MarketMaker {
                         if position_changed || hawkes_needs_update {
                             self.update_state_vector(); // Update inventory, etc.
                             self.potentially_update().await; // Re-evaluate multi-level quotes
+                        }
+                    }
+                }
+                Message::OrderUpdates(order_updates) => {
+                    // Process oid->cloid mappings from orderUpdates
+                    // This is critical for reconciling fills that arrive before oid confirmation
+                    for order_status in &order_updates.data {
+                        let oid = order_status.order.oid;
+
+                        // Check if this oid has pending fills in the holding pen
+                        if let Some(pending_fills) = self.unmatched_fills.remove(&oid) {
+                            info!("🔄 Processing {} held fills for newly confirmed oid {}", pending_fills.len(), oid);
+
+                            let current_time = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs_f64();
+
+                            // Process each fill that was waiting for this oid
+                            for fill in pending_fills {
+                                let amount: f64 = fill.sz.parse().unwrap_or(0.0);
+                                if amount < EPSILON {
+                                    continue;
+                                }
+
+                                let is_bid_fill = fill.side == "B";
+                                let fill_price: f64 = fill.px.parse().unwrap_or(0.0);
+
+                                // Update position
+                                if is_bid_fill {
+                                    self.cur_position += amount;
+                                    info!("Held fill processed: bought {} {} @ {} (oid: {})",
+                                          amount, self.asset, fill_price, oid);
+                                } else {
+                                    self.cur_position -= amount;
+                                    info!("Held fill processed: sold {} {} @ {} (oid: {})",
+                                          amount, self.asset, fill_price, oid);
+                                }
+
+                                // Try to find this order in our tracking to update Hawkes model
+                                let level_opt = if is_bid_fill {
+                                    self.bid_levels.iter().find(|o| o.oid == oid).map(|o| o.level)
+                                } else {
+                                    self.ask_levels.iter().find(|o| o.oid == oid).map(|o| o.level)
+                                };
+
+                                if let Some(level) = level_opt {
+                                    self.hawkes_model.write().record_fill(level, is_bid_fill, current_time);
+                                    info!("Updated Hawkes model from held fill: L{}, side {}",
+                                          level + 1, if is_bid_fill {"BID"} else {"ASK"});
+                                }
+                            }
+
+                            // Trigger state update after processing held fills
+                            self.update_state_vector();
+                            self.potentially_update().await;
                         }
                     }
                 }
@@ -3462,6 +3584,19 @@ impl MarketMaker {
         // --- 0. Pre-checks ---
         self.cleanup_invalid_resting_orders();
 
+        // CIRCUIT BREAKER: Check if order execution channel is saturated
+        // If capacity is low, skip placing new orders to prevent channel overflow
+        let channel_capacity = self.order_command_tx.capacity();
+        if channel_capacity < 400 {
+            warn!(
+                "🔴 CIRCUIT BREAKER: Order channel capacity low ({} < 400), skipping new placements",
+                channel_capacity
+            );
+            // Still allow cancellations but skip new placements
+            // Note: This prevents death spirals from channel saturation
+            return;
+        }
+
         if !*self.trading_enabled.read() {
             info!("⏳ Trading disabled (performance gap). Skipping order management.");
             return;
@@ -3707,8 +3842,38 @@ impl MarketMaker {
         // --- 5. Execute Placements Sequentially ---
         let mut successful_placements = 0;
 
+        // Extract BBO from latest_book for spread-crossing validation
+        let best_ask = self.latest_book.as_ref()
+            .and_then(|book| {
+                if !book.asks.is_empty() {
+                    book.asks[0].px.parse::<f64>().ok()
+                } else {
+                    None
+                }
+            });
+
+        let best_bid = self.latest_book.as_ref()
+            .and_then(|book| {
+                if !book.bids.is_empty() {
+                    book.bids[0].px.parse::<f64>().ok()
+                } else {
+                    None
+                }
+            });
+
         // Place new bids
         for (level, (price, size)) in bids_to_place.iter().enumerate() {
+            // CRITICAL: Check if bid would cross the spread (aggressive taker order)
+            if let Some(ask) = best_ask {
+                if *price >= ask {
+                    error!(
+                        "⛔ SKIPPING TAKER BID: L{} bid price {:.3} >= best_ask {:.3} (would cross spread!)",
+                        level + 1, price, ask
+                    );
+                    continue; // Skip this order - it would be an instant taker fill
+                }
+            }
+
             // SAFETY: Check if this bid would violate position limits (defense in depth)
             let remaining_buy_capacity = self.max_absolute_position_size - self.cur_position;
             if *size > remaining_buy_capacity + EPSILON {
@@ -3789,6 +3954,17 @@ impl MarketMaker {
         
         // Place new asks
         for (level, (price, size)) in asks_to_place.iter().enumerate() {
+            // CRITICAL: Check if ask would cross the spread (aggressive taker order)
+            if let Some(bid) = best_bid {
+                if *price <= bid {
+                    error!(
+                        "⛔ SKIPPING TAKER ASK: L{} ask price {:.3} <= best_bid {:.3} (would cross spread!)",
+                        level + 1, price, bid
+                    );
+                    continue; // Skip this order - it would be an instant taker fill
+                }
+            }
+
             // SAFETY: Check if this ask would violate position limits (defense in depth)
             let remaining_sell_capacity = self.max_absolute_position_size + self.cur_position;
             if *size > remaining_sell_capacity + EPSILON {
