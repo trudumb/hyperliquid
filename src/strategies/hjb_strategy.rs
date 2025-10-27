@@ -43,9 +43,14 @@ use serde_json::Value;
 use crate::strategy::{CurrentState, MarketUpdate, Strategy, StrategyAction, UserUpdate};
 use crate::{
     AssetType, ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest,
-    HawkesFillModel, L2BookData, MultiLevelConfig, MultiLevelOptimizer, OptimizationState,
-    OrderBook, ParameterUncertainty, ParticleFilterState, RobustConfig, RobustParameters,
-    TickLotValidator, Trade, TradeInfo, EPSILON,
+    HawkesFillModel, L2BookData, MultiLevelConfig, MultiLevelOptimizer,
+    OrderBook, ParameterUncertainty, ParticleFilterState, RobustConfig,
+    TickLotValidator, Trade, TradeInfo,
+};
+
+// Import the component-based architecture
+use crate::strategies::components::{
+    HjbMultiLevelOptimizer, OptimizerInputs, OptimizerOutput,
 };
 
 // Re-import state vector and related components from the parent module
@@ -161,6 +166,23 @@ impl HjbStrategyConfig {
 }
 
 // ============================================================================
+// Cached Optimizer Result
+// ============================================================================
+
+/// Cached result from the quote optimizer to avoid redundant calculations
+#[derive(Debug, Clone)]
+struct CachedOptimizerResult {
+    /// The optimizer output
+    output: OptimizerOutput,
+    
+    /// Timestamp of this calculation
+    timestamp: f64,
+    
+    /// State hash (for cache invalidation)
+    state_hash: u64,
+}
+
+// ============================================================================
 // HJB Strategy Implementation
 // ============================================================================
 
@@ -181,7 +203,12 @@ pub struct HjbStrategy {
     /// Value Function V(Q,t) for inventory penalty calculation
     value_function: ValueFunction,
 
-    /// Multi-level optimizer (contains config, Hawkes model, level logic)
+    /// **NEW: Component-based quote optimizer**
+    /// Replaces the direct use of MultiLevelOptimizer
+    quote_optimizer: HjbMultiLevelOptimizer,
+
+    /// Multi-level optimizer (DEPRECATED - kept for backward compatibility)
+    /// TODO: Remove once fully migrated to component
     multi_level_optimizer: MultiLevelOptimizer,
 
     /// Hawkes process model for fill rate estimation
@@ -222,6 +249,14 @@ pub struct HjbStrategy {
     /// Smoothed taker rates (exponential moving average)
     smoothed_taker_buy_rate: f64,
     smoothed_taker_sell_rate: f64,
+    
+    /// **NEW: Cached optimizer result (for performance)**
+    cached_optimizer_result: Option<CachedOptimizerResult>,
+    
+    /// **NEW: Performance metrics**
+    optimization_call_count: u64,
+    optimization_cache_hits: u64,
+    total_optimization_time_us: u64,
 }
 
 impl Strategy for HjbStrategy {
@@ -256,9 +291,22 @@ impl Strategy for HjbStrategy {
         // Initialize Hawkes model (3 levels by default)
         let hawkes_model = Arc::new(RwLock::new(HawkesFillModel::new(3)));
 
+        // Initialize robust control config (before using in quote_optimizer)
+        let robust_config = strategy_config.robust_config.clone()
+            .unwrap_or_else(|| RobustConfig::default());
+
         // Initialize multi-level optimizer
         let multi_level_config = strategy_config.multi_level_config.clone()
             .unwrap_or_else(|| MultiLevelConfig::default());
+
+        // Initialize the component-based quote optimizer (before moving multi_level_config)
+        let quote_optimizer = HjbMultiLevelOptimizer::new(
+            multi_level_config.clone(),
+            robust_config.clone(),
+            strategy_config.asset.clone(),
+            strategy_config.max_absolute_position_size,
+            TuningParams::default().get_constrained(),
+        );
 
         let multi_level_optimizer = MultiLevelOptimizer::new(multi_level_config);
 
@@ -281,10 +329,6 @@ impl Strategy for HjbStrategy {
 
         // Initialize cached volatility
         let cached_volatility = Arc::new(RwLock::new(CachedVolatilityEstimate::default()));
-
-        // Initialize robust control config
-        let robust_config = strategy_config.robust_config.clone()
-            .unwrap_or_else(|| RobustConfig::default());
 
         // Initialize parameter uncertainty
         let current_uncertainty = ParameterUncertainty::default();
@@ -311,6 +355,7 @@ impl Strategy for HjbStrategy {
             state_vector,
             hjb_components,
             value_function,
+            quote_optimizer,
             multi_level_optimizer,
             hawkes_model,
             particle_filter,
@@ -327,6 +372,10 @@ impl Strategy for HjbStrategy {
             last_taker_sell_time: 0.0,
             smoothed_taker_buy_rate: 0.0,
             smoothed_taker_sell_rate: 0.0,
+            cached_optimizer_result: None,
+            optimization_call_count: 0,
+            optimization_cache_hits: 0,
+            total_optimization_time_us: 0,
         }
     }
 
@@ -472,116 +521,134 @@ impl HjbStrategy {
         }
     }
 
-    /// Calculate multi-level target quotes using HJB/Hawkes/Robust control
-    fn calculate_multi_level_targets(&mut self, _state: &CurrentState) -> (Vec<(f64, f64)>, Vec<(f64, f64)>) {
+    /// Calculate multi-level target quotes using HJB/Hawkes/Robust control (Component-based)
+    fn calculate_multi_level_targets(&mut self, state: &CurrentState) -> (Vec<(f64, f64)>, Vec<(f64, f64)>) {
+        let start = std::time::Instant::now();
         let current_time = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
 
+        // Increment optimization call counter
+        self.optimization_call_count += 1;
+
+        // --- CACHING LOGIC ---
+        // Compute state hash for cache invalidation
+        let state_hash = self.compute_state_hash(state);
+        
+        // Check if we can use cached result
+        if let Some(cached) = &self.cached_optimizer_result {
+            // Cache is valid if:
+            // 1. State hasn't changed significantly (same hash)
+            // 2. Cache is recent (< 100ms old for fast markets)
+            let cache_age_ms = (current_time - cached.timestamp) * 1000.0;
+            if cached.state_hash == state_hash && cache_age_ms < 100.0 {
+                self.optimization_cache_hits += 1;
+                debug!(
+                    "[OPTIMIZER CACHE HIT] Age: {:.1}ms, Hit rate: {:.1}%",
+                    cache_age_ms,
+                    100.0 * self.optimization_cache_hits as f64 / self.optimization_call_count as f64
+                );
+                
+                // Update taker rates from cached result
+                self.latest_taker_buy_rate = cached.output.taker_buy_rate;
+                self.latest_taker_sell_rate = cached.output.taker_sell_rate;
+                
+                return (cached.output.target_bids.clone(), cached.output.target_asks.clone());
+            }
+        }
+
+        // --- MODEL INPUTS PREPARATION ---
+        // --- MODEL INPUTS PREPARATION ---
         // Get cached volatility uncertainty
         let cached_vol = self.cached_volatility.read();
-        let (mu_std, _, _) = cached_vol.param_std_devs;
+        let (_mu_std, _, _) = cached_vol.param_std_devs;
         let sigma_std = cached_vol.volatility_std_dev_bps;
         drop(cached_vol);
 
-        // Update parameter uncertainty
-        self.current_uncertainty = ParameterUncertainty::from_particle_filter_stats(
-            mu_std,
-            sigma_std,
-            0.95,
-        );
-
-        // Compute robust parameters
-        let robust_params = RobustParameters::compute(
-            self.state_vector.adverse_selection_estimate,
-            self.state_vector.volatility_ema_bps,
-            self.state_vector.inventory,
-            &self.current_uncertainty,
-            &self.robust_config,
-        );
-
-        // Prepare optimization state
-        let hawkes_lock = self.hawkes_model.read();
-        let opt_state = OptimizationState {
-            mid_price: self.state_vector.mid_price,
-            inventory: self.state_vector.inventory,
-            max_position: self.config.max_absolute_position_size,
-            adverse_selection_bps: robust_params.mu_worst_case,
+        // Prepare optimizer inputs
+        let inputs = OptimizerInputs {
+            current_time_sec: current_time,
+            volatility_bps: self.state_vector.volatility_ema_bps,
+            vol_uncertainty_bps: sigma_std,
+            adverse_selection_bps: self.state_vector.adverse_selection_estimate,
             lob_imbalance: self.state_vector.lob_imbalance,
-            volatility_bps: robust_params.sigma_worst_case,
-            current_time,
-            hawkes_model: &hawkes_lock,
         };
 
-        // Calculate robust base half-spread
-        let min_profitable_half_spread = self.multi_level_optimizer.config().min_profitable_spread_bps / 2.0;
-        let robust_base_half_spread = (robust_params.sigma_worst_case * 0.1)
-            .max(min_profitable_half_spread)
-            * robust_params.spread_multiplier;
-
-        // Get tuning parameters
+        // --- COMPONENT CALL ---
+        // Update the component's tuning params from the shared state
         let current_tuning_params = self.tuning_params.read().get_constrained();
+        self.quote_optimizer.set_tuning_params(current_tuning_params);
 
-        // Run multi-level optimization
-        let multi_level_control = self.multi_level_optimizer.optimize(
-            &opt_state,
-            robust_base_half_spread,
-            &current_tuning_params,
+        // Call the component with metadata
+        let hawkes_lock = self.hawkes_model.read();
+        let output = self.quote_optimizer.calculate_target_quotes_with_metadata(
+            &inputs,
+            state,
+            &hawkes_lock,
         );
         drop(hawkes_lock);
 
+        // --- UPDATE STRATEGY STATE ---
         // Store taker rates
-        self.latest_taker_buy_rate = multi_level_control.taker_buy_rate;
-        self.latest_taker_sell_rate = multi_level_control.taker_sell_rate;
-
-        // Convert offsets to prices
-        let mut target_bids = Vec::new();
-        let mut target_asks = Vec::new();
-
-        for (offset_bps, size_raw) in multi_level_control.bid_levels {
-            if size_raw < EPSILON {
-                continue;
-            }
-
-            let size = self.tick_lot_validator.round_size(size_raw, false);
-            if size < EPSILON {
-                continue;
-            }
-
-            let price_raw = self.state_vector.mid_price * (1.0 - offset_bps / 10000.0);
-            let price = self.tick_lot_validator.round_price(price_raw, false);
-
-            if price > 0.0 && (size * price) >= 10.0 {
-                target_bids.push((price, size));
-            }
+        self.latest_taker_buy_rate = output.taker_buy_rate;
+        self.latest_taker_sell_rate = output.taker_sell_rate;
+        
+        if output.liquidate {
+            log::warn!("🚨 Liquidation mode triggered by optimizer!");
+            log::info!("   Taker rates: buy={:.4}, sell={:.4}", 
+                  self.latest_taker_buy_rate, self.latest_taker_sell_rate);
         }
 
-        for (offset_bps, size_raw) in multi_level_control.ask_levels {
-            if size_raw < EPSILON {
-                continue;
-            }
-
-            let size = self.tick_lot_validator.round_size(size_raw, false);
-            if size < EPSILON {
-                continue;
-            }
-
-            let price_raw = self.state_vector.mid_price * (1.0 + offset_bps / 10000.0);
-            let price = self.tick_lot_validator.round_price(price_raw, true);
-
-            if price > 0.0 && (size * price) >= 10.0 {
-                target_asks.push((price, size));
-            }
-        }
-
-        // Sort bids descending, asks ascending
-        target_bids.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-        target_asks.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-
+        // --- PERFORMANCE METRICS ---
+        let elapsed = start.elapsed();
+        self.total_optimization_time_us += elapsed.as_micros() as u64;
+        let avg_time_us = self.total_optimization_time_us / self.optimization_call_count;
+        
         debug!(
-            "[HJB STRATEGY] Targets: Bids({})={:?}, Asks({})={:?}",
-            target_bids.len(), target_bids, target_asks.len(), target_asks
+            "[MULTI-LEVEL OPTIMIZE] Time: {}μs (avg: {}μs), Bids: {}, Asks: {}, Cache hit rate: {:.1}%",
+            elapsed.as_micros(),
+            avg_time_us,
+            output.target_bids.len(),
+            output.target_asks.len(),
+            100.0 * self.optimization_cache_hits as f64 / self.optimization_call_count as f64
         );
 
-        (target_bids, target_asks)
+        // --- CACHE UPDATE ---
+        self.cached_optimizer_result = Some(CachedOptimizerResult {
+            output: output.clone(),
+            timestamp: current_time,
+            state_hash,
+        });
+
+        (output.target_bids, output.target_asks)
+    }
+    
+    /// Compute a hash of the current state for cache invalidation.
+    /// 
+    /// The hash includes key state variables that affect quote calculation:
+    /// - Mid price (rounded to tick)
+    /// - Inventory (rounded to 0.1)
+    /// - Volatility (rounded to 0.1 bps)
+    /// - Adverse selection (rounded to 0.1 bps)
+    /// - LOB imbalance (rounded to 0.01)
+    fn compute_state_hash(&self, state: &CurrentState) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        
+        let mut hasher = DefaultHasher::new();
+        
+        // Round values to avoid cache misses from tiny fluctuations
+        let mid_price_ticks = (state.l2_mid_price / 0.01).round() as i64;
+        let inventory_tenths = (state.position * 10.0).round() as i64;
+        let volatility_tenths = (self.state_vector.volatility_ema_bps * 10.0).round() as i64;
+        let adverse_selection_tenths = (self.state_vector.adverse_selection_estimate * 10.0).round() as i64;
+        let lob_imbalance_hundredths = (self.state_vector.lob_imbalance * 100.0).round() as i64;
+        
+        mid_price_ticks.hash(&mut hasher);
+        inventory_tenths.hash(&mut hasher);
+        volatility_tenths.hash(&mut hasher);
+        adverse_selection_tenths.hash(&mut hasher);
+        lob_imbalance_hundredths.hash(&mut hasher);
+        
+        hasher.finish()
     }
 
     /// Reconcile existing orders with target quotes

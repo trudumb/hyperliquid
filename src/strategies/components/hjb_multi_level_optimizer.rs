@@ -57,7 +57,31 @@ use crate::{
     HawkesFillModel, MultiLevelConfig, MultiLevelOptimizer, OptimizationState,
     ParameterUncertainty, RobustConfig, RobustParameters, TickLotValidator, EPSILON,
 };
+use crate::market_maker_v2::ConstrainedTuningParams;
 use super::quote_optimizer::{QuoteOptimizer, OptimizerInputs};
+
+/// Extended optimizer output with metadata.
+///
+/// In addition to the quotes, this includes:
+/// - Taker rates for urgent inventory management
+/// - Liquidation flag indicating extreme risk mode
+#[derive(Debug, Clone)]
+pub struct OptimizerOutput {
+    /// Target bid quotes: (price, size)
+    pub target_bids: Vec<(f64, f64)>,
+    
+    /// Target ask quotes: (price, size)
+    pub target_asks: Vec<(f64, f64)>,
+    
+    /// Taker buy rate (for reducing long inventory)
+    pub taker_buy_rate: f64,
+    
+    /// Taker sell rate (for reducing short inventory)
+    pub taker_sell_rate: f64,
+    
+    /// Liquidation mode flag
+    pub liquidate: bool,
+}
 
 /// HJB-based multi-level quote optimizer implementation.
 ///
@@ -73,11 +97,11 @@ pub struct HjbMultiLevelOptimizer {
     /// Tick/lot size validator for price/size rounding
     tick_lot_validator: TickLotValidator,
 
-    /// Asset being traded
-    asset: String,
-
     /// Maximum absolute position size
     max_position_size: f64,
+    
+    /// Tuning parameters (constrained, i.e., theta space)
+    tuning_params: ConstrainedTuningParams,
 }
 
 impl HjbMultiLevelOptimizer {
@@ -88,12 +112,15 @@ impl HjbMultiLevelOptimizer {
     /// - Standard robust config (robustness level 0.5)
     /// - Asset: "HYPE"
     /// - Max position: 50.0
+    /// - Default tuning parameters
     pub fn new_default() -> Self {
+        use crate::market_maker_v2::TuningParams;
         Self::new(
             MultiLevelConfig::default(),
             RobustConfig::default(),
             "HYPE".to_string(),
             50.0,
+            TuningParams::default().get_constrained(),
         )
     }
 
@@ -104,11 +131,13 @@ impl HjbMultiLevelOptimizer {
     /// - `robust_config`: Configuration for robust control
     /// - `asset`: Asset symbol (for tick/lot validation)
     /// - `max_position_size`: Maximum absolute position size
+    /// - `tuning_params`: Constrained tuning parameters (theta space)
     pub fn new(
         multi_level_config: MultiLevelConfig,
         robust_config: RobustConfig,
         asset: String,
         max_position_size: f64,
+        tuning_params: ConstrainedTuningParams,
     ) -> Self {
         let multi_level_optimizer = MultiLevelOptimizer::new(multi_level_config);
 
@@ -123,9 +152,19 @@ impl HjbMultiLevelOptimizer {
             multi_level_optimizer,
             robust_config,
             tick_lot_validator,
-            asset,
             max_position_size,
+            tuning_params,
         }
+    }
+    
+    /// Update tuning parameters (for online tuning)
+    pub fn set_tuning_params(&mut self, tuning_params: ConstrainedTuningParams) {
+        self.tuning_params = tuning_params;
+    }
+    
+    /// Get current tuning parameters
+    pub fn get_tuning_params(&self) -> &ConstrainedTuningParams {
+        &self.tuning_params
     }
 
     /// Create a new HJB multi-level optimizer from JSON config.
@@ -136,10 +175,13 @@ impl HjbMultiLevelOptimizer {
     ///   "asset": "HYPE",
     ///   "max_position_size": 50.0,
     ///   "multi_level_config": { ... },
-    ///   "robust_config": { ... }
+    ///   "robust_config": { ... },
+    ///   "tuning_params": { ... }
     /// }
     /// ```
     pub fn from_json(config: &Value) -> Self {
+        use crate::market_maker_v2::TuningParams;
+        
         let asset = config.get("asset")
             .and_then(|v| v.as_str())
             .unwrap_or("HYPE")
@@ -156,8 +198,13 @@ impl HjbMultiLevelOptimizer {
         let robust_config = config.get("robust_config")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_else(|| RobustConfig::default());
+        
+        let tuning_params = config.get("tuning_params")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .map(|tp: TuningParams| tp.get_constrained())
+            .unwrap_or_else(|| TuningParams::default().get_constrained());
 
-        Self::new(multi_level_config, robust_config, asset, max_position_size)
+        Self::new(multi_level_config, robust_config, asset, max_position_size, tuning_params)
     }
 }
 
@@ -168,6 +215,22 @@ impl QuoteOptimizer for HjbMultiLevelOptimizer {
         state: &CurrentState,
         fill_model: &HawkesFillModel,
     ) -> (Vec<(f64, f64)>, Vec<(f64, f64)>) {
+        let output = self.calculate_target_quotes_with_metadata(inputs, state, fill_model);
+        (output.target_bids, output.target_asks)
+    }
+}
+
+impl HjbMultiLevelOptimizer {
+    /// Calculate target quotes with additional metadata (taker rates, liquidation flag).
+    ///
+    /// This extended method returns all the information from the multi-level optimizer,
+    /// not just the quotes. Use this when you need taker rates or liquidation signals.
+    pub fn calculate_target_quotes_with_metadata(
+        &self,
+        inputs: &OptimizerInputs,
+        state: &CurrentState,
+        fill_model: &HawkesFillModel,
+    ) -> OptimizerOutput {
         // 1. Compute parameter uncertainty from volatility uncertainty
         let current_uncertainty = ParameterUncertainty::from_particle_filter_stats(
             0.0,  // mu_std (not used currently)
@@ -203,13 +266,11 @@ impl QuoteOptimizer for HjbMultiLevelOptimizer {
             * robust_params.spread_multiplier;
 
         // 5. Run multi-level optimization
-        // TODO: Get tuning params from somewhere (for now, use defaults)
-        let tuning_params = crate::market_maker_v2::TuningParams::default().get_constrained();
-
+        // Use the stored tuning params instead of defaults
         let multi_level_control = self.multi_level_optimizer.optimize(
             &opt_state,
             robust_base_half_spread,
-            &tuning_params,
+            &self.tuning_params,
         );
 
         // 6. Convert offsets to prices
@@ -258,6 +319,12 @@ impl QuoteOptimizer for HjbMultiLevelOptimizer {
         target_bids.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
         target_asks.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
-        (target_bids, target_asks)
+        OptimizerOutput {
+            target_bids,
+            target_asks,
+            taker_buy_rate: multi_level_control.taker_buy_rate,
+            taker_sell_rate: multi_level_control.taker_sell_rate,
+            liquidate: multi_level_control.liquidate,
+        }
     }
 }

@@ -5,6 +5,9 @@
 // This component uses stochastic gradient descent (SGD) to learn a linear
 // model that predicts short-term price drift from microstructure features.
 //
+// Ported from market_maker_v2.rs OnlineAdverseSelectionModel to be a
+// pluggable component implementing the AdverseSelectionModel trait.
+//
 // # Model
 //
 // The model learns weights W = [w_bias, w_trade_flow, w_lob_imb, w_spread, w_vol]
@@ -35,14 +38,13 @@
 // - Bottou, L. (2010). "Large-Scale Machine Learning with Stochastic Gradient Descent"
 // - Welford, B. P. (1962). "Note on a Method for Calculating Corrected Sums of Squares and Products"
 
-use crate::{
-    strategy::MarketUpdate,
-    strategies::components::AdverseSelectionModel,
-};
+use crate::strategy::MarketUpdate;
+use super::adverse_selection::AdverseSelectionModel;
 use log::info;
 use std::collections::VecDeque;
 
 /// Internal state representation extracted from market updates
+/// This mirrors the StateVector structure from market_maker_v2.rs
 #[derive(Clone, Debug)]
 struct InternalState {
     mid_price: f64,
@@ -60,87 +62,101 @@ impl Default for InternalState {
             trade_flow_ema: 0.0,
             lob_imbalance: 0.5, // Neutral
             market_spread_bps: 0.0,
-            volatility_ema_bps: 0.0,
+            volatility_ema_bps: 10.0, // Default to 10 bps
             previous_mid_price: 0.0,
         }
     }
 }
 
-/// Online SGD-based adverse selection model
+/// Online Linear Regression Model for Adverse Selection Estimation
+/// Uses Stochastic Gradient Descent (SGD) to learn feature weights from observed price changes
+/// This replaces the fixed 80/20 heuristic with a data-driven model that adapts to market conditions
+/// 
+/// PORTED FROM: market_maker_v2.rs OnlineAdverseSelectionModel
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OnlineSgdAsModel {
-    /// Current internal state
+    /// Regression weights: W = [w_bias, w_trade_flow, w_lob_imb, w_spread, w_vol]
+    /// These weights are learned via SGD to predict short-term price drift
+    pub weights: Vec<f64>,
+    
+    /// Learning rate for SGD updates (default: 0.001)
+    /// Controls how quickly the model adapts to new observations
+    pub learning_rate: f64,
+    
+    /// Number of ticks to wait before computing actual price change for training
+    /// E.g., lookback_ticks=10 means we predict S_{t+10} - S_t
+    pub lookback_ticks: usize,
+    
+    /// Observation buffer: stores (features, mid_price) for delayed label computation
+    /// Implemented as circular buffer with fixed capacity
+    pub observation_buffer: VecDeque<(Vec<f64>, f64)>,
+    
+    /// Maximum buffer capacity (should be >= lookback_ticks)
+    pub buffer_capacity: usize,
+    
+    /// Enable/disable online learning (default: true)
+    /// When false, model uses fixed weights without updates
+    pub enable_learning: bool,
+    
+    /// Count of SGD updates performed (for monitoring)
+    pub update_count: usize,
+    
+    /// Running average of prediction error (MAE) for monitoring
+    pub mean_absolute_error: f64,
+    
+    /// Decay factor for MAE averaging (0.99 = slow decay)
+    pub mae_decay: f64,
+    
+    /// Welford's algorithm for online mean/variance
+    /// [ (count, mean, M2), (count, mean, M2), ... ]
+    /// We skip the bias term (index 0) - only normalize the 4 actual features
+    pub feature_stats: Vec<(f64, f64, f64)>,
+
+    /// Internal state tracked from market updates (non-serialized)
+    #[serde(skip)]
     state: InternalState,
 
-    /// Regression weights: W = [w_bias, w_trade_flow, w_lob_imb, w_spread, w_vol]
-    weights: Vec<f64>,
-
-    /// Learning rate for SGD updates
-    learning_rate: f64,
-
-    /// Number of ticks to wait before computing actual price change
-    lookback_ticks: usize,
-
-    /// Observation buffer: stores (features, mid_price) for delayed label computation
-    observation_buffer: VecDeque<(Vec<f64>, f64)>,
-
-    /// Maximum buffer capacity
-    buffer_capacity: usize,
-
-    /// Enable/disable online learning
-    enable_learning: bool,
-
-    /// Count of SGD updates performed
-    update_count: usize,
-
-    /// Running average of prediction error (MAE)
-    mean_absolute_error: f64,
-
-    /// Decay factor for MAE averaging
-    mae_decay: f64,
-
-    /// Welford's algorithm for online mean/variance
-    /// [(count, mean, M2), ...] for each feature
-    feature_stats: Vec<(f64, f64, f64)>,
-
-    /// EMA alpha for trade flow and volatility
+    /// EMA alpha for smoothing (non-serialized)
+    #[serde(skip)]
     ema_alpha: f64,
 
-    /// Volatility calculation window (for realized vol estimation)
-    volatility_window_secs: f64,
+    /// Last update time for volatility calculation (non-serialized)
+    #[serde(skip)]
     last_update_time: Option<std::time::Instant>,
 }
 
 impl Default for OnlineSgdAsModel {
     fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl OnlineSgdAsModel {
-    /// Create a new online SGD adverse selection model
-    pub fn new() -> Self {
         Self {
-            state: InternalState::default(),
-            // Initialize weights based on 80/20 heuristic knowledge
-            weights: vec![0.0, 0.4, 0.1, -0.05, 0.02],
+            // Initialize weights to small random values to break symmetry
+            // [bias, trade_flow, lob_imbalance, market_spread, volatility]
+            weights: vec![0.0, 0.4, 0.1, -0.05, 0.02], // Reasonable starting point based on 80/20 heuristic
             learning_rate: 0.001,
-            lookback_ticks: 10, // Predict 10 ticks ahead
+            lookback_ticks: 10, // Predict 10 ticks ahead (~10 seconds)
             observation_buffer: VecDeque::with_capacity(100),
             buffer_capacity: 100,
             enable_learning: true,
             update_count: 0,
             mean_absolute_error: 0.0,
             mae_decay: 0.99,
-            feature_stats: vec![(0.0, 0.0, 0.0); 4], // 4 features (bias not normalized)
+            // 4 features (bias term is not normalized)
+            feature_stats: vec![(0.0, 0.0, 0.0); 4],
+            state: InternalState::default(),
             ema_alpha: 0.1,
-            volatility_window_secs: 60.0,
             last_update_time: None,
         }
     }
+}
 
-    /// Create new model (alias for new())
+impl OnlineSgdAsModel {
+    /// Create a new online SGD adverse selection model
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create new model (alias for default)
     pub fn new_default() -> Self {
-        Self::new()
+        Self::default()
     }
 
     /// Create with custom parameters
@@ -154,28 +170,24 @@ impl OnlineSgdAsModel {
             lookback_ticks,
             buffer_capacity,
             observation_buffer: VecDeque::with_capacity(buffer_capacity),
-            ..Self::new()
+            ..Self::default()
         }
     }
 
-    /// Extract features from current state
-    fn get_raw_features(&self) -> Vec<f64> {
-        vec![
+    /// Update running feature statistics using Welford's online algorithm
+    /// This should be called once per tick BEFORE predict/record_observation
+    pub fn update_feature_stats(&mut self) {
+        let raw_features = vec![
             self.state.trade_flow_ema,
-            self.state.lob_imbalance - 0.5, // Center around 0
+            self.state.lob_imbalance - 0.5,
             self.state.market_spread_bps,
             self.state.volatility_ema_bps,
-        ]
-    }
-
-    /// Update running feature statistics using Welford's online algorithm
-    fn update_feature_stats(&mut self) {
-        let raw_features = self.get_raw_features();
+        ];
 
         for i in 0..raw_features.len() {
             let x = raw_features[i];
 
-            // Welford's online algorithm for mean and variance
+            // Welford's online algorithm
             let (count, mean, m2) = &mut self.feature_stats[i];
             *count += 1.0;
             let delta = x - *mean;
@@ -186,8 +198,15 @@ impl OnlineSgdAsModel {
     }
 
     /// Get normalized features using current statistics
+    /// Does NOT update stats - use update_feature_stats() first
     fn get_normalized_features(&self) -> Vec<f64> {
-        let raw_features = self.get_raw_features();
+        let raw_features = vec![
+            self.state.trade_flow_ema,
+            self.state.lob_imbalance - 0.5,
+            self.state.market_spread_bps,
+            self.state.volatility_ema_bps,
+        ];
+
         let mut normalized_features = vec![1.0]; // Start with bias term
 
         for i in 0..raw_features.len() {
@@ -196,7 +215,7 @@ impl OnlineSgdAsModel {
 
             // Get variance and std_dev from current stats
             let (mean, std_dev) = if *count < 2.0 {
-                (0.0, 1.0) // Not enough data, pass through
+                (0.0, 1.0) // Not enough data, just pass through (or return 0.0)
             } else {
                 let variance = *m2 / (*count - 1.0);
                 let std_dev = variance.sqrt().max(1e-6); // Avoid div by zero
@@ -209,45 +228,47 @@ impl OnlineSgdAsModel {
 
         normalized_features // Returns [1.0, z_flow, z_imb, z_spread, z_vol]
     }
-
-    /// Predict short-term price drift
-    fn predict(&self) -> f64 {
+    
+    /// Predict short-term price drift: μ_hat = W · X_t
+    /// Returns prediction in basis points (positive = bullish, negative = bearish)
+    /// NOTE: Call update_feature_stats() first to ensure stats are current
+    pub fn predict(&self) -> f64 {
         let features = self.get_normalized_features();
-
+        
         // Dot product: prediction = sum(w_i * x_i)
         self.weights.iter()
             .zip(features.iter())
             .map(|(w, x)| w * x)
             .sum()
     }
-
+    
     /// Record observation for delayed SGD update
-    fn record_observation(&mut self) {
+    /// Stores (features, mid_price) in circular buffer
+    /// NOTE: Call update_feature_stats() first to ensure stats are current
+    pub fn record_observation(&mut self, mid_price: f64) {
         let features = self.get_normalized_features();
-        let mid_price = self.state.mid_price;
-
+        
         // Add to buffer
         self.observation_buffer.push_back((features, mid_price));
-
-        // Maintain buffer capacity
+        
+        // Maintain buffer capacity (remove oldest if full)
         if self.observation_buffer.len() > self.buffer_capacity {
             self.observation_buffer.pop_front();
         }
     }
-
-    /// Perform SGD update with delayed labels
-    fn sgd_update(&mut self) {
+    
+    /// Perform SGD update if enough observations are available
+    /// Computes actual price change from lookback_ticks ago and updates weights
+    pub fn update(&mut self, current_mid_price: f64) {
         if !self.enable_learning {
             return;
         }
-
-        // Need at least lookback_ticks observations
+        
+        // Need at least lookback_ticks observations to compute actual price change
         if self.observation_buffer.len() <= self.lookback_ticks {
             return;
         }
-
-        let current_mid_price = self.state.mid_price;
-
+        
         // Get observation from lookback_ticks ago
         let lookback_idx = self.observation_buffer.len() - self.lookback_ticks - 1;
         if let Some((features, old_mid_price)) = self.observation_buffer.get(lookback_idx) {
@@ -257,40 +278,55 @@ impl OnlineSgdAsModel {
             } else {
                 0.0
             };
-
+            
             // Compute prediction from old features
             let predicted_change_bps: f64 = self.weights.iter()
                 .zip(features.iter())
                 .map(|(w, x)| w * x)
                 .sum();
-
+            
             // Compute prediction error
             let error = predicted_change_bps - actual_change_bps;
-
+            
             // Update MAE for monitoring
             let abs_error = error.abs();
             if self.update_count == 0 {
                 self.mean_absolute_error = abs_error;
             } else {
-                self.mean_absolute_error = self.mae_decay * self.mean_absolute_error
+                self.mean_absolute_error = self.mae_decay * self.mean_absolute_error 
                     + (1.0 - self.mae_decay) * abs_error;
             }
-
+            
             // SGD update: W = W - learning_rate * error * X
+            // This is gradient descent on squared error: L = (y_pred - y_actual)^2
+            // ∇L = 2 * (y_pred - y_actual) * X, but we absorb the 2 into learning_rate
             for i in 0..self.weights.len() {
                 self.weights[i] -= self.learning_rate * error * features[i];
             }
-
+            
             self.update_count += 1;
-
-            // Log update every 100 iterations
+            
+            // Log update every 100 iterations for monitoring
             if self.update_count % 100 == 0 {
                 info!(
-                    "Online AS Model Update #{}: MAE={:.4}bps, Weights={:?}",
+                    "Online Adverse Selection Model Update #{}: MAE={:.4}bps, Weights={:?}",
                     self.update_count, self.mean_absolute_error, self.weights
                 );
             }
         }
+    }
+    
+    /// Get current model statistics for logging/monitoring
+    pub fn get_stats(&self) -> String {
+        format!(
+            "OnlineModel[updates={}, MAE={:.4}bps, lr={:.6}, enabled={}]",
+            self.update_count, self.mean_absolute_error, self.learning_rate, self.enable_learning
+        )
+    }
+    
+    /// Reset model to initial state (useful for regime changes)
+    pub fn reset(&mut self) {
+        *self = Self::default();
     }
 
     /// Update internal state from market update
@@ -364,29 +400,18 @@ impl OnlineSgdAsModel {
         // Update trade flow from trades
         if !update.trades.is_empty() {
             for trade in &update.trades {
-                // +1 for taker buy (bullish), -1 for taker sell (bearish)
-                let flow_signal = if trade.side == "buy" { 1.0 } else { -1.0 };
+                // Trade side: "A" = taker hit ask (bullish), "B" = taker hit bid (bearish)
+                // Note: market_maker_v2.rs uses "A" for ask and "B" for bid
+                let flow_signal = if trade.side == "A" { 1.0 } else { -1.0 };
 
                 // EMA update
-                if self.update_count > 0 {
-                    self.state.trade_flow_ema =
-                        self.ema_alpha * flow_signal +
-                        (1.0 - self.ema_alpha) * self.state.trade_flow_ema;
-                } else {
-                    self.state.trade_flow_ema = flow_signal;
-                }
+                self.state.trade_flow_ema =
+                    self.ema_alpha * flow_signal +
+                    (1.0 - self.ema_alpha) * self.state.trade_flow_ema;
             }
         }
 
         self.last_update_time = Some(now);
-    }
-
-    /// Get model statistics for logging/monitoring
-    pub fn get_stats(&self) -> String {
-        format!(
-            "OnlineModel[updates={}, MAE={:.4}bps, lr={:.6}, enabled={}]",
-            self.update_count, self.mean_absolute_error, self.learning_rate, self.enable_learning
-        )
     }
 }
 
@@ -395,22 +420,24 @@ impl AdverseSelectionModel for OnlineSgdAsModel {
         // Update internal state from market update
         self.update_state(update);
 
+        // Only proceed if we have a valid mid-price
+        if self.state.mid_price <= 0.0 {
+            return;
+        }
+
         // Update feature statistics
         self.update_feature_stats();
 
         // Record current observation for delayed learning
-        self.record_observation();
+        self.record_observation(self.state.mid_price);
 
         // Perform SGD update with delayed labels
-        self.sgd_update();
+        self.update(self.state.mid_price);
     }
 
     fn get_adverse_selection_bps(&self) -> f64 {
-        // Return current prediction
-        let prediction = self.predict();
-
-        // Clamp to reasonable bounds to prevent extreme values
-        prediction.clamp(-100.0, 100.0)
+        // Return current prediction (clamped to reasonable bounds)
+        self.predict().clamp(-100.0, 100.0)
     }
 }
 

@@ -58,4 +58,4 @@ pub use quote_optimizer::{QuoteOptimizer, OptimizerInputs};
 pub use particle_filter_vol::ParticleFilterVolModel;
 pub use hawkes_fill_model::HawkesFillModelImpl;
 pub use online_sgd_as::OnlineSgdAsModel;
-pub use hjb_multi_level_optimizer::HjbMultiLevelOptimizer;
+pub use hjb_multi_level_optimizer::{HjbMultiLevelOptimizer, OptimizerOutput};
