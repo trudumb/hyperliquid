@@ -107,7 +107,18 @@ impl ExchangeClient {
         meta: Option<Meta>,
         vault_address: Option<Address>,
     ) -> Result<ExchangeClient> {
-        let client = client.unwrap_or_default();
+        let client = client.unwrap_or_else(|| {
+            // Create optimized HTTP client for high-frequency trading
+            Client::builder()
+                .timeout(std::time::Duration::from_secs(30))  // Request timeout
+                .connect_timeout(std::time::Duration::from_secs(10))  // Connection timeout
+                .pool_idle_timeout(std::time::Duration::from_secs(90))  // Keep connections alive
+                .pool_max_idle_per_host(10)  // Connection pool size per host
+                .tcp_keepalive(std::time::Duration::from_secs(60))  // TCP keepalive
+                .http2_keep_alive_interval(Some(std::time::Duration::from_secs(30)))  // HTTP/2 keepalive
+                .build()
+                .unwrap_or_default()  // Fallback to default if builder fails
+        });
         let base_url = base_url.unwrap_or(BaseUrl::Mainnet);
 
         let info = InfoClient::new(None, Some(base_url)).await?;
