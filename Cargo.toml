@@ -19,6 +19,7 @@ alloy = { version = "1.0", default-features = false, features = [
 ] }
 chrono = "0.4.26"
 env_logger = "0.11.8"
+futures = "0.3.28"  # For parallel execution utilities
 futures-util = "0.3.28"
 lazy_static = "1.0"
 log = "0.4.19"
@@ -42,3 +43,6 @@ tracing-appender = "0.2"
 parking_lot = "0.12"  # Faster RwLock implementation
 ratatui = "0.29"
 crossterm = "0.28"
+bytes = "1.0"  # Zero-copy buffer management for HFT optimizations
+crossbeam = "0.8"  # Lock-free data structures for HFT
+flume = "0.11"  # Faster than tokio::mpsc for message passing

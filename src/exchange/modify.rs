@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{order::OrderRequest, ClientOrderRequest};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ClientModifyRequest {
     pub oid: u64,
     pub order: ClientOrderRequest,

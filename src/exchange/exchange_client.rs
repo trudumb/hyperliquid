@@ -108,14 +108,32 @@ impl ExchangeClient {
         vault_address: Option<Address>,
     ) -> Result<ExchangeClient> {
         let client = client.unwrap_or_else(|| {
-            // Create optimized HTTP client for high-frequency trading
+            // Ultra-low latency HTTP client optimized for high-frequency trading
             Client::builder()
-                .timeout(std::time::Duration::from_secs(30))  // Request timeout
-                .connect_timeout(std::time::Duration::from_secs(10))  // Connection timeout
-                .pool_idle_timeout(std::time::Duration::from_secs(90))  // Keep connections alive
-                .pool_max_idle_per_host(10)  // Connection pool size per host
-                .tcp_keepalive(std::time::Duration::from_secs(60))  // TCP keepalive
-                .http2_keep_alive_interval(Some(std::time::Duration::from_secs(30)))  // HTTP/2 keepalive
+                // Ultra-low latency timeout settings
+                .timeout(std::time::Duration::from_millis(500))  // 500ms max request timeout
+                .connect_timeout(std::time::Duration::from_millis(200))  // Fast connection establishment
+
+                // Aggressive connection pooling for reuse
+                .pool_idle_timeout(std::time::Duration::from_secs(120))  // Keep connections alive longer
+                .pool_max_idle_per_host(50)  // More connections per host for parallel requests
+
+                // TCP optimizations for minimal latency
+                .tcp_keepalive(std::time::Duration::from_secs(30))  // More frequent TCP keepalive
+                .tcp_nodelay(true)  // CRITICAL: Disable Nagle's algorithm for immediate transmission
+
+                // HTTP/2 optimizations with flow control
+                .http2_keep_alive_interval(Some(std::time::Duration::from_secs(15)))  // Frequent keepalive pings
+                .http2_keep_alive_timeout(std::time::Duration::from_secs(5))  // Fast timeout detection
+                .http2_keep_alive_while_idle(true)  // Keep connections alive even when idle
+                .http2_adaptive_window(true)  // Adaptive flow control for better throughput
+                .http2_initial_stream_window_size(Some(2 * 1024 * 1024))  // 2MB stream window
+                .http2_initial_connection_window_size(Some(4 * 1024 * 1024))  // 4MB connection window
+
+                // Disable unnecessary features that add latency
+                .redirect(reqwest::redirect::Policy::none())  // No automatic redirects
+                .referer(false)  // Don't send referer header
+
                 .build()
                 .unwrap_or_default()  // Fallback to default if builder fails
         });
