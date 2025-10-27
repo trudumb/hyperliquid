@@ -8,7 +8,6 @@ mod hawkes_multi_level;
 mod helpers;
 mod info;
 mod inventory_skew;
-pub mod market_maker_v2; // Legacy v2 implementation (to be removed)
 mod meta;
 pub mod strategy;
 pub mod strategies;

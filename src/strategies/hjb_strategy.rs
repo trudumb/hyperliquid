@@ -57,7 +57,7 @@ use crate::strategies::components::{
 // Import HJB implementation details from the sibling hjb_impl module
 // ----------------------------------------------------------------------------
 use super::hjb_impl::{
-    AdamOptimizerState, CachedVolatilityEstimate, ControlVector, HJBComponents,
+    AdamOptimizerState, CachedVolatilityEstimate, HJBComponents,
     OnlineAdverseSelectionModel, StateVector, TuningParams, ValueFunction,
 };
 
@@ -301,24 +301,13 @@ impl Strategy for HjbStrategy {
             .unwrap_or_else(|| MultiLevelConfig::default());
 
         // Initialize the component-based quote optimizer (before moving multi_level_config)
-        // Convert tuning params from hjb_impl type to market_maker_v2 type
         let default_tuning_params = TuningParams::default().get_constrained();
-        let converted_default_params = crate::market_maker_v2::ConstrainedTuningParams {
-            skew_adjustment_factor: default_tuning_params.skew_adjustment_factor,
-            adverse_selection_adjustment_factor: default_tuning_params.adverse_selection_adjustment_factor,
-            adverse_selection_lambda: default_tuning_params.adverse_selection_lambda,
-            inventory_urgency_threshold: default_tuning_params.inventory_urgency_threshold,
-            liquidation_rate_multiplier: default_tuning_params.liquidation_rate_multiplier,
-            min_spread_base_ratio: default_tuning_params.min_spread_base_ratio,
-            adverse_selection_spread_scale: default_tuning_params.adverse_selection_spread_scale,
-            control_gap_threshold: default_tuning_params.control_gap_threshold,
-        };
         let quote_optimizer = HjbMultiLevelOptimizer::new(
             multi_level_config.clone(),
             robust_config.clone(),
             strategy_config.asset.clone(),
             strategy_config.max_absolute_position_size,
-            converted_default_params,
+            default_tuning_params,
         );
 
         let multi_level_optimizer = MultiLevelOptimizer::new(multi_level_config);
@@ -549,23 +538,6 @@ impl Strategy for HjbStrategy {
 // ============================================================================
 
 impl HjbStrategy {
-    /// Convert from hjb_impl::ConstrainedTuningParams to market_maker_v2::ConstrainedTuningParams
-    ///
-    /// TODO: Remove this once the type duplication is resolved
-    fn convert_tuning_params(
-        params: &super::hjb_impl::ConstrainedTuningParams,
-    ) -> crate::market_maker_v2::ConstrainedTuningParams {
-        crate::market_maker_v2::ConstrainedTuningParams {
-            skew_adjustment_factor: params.skew_adjustment_factor,
-            adverse_selection_adjustment_factor: params.adverse_selection_adjustment_factor,
-            adverse_selection_lambda: params.adverse_selection_lambda,
-            inventory_urgency_threshold: params.inventory_urgency_threshold,
-            liquidation_rate_multiplier: params.liquidation_rate_multiplier,
-            min_spread_base_ratio: params.min_spread_base_ratio,
-            adverse_selection_spread_scale: params.adverse_selection_spread_scale,
-            control_gap_threshold: params.control_gap_threshold,
-        }
-    }
 
     /// Sync internal state vector with current bot state
     fn sync_state_vector(&mut self, state: &CurrentState) {
@@ -672,8 +644,7 @@ impl HjbStrategy {
         // --- COMPONENT CALL ---
         // Update the component's tuning params from the shared state
         let current_tuning_params = self.tuning_params.read().get_constrained();
-        let converted_params = Self::convert_tuning_params(&current_tuning_params);
-        self.quote_optimizer.set_tuning_params(converted_params);
+        self.quote_optimizer.set_tuning_params(current_tuning_params);
 
         // Call the component with metadata
         let hawkes_lock = self.hawkes_model.read();
