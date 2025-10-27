@@ -108,11 +108,11 @@ impl ExchangeClient {
         vault_address: Option<Address>,
     ) -> Result<ExchangeClient> {
         let client = client.unwrap_or_else(|| {
-            // Ultra-low latency HTTP client optimized for high-frequency trading
+            // Optimized HTTP client for high-frequency trading with reliable connectivity
             Client::builder()
-                // Ultra-low latency timeout settings
-                .timeout(std::time::Duration::from_millis(500))  // 500ms max request timeout
-                .connect_timeout(std::time::Duration::from_millis(200))  // Fast connection establishment
+                // Balanced timeout settings for reliability
+                .timeout(std::time::Duration::from_secs(5))  // 5s max request timeout (increased from 500ms)
+                .connect_timeout(std::time::Duration::from_secs(2))  // 2s connection establishment (increased from 200ms)
 
                 // Aggressive connection pooling for reuse
                 .pool_idle_timeout(std::time::Duration::from_secs(120))  // Keep connections alive longer
@@ -174,12 +174,6 @@ impl ExchangeClient {
         signature: Signature,
         nonce: u64,
     ) -> Result<ExchangeResponseStatus> {
-        // let signature = ExchangeSignature {
-        //     r: signature.r(),
-        //     s: signature.s(),
-        //     v: 27 + signature.v() as u64,
-        // };
-
         let exchange_payload = ExchangePayload {
             action,
             signature,
@@ -190,13 +184,43 @@ impl ExchangeClient {
             .map_err(|e| Error::JsonParse(e.to_string()))?;
         debug!("Sending request {res:?}");
 
-        let output = &self
-            .http_client
-            .post("/exchange", res)
-            .await
-            .map_err(|e| Error::JsonParse(e.to_string()))?;
-        debug!("Response: {output}");
-        serde_json::from_str(output).map_err(|e| Error::JsonParse(e.to_string()))
+        // Retry logic with exponential backoff for network errors
+        let max_retries = 3;
+        let mut last_error = None;
+
+        for attempt in 0..=max_retries {
+            match self.http_client.post("/exchange", res.clone()).await {
+                Ok(output) => {
+                    debug!("Response: {output}");
+                    return serde_json::from_str(&output)
+                        .map_err(|e| Error::JsonParse(e.to_string()));
+                }
+                Err(e) => {
+                    // Check if this is a network/timeout error that should be retried
+                    let should_retry = matches!(e, Error::GenericRequest(_));
+
+                    if should_retry && attempt < max_retries {
+                        let backoff_ms = 100 * (2_u64.pow(attempt as u32)); // 100ms, 200ms, 400ms
+                        debug!(
+                            "Request failed (attempt {}/{}): {}. Retrying in {}ms...",
+                            attempt + 1,
+                            max_retries + 1,
+                            e,
+                            backoff_ms
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                        last_error = Some(e);
+                        continue;
+                    }
+
+                    // Either not retryable or out of retries
+                    return Err(e);
+                }
+            }
+        }
+
+        // Should never reach here, but handle it anyway
+        Err(last_error.unwrap_or_else(|| Error::GenericRequest("Max retries exceeded".to_string())))
     }
 
     pub async fn enable_big_blocks(
