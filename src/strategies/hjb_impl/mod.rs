@@ -16,6 +16,6 @@ mod utils;
 
 // Publicly re-export the structs needed by hjb_strategy.rs
 pub use cache::CachedVolatilityEstimate;
-pub use models::OnlineAdverseSelectionModel;
+pub use models::{ControlVector, HJBComponents, OnlineAdverseSelectionModel, ValueFunction};
 pub use state::StateVector;
 pub use tuning::{AdamOptimizerState, ConstrainedTuningParams, TuningParams};

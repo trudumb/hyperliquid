@@ -34,6 +34,13 @@ pub mod components;
 // Private implementation module for HJB strategy
 mod hjb_impl;
 
+// Re-export core HJB types from the private implementation module
+// These are needed by users of the hjb_strategy and other modules
+pub use hjb_impl::{
+    ConstrainedTuningParams, ControlVector, HJBComponents,
+    OnlineAdverseSelectionModel, StateVector, TuningParams, ValueFunction,
+};
+
 // Future strategies can be added here:
 // pub mod grid_strategy;
 // pub mod momentum_strategy;

@@ -54,10 +54,10 @@ use serde_json::Value;
 
 use crate::strategy::CurrentState;
 use crate::{
-    HawkesFillModel, MultiLevelConfig, MultiLevelOptimizer, OptimizationState,
-    ParameterUncertainty, RobustConfig, RobustParameters, TickLotValidator, EPSILON,
+    ConstrainedTuningParams, HawkesFillModel, MultiLevelConfig, MultiLevelOptimizer,
+    OptimizationState, ParameterUncertainty, RobustConfig, RobustParameters,
+    TickLotValidator, EPSILON,
 };
-use crate::market_maker_v2::ConstrainedTuningParams;
 use super::quote_optimizer::{QuoteOptimizer, OptimizerInputs};
 
 /// Extended optimizer output with metadata.
@@ -114,7 +114,7 @@ impl HjbMultiLevelOptimizer {
     /// - Max position: 50.0
     /// - Default tuning parameters
     pub fn new_default() -> Self {
-        use crate::market_maker_v2::TuningParams;
+        use crate::TuningParams;
         Self::new(
             MultiLevelConfig::default(),
             RobustConfig::default(),
@@ -180,8 +180,8 @@ impl HjbMultiLevelOptimizer {
     /// }
     /// ```
     pub fn from_json(config: &Value) -> Self {
-        use crate::market_maker_v2::TuningParams;
-        
+        use crate::TuningParams;
+
         let asset = config.get("asset")
             .and_then(|v| v.as_str())
             .unwrap_or("HYPE")
