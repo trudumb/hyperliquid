@@ -6,6 +6,7 @@ mod exchange;
 mod helpers;
 mod info;
 mod meta;
+pub mod rate_limiter;
 pub mod strategy;
 pub mod strategies;
 mod prelude;
