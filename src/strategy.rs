@@ -254,70 +254,7 @@ impl Default for CurrentState {
 }
 
 // ============================================================================
-// 5. STRATEGY TUI METRICS - Strategy-specific data for dashboard display
-// ============================================================================
-
-/// Metrics from the strategy's internal state to display in the TUI.
-/// These are read-only snapshots of strategy internals (volatility, learning models, etc.)
-#[derive(Debug, Clone, Default)]
-pub struct StrategyTuiMetrics {
-    // ----- Volatility Estimation -----
-    /// EMA of realized volatility in basis points
-    pub volatility_ema_bps: f64,
-
-    // ----- Particle Filter Stats -----
-    /// Effective sample size (ESS) of particle filter
-    pub pf_ess: f64,
-
-    /// Maximum number of particles in the filter
-    pub pf_max_particles: usize,
-
-    /// 5th percentile of volatility distribution (bps)
-    pub pf_vol_5th: f64,
-
-    /// 95th percentile of volatility distribution (bps)
-    pub pf_vol_95th: f64,
-
-    /// Mean volatility from particle filter (bps)
-    pub pf_volatility_bps: f64,
-
-    // ----- Adverse Selection & Flow -----
-    /// Adverse selection estimate in basis points
-    pub adverse_selection_estimate: f64,
-
-    /// Trade flow EMA (positive = buying pressure)
-    pub trade_flow_ema: f64,
-
-    // ----- Online Learning Model -----
-    /// Mean absolute error of online model
-    pub online_model_mae: f64,
-
-    /// Number of model updates
-    pub online_model_updates: u64,
-
-    /// Current learning rate
-    pub online_model_lr: f64,
-
-    /// Whether online learning is enabled
-    pub online_model_enabled: bool,
-
-    // ----- Adam Optimizer (Self-Tuning) -----
-    /// Number of gradient samples collected
-    pub adam_gradient_samples: u64,
-
-    /// Average loss (for convergence monitoring)
-    pub adam_avg_loss: f64,
-
-    /// Seconds since last optimizer update
-    pub adam_last_update_secs: f64,
-
-    // ----- Performance Metrics -----
-    /// Sharpe ratio (annualized)
-    pub sharpe_ratio: f64,
-}
-
-// ============================================================================
-// 6. THE STRATEGY TRAIT - The "contract" all strategies must implement
+// 5. THE STRATEGY TRAIT - The "contract" all strategies must implement
 // ============================================================================
 
 /// The Strategy trait defines the interface that all trading strategies must implement.
@@ -500,20 +437,6 @@ pub trait Strategy: Send {
     /// Returns the type name (via std::any::type_name)
     fn name(&self) -> &str {
         std::any::type_name::<Self>()
-    }
-
-    /// (Optional) Return strategy-specific metrics for TUI display.
-    ///
-    /// This method exposes internal strategy state (volatility, learning models, etc.)
-    /// to the bot runner for dashboard visualization.
-    ///
-    /// # Returns
-    /// A snapshot of strategy metrics (volatility, particle filter stats, online learning, etc.)
-    ///
-    /// # Default Implementation
-    /// Returns empty/zero metrics (strategies without rich internals can skip this)
-    fn get_tui_metrics(&self) -> StrategyTuiMetrics {
-        StrategyTuiMetrics::default()
     }
 
     /// (Optional) Return the maximum absolute position size for this strategy.

@@ -40,7 +40,7 @@ use log::{debug, info};
 
 use serde_json::Value;
 
-use crate::strategy::{CurrentState, MarketUpdate, Strategy, StrategyAction, StrategyTuiMetrics, UserUpdate};
+use crate::strategy::{CurrentState, MarketUpdate, Strategy, StrategyAction, UserUpdate};
 use crate::{
     AssetType, ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest,
     HawkesFillModel, L2BookData, MultiLevelConfig,
@@ -475,80 +475,6 @@ impl Strategy for HjbStrategy {
 
     fn name(&self) -> &str {
         "HJB Strategy v2"
-    }
-
-    fn get_tui_metrics(&self) -> StrategyTuiMetrics {
-        // Read particle filter metrics
-        let pf = self.particle_filter.read();
-        let pf_ess = pf.get_effective_sample_size();
-        let pf_max_particles = pf.get_num_particles();
-        let pf_vol_5th = pf.estimate_volatility_percentile_bps(0.05);
-        let pf_vol_95th = pf.estimate_volatility_percentile_bps(0.95);
-        let pf_volatility_bps = pf.estimate_volatility_bps();
-        drop(pf);
-
-        // Read online model metrics
-        let model = self.online_adverse_selection_model.read();
-        let online_model_mae = model.mean_absolute_error;
-        let online_model_updates = model.update_count as u64;
-        let online_model_lr = model.learning_rate;
-        let online_model_enabled = model.enable_learning;
-        drop(model);
-
-        // Read Adam optimizer metrics
-        let adam = self.adam_optimizer.read();
-        let adam_gradient_samples = adam.t as u64;
-        // Calculate average loss from the optimizer's v (second moment)
-        let adam_avg_loss = if adam.t > 0 {
-            adam.v.iter().map(|&x| x.sqrt()).sum::<f64>() / adam.v.len() as f64
-        } else {
-            0.0
-        };
-        drop(adam);
-
-        // Calculate time since last update (for Adam)
-        let current_time = chrono::Utc::now().timestamp() as f64;
-        let cached_vol = self.cached_volatility.read();
-        let adam_last_update_secs = current_time - cached_vol.last_update_time;
-        drop(cached_vol);
-
-        // Calculate inventory penalty using value function
-        let _inventory_penalty = self.get_inventory_penalty();
-
-        // Log robust control parameters (uses robust_config)
-        if log::log_enabled!(log::Level::Debug) {
-            debug!(
-                "[TUI METRICS] Robust level: {:.2}, Taker smoothing: {:.3}/{:.3}, Last taker: {:.1}s/{:.1}s ago",
-                self.robust_config.robustness_level,
-                self.smoothed_taker_buy_rate,
-                self.smoothed_taker_sell_rate,
-                current_time - self.last_taker_buy_time,
-                current_time - self.last_taker_sell_time
-            );
-        }
-
-        // TODO: Calculate Sharpe ratio from historical returns
-        // For now, use a placeholder value
-        let sharpe_ratio = 0.0;
-
-        StrategyTuiMetrics {
-            volatility_ema_bps: self.state_vector.volatility_ema_bps,
-            pf_ess,
-            pf_max_particles,
-            pf_vol_5th,
-            pf_vol_95th,
-            pf_volatility_bps,
-            adverse_selection_estimate: self.state_vector.adverse_selection_estimate,
-            trade_flow_ema: self.state_vector.trade_flow_ema,
-            online_model_mae,
-            online_model_updates,
-            online_model_lr,
-            online_model_enabled,
-            adam_gradient_samples,
-            adam_avg_loss,
-            adam_last_update_secs,
-            sharpe_ratio,
-        }
     }
 
     fn get_max_position_size(&self) -> f64 {

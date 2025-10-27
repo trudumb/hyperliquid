@@ -89,7 +89,6 @@ use hyperliquid_rust_sdk::{
     TradeInfo, UserData, UserUpdate,
 };
 use hyperliquid_rust_sdk::strategies::hjb_strategy::HjbStrategy;
-use hyperliquid_rust_sdk::tui::state::DashboardState;
 
 use log::{error, info, warn};
 use std::collections::HashMap;
@@ -97,7 +96,6 @@ use std::env;
 use std::fs;
 use std::sync::Arc;
 use tokio::signal;
-use tokio::sync::watch;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 // ============================================================================
@@ -144,9 +142,6 @@ struct BotRunner {
     /// Current bot state (maintained by bot runner)
     current_state: CurrentState,
 
-    /// TUI dashboard state sender
-    tui_tx: watch::Sender<DashboardState>,
-
     /// Order tracking: cloid -> oid mapping
     cloid_to_oid: HashMap<uuid::Uuid, u64>,
 
@@ -167,7 +162,7 @@ impl BotRunner {
         strategy: Box<dyn Strategy>,
         wallet: PrivateKeySigner,
         tick_lot_validator: TickLotValidator,
-    ) -> Result<(Self, watch::Receiver<DashboardState>), Box<dyn std::error::Error>> {
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         // Initialize exchange client
         let exchange_client = Arc::new(
             ExchangeClient::new(None, wallet.clone(), Some(BaseUrl::Mainnet), None, None)
@@ -210,29 +205,22 @@ impl BotRunner {
             session_start_time: chrono::Utc::now().timestamp() as f64,
         };
 
-        // Create TUI state channel
-        let (tui_tx, tui_rx) = watch::channel(DashboardState::default());
-
         info!("✅ Bot Runner initialized for {} with strategy: {}", asset, strategy.name());
         info!("   Account Equity: ${:.2}", account_equity);
 
-        Ok((
-            Self {
-                asset,
-                strategy,
-                exchange_client,
-                info_client,
-                user_address,
-                tick_lot_validator,
-                current_state,
-                tui_tx,
-                cloid_to_oid: HashMap::new(),
-                pending_orders: HashMap::new(),
-                session_start_equity: account_equity,
-                total_messages: 0,
-            },
-            tui_rx,
-        ))
+        Ok(Self {
+            asset,
+            strategy,
+            exchange_client,
+            info_client,
+            user_address,
+            tick_lot_validator,
+            current_state,
+            cloid_to_oid: HashMap::new(),
+            pending_orders: HashMap::new(),
+            session_start_equity: account_equity,
+            total_messages: 0,
+        })
     }
 
     /// Start the bot runner event loop
@@ -339,9 +327,6 @@ impl BotRunner {
                 // Ignore other message types
             }
         }
-
-        // Update TUI after every message
-        self.update_tui();
     }
 
     /// Handle L2 order book updates
@@ -697,69 +682,6 @@ impl BotRunner {
         // Call strategy tick hook
         let actions = self.strategy.on_tick(&self.current_state);
         self.execute_actions(actions).await;
-
-        // Update TUI
-        self.update_tui();
-    }
-
-    /// Update TUI dashboard
-    fn update_tui(&self) {
-        // Get strategy-specific metrics
-        let strategy_metrics = self.strategy.get_tui_metrics();
-
-        let dashboard_state = DashboardState {
-            cur_position: self.current_state.position,
-            avg_entry_price: self.current_state.avg_entry_price,
-            unrealized_pnl: self.current_state.unrealized_pnl,
-            realized_pnl: self.current_state.realized_pnl,
-            total_fees: self.current_state.total_fees,
-            total_session_pnl: self.current_state.realized_pnl + self.current_state.unrealized_pnl - self.current_state.total_fees,
-            account_equity: self.current_state.account_equity,
-            session_start_equity: self.session_start_equity,
-            sharpe_ratio: strategy_metrics.sharpe_ratio,
-            l2_mid_price: self.current_state.l2_mid_price,
-            all_mids_price: self.current_state.l2_mid_price, // Using L2 mid as AllMids
-            market_spread_bps: self.current_state.market_spread_bps,
-            lob_imbalance: self.current_state.lob_imbalance,
-            volatility_ema_bps: strategy_metrics.volatility_ema_bps,
-            adverse_selection_estimate: strategy_metrics.adverse_selection_estimate,
-            trade_flow_ema: strategy_metrics.trade_flow_ema,
-            pf_ess: strategy_metrics.pf_ess,
-            pf_max_particles: strategy_metrics.pf_max_particles,
-            pf_vol_5th: strategy_metrics.pf_vol_5th,
-            pf_vol_95th: strategy_metrics.pf_vol_95th,
-            pf_volatility_bps: strategy_metrics.pf_volatility_bps,
-            online_model_mae: strategy_metrics.online_model_mae,
-            online_model_updates: strategy_metrics.online_model_updates as usize,
-            online_model_lr: strategy_metrics.online_model_lr,
-            online_model_enabled: strategy_metrics.online_model_enabled,
-            adam_gradient_samples: strategy_metrics.adam_gradient_samples as usize,
-            adam_avg_loss: strategy_metrics.adam_avg_loss,
-            adam_last_update_secs: strategy_metrics.adam_last_update_secs,
-            bid_levels: self.current_state.open_bids.iter().map(|o| {
-                hyperliquid_rust_sdk::tui::state::OrderLevel {
-                    side: "BID".to_string(),
-                    level: o.level,
-                    price: o.price,
-                    size: o.size,
-                    oid: o.oid,
-                }
-            }).collect(),
-            ask_levels: self.current_state.open_asks.iter().map(|o| {
-                hyperliquid_rust_sdk::tui::state::OrderLevel {
-                    side: "ASK".to_string(),
-                    level: o.level,
-                    price: o.price,
-                    size: o.size,
-                    oid: o.oid,
-                }
-            }).collect(),
-            recent_fills: Default::default(),
-            uptime_secs: (chrono::Utc::now().timestamp() as f64) - self.current_state.session_start_time,
-            total_messages: self.total_messages,
-        };
-
-        let _ = self.tui_tx.send(dashboard_state);
     }
 }
 
@@ -825,7 +747,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Create bot runner
-    let (mut bot_runner, tui_rx) = BotRunner::new(
+    let mut bot_runner = BotRunner::new(
         config.asset.clone(),
         strategy,
         wallet,
@@ -834,14 +756,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Set up shutdown signals
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let (tui_shutdown_tx, tui_shutdown_rx) = tokio::sync::oneshot::channel();
-
-    // Spawn TUI task
-    let tui_handle = tokio::spawn(async move {
-        if let Err(e) = hyperliquid_rust_sdk::tui::run_tui(tui_rx, tui_shutdown_rx).await {
-            eprintln!("TUI error: {}", e);
-        }
-    });
 
     // Set up Ctrl+C handler
     tokio::spawn(async move {
@@ -852,10 +766,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run bot runner
     bot_runner.run(shutdown_rx).await?;
-
-    // Shutdown TUI
-    let _ = tui_shutdown_tx.send(());
-    let _ = tui_handle.await;
 
     info!("Market Maker V3 shutdown complete");
     Ok(())
