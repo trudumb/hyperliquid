@@ -358,10 +358,13 @@ impl Strategy for HjbStrategy {
         // Initialize Adam optimizer
         let adam_optimizer = Arc::new(RwLock::new(AdamOptimizerState::default()));
 
-        // Trading disabled by default (enabled by optimizer)
-        let trading_enabled = Arc::new(RwLock::new(false));
+        // Trading enabled by default for v3 (can be disabled via config)
+        // In v2, this was controlled by the Adam optimizer, but for v3 we simplify
+        let trading_enabled_default = strategy_config.enable_online_learning; // Enable if online learning is on
+        let trading_enabled = Arc::new(RwLock::new(trading_enabled_default));
 
         info!("✅ Initialized HJB Strategy for {}", asset);
+        info!("   - Trading enabled: {}", trading_enabled_default);
         info!("   - Multi-level: {}", strategy_config.enable_multi_level);
         info!("   - Robust control: {}", strategy_config.enable_robust_control);
         info!("   - φ (inventory aversion): {}", strategy_config.phi);
