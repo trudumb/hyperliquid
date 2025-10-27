@@ -43,7 +43,7 @@ use serde_json::Value;
 use crate::strategy::{CurrentState, MarketUpdate, Strategy, StrategyAction, StrategyTuiMetrics, UserUpdate};
 use crate::{
     AssetType, ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest,
-    HawkesFillModel, L2BookData, MultiLevelConfig, MultiLevelOptimizer,
+    HawkesFillModel, L2BookData, MultiLevelConfig,
     OrderBook, ParameterUncertainty, ParticleFilterState,
     TickLotValidator, Trade, TradeInfo,
 };
@@ -218,10 +218,6 @@ pub struct HjbStrategy {
     /// Replaces the direct use of MultiLevelOptimizer
     quote_optimizer: HjbMultiLevelOptimizer,
 
-    /// Multi-level optimizer (DEPRECATED - kept for backward compatibility)
-    /// TODO: Remove once fully migrated to component
-    multi_level_optimizer: MultiLevelOptimizer,
-
     /// Hawkes process model for fill rate estimation
     hawkes_model: Arc<RwLock<HawkesFillModel>>,
 
@@ -325,8 +321,6 @@ impl Strategy for HjbStrategy {
             default_tuning_params,
         );
 
-        let multi_level_optimizer = MultiLevelOptimizer::new(multi_level_config);
-
         // Initialize particle filter for stochastic volatility
         // Parameters: num_particles, mu, phi, sigma_eta, initial_h, initial_h_std_dev, seed
         let particle_filter = Arc::new(RwLock::new(ParticleFilterState::new(
@@ -376,7 +370,6 @@ impl Strategy for HjbStrategy {
             hjb_components,
             value_function,
             quote_optimizer,
-            multi_level_optimizer,
             hawkes_model,
             particle_filter,
             online_adverse_selection_model,
@@ -519,6 +512,21 @@ impl Strategy for HjbStrategy {
         let adam_last_update_secs = current_time - cached_vol.last_update_time;
         drop(cached_vol);
 
+        // Calculate inventory penalty using value function
+        let _inventory_penalty = self.get_inventory_penalty();
+
+        // Log robust control parameters (uses robust_config)
+        if log::log_enabled!(log::Level::Debug) {
+            debug!(
+                "[TUI METRICS] Robust level: {:.2}, Taker smoothing: {:.3}/{:.3}, Last taker: {:.1}s/{:.1}s ago",
+                self.robust_config.robustness_level,
+                self.smoothed_taker_buy_rate,
+                self.smoothed_taker_sell_rate,
+                current_time - self.last_taker_buy_time,
+                current_time - self.last_taker_sell_time
+            );
+        }
+
         // TODO: Calculate Sharpe ratio from historical returns
         // For now, use a placeholder value
         let sharpe_ratio = 0.0;
@@ -587,10 +595,15 @@ impl HjbStrategy {
         // Update particle filter with new price observation
         let mut pf = self.particle_filter.write();
         pf.update(mid_price);
+        drop(pf);
 
         // Update online adverse selection model
         let mut model = self.online_adverse_selection_model.write();
         model.update(mid_price);
+        drop(model);
+
+        // Update uncertainty estimates from particle filter
+        self.update_uncertainty_estimates();
     }
 
     /// Handle fills (update Hawkes model)
@@ -674,10 +687,13 @@ impl HjbStrategy {
         // Store taker rates
         self.latest_taker_buy_rate = output.taker_buy_rate;
         self.latest_taker_sell_rate = output.taker_sell_rate;
-        
+
+        // Update smoothed taker rates (EMA with alpha=0.3)
+        self.update_smoothed_taker_rates(0.3);
+
         if output.liquidate {
             log::warn!("🚨 Liquidation mode triggered by optimizer!");
-            log::info!("   Taker rates: buy={:.4}, sell={:.4}", 
+            log::info!("   Taker rates: buy={:.4}, sell={:.4}",
                   self.latest_taker_buy_rate, self.latest_taker_sell_rate);
         }
 
@@ -823,5 +839,228 @@ impl HjbStrategy {
 
         debug!("[HJB STRATEGY] Reconcile: {} actions", actions.len());
         actions
+    }
+
+    /// Update uncertainty estimates from particle filter statistics.
+    ///
+    /// This method updates `current_uncertainty` with the latest parameter
+    /// uncertainty estimates from the particle filter and caches volatility
+    /// statistics for use in robust control.
+    fn update_uncertainty_estimates(&mut self) {
+        let pf = self.particle_filter.read();
+
+        // Extract volatility statistics
+        let volatility_bps = pf.estimate_volatility_bps();
+        let vol_5th_percentile = pf.estimate_volatility_percentile_bps(0.05);
+        let vol_95th_percentile = pf.estimate_volatility_percentile_bps(0.95);
+
+        // Estimate parameter standard deviations from particle spread
+        let volatility_std_dev_bps = (vol_95th_percentile - vol_5th_percentile) / 3.29; // ~90% confidence interval / 3.29 ≈ std dev
+
+        // Update cached volatility with all fields
+        let current_time = chrono::Utc::now().timestamp() as f64;
+        let mut cached_vol = self.cached_volatility.write();
+        cached_vol.volatility_bps = volatility_bps;
+        cached_vol.vol_5th_percentile = vol_5th_percentile;
+        cached_vol.vol_95th_percentile = vol_95th_percentile;
+        cached_vol.volatility_std_dev_bps = volatility_std_dev_bps;
+        cached_vol.last_update_time = current_time;
+
+        // Estimate parameter uncertainties for robust control
+        // These represent the radius of the uncertainty set around point estimates
+        let mu_uncertainty = self.state_vector.adverse_selection_estimate * 0.2; // 20% uncertainty
+        let sigma_uncertainty = volatility_std_dev_bps;
+        let kappa_uncertainty = 0.05; // 5% uncertainty in fill rates
+
+        cached_vol.param_std_devs = (mu_uncertainty, sigma_uncertainty, kappa_uncertainty);
+        drop(cached_vol);
+
+        drop(pf);
+
+        // Update current_uncertainty for robust control
+        self.current_uncertainty = ParameterUncertainty {
+            epsilon_mu: mu_uncertainty,
+            epsilon_sigma: sigma_uncertainty,
+            confidence: 0.95,
+        };
+
+        debug!(
+            "[UNCERTAINTY UPDATE] σ: {:.2} bps (±{:.2}), μ: {:.2} bps (±{:.2})",
+            volatility_bps, sigma_uncertainty,
+            self.state_vector.adverse_selection_estimate, mu_uncertainty
+        );
+    }
+
+    /// Calculate the value function penalty for current inventory.
+    ///
+    /// Returns the utility penalty (negative value) for holding the current
+    /// inventory position. This uses the HJB value function V(Q, t).
+    ///
+    /// The value function represents the maximum expected terminal wealth from
+    /// the current state. A negative value indicates inventory risk.
+    fn get_inventory_penalty(&self) -> f64 {
+        // V(Q, state) evaluates the value function given current inventory and state
+        self.value_function.evaluate(self.state_vector.inventory, &self.state_vector)
+    }
+
+    /// Update smoothed taker rates using exponential moving average.
+    ///
+    /// This smooths the taker buy/sell rates from the optimizer to avoid
+    /// rapid changes that could cause excessive taker executions.
+    fn update_smoothed_taker_rates(&mut self, alpha: f64) {
+        // EMA: smoothed = α * new + (1 - α) * old
+        self.smoothed_taker_buy_rate =
+            alpha * self.latest_taker_buy_rate + (1.0 - alpha) * self.smoothed_taker_buy_rate;
+        self.smoothed_taker_sell_rate =
+            alpha * self.latest_taker_sell_rate + (1.0 - alpha) * self.smoothed_taker_sell_rate;
+    }
+
+    /// Check if we should execute a taker order based on rate limiting.
+    ///
+    /// Returns true if enough time has passed since the last taker execution
+    /// and the smoothed taker rate is above the threshold.
+    ///
+    /// # Arguments
+    /// - `is_buy`: true for taker buy (to reduce long), false for taker sell (to reduce short)
+    /// - `min_interval_sec`: minimum seconds between taker executions
+    /// - `rate_threshold`: minimum smoothed rate to trigger taker execution
+    #[allow(dead_code)]
+    fn should_execute_taker_order(
+        &self,
+        is_buy: bool,
+        min_interval_sec: f64,
+        rate_threshold: f64,
+    ) -> bool {
+        let current_time = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+
+        let (smoothed_rate, last_execution_time) = if is_buy {
+            (self.smoothed_taker_buy_rate, self.last_taker_buy_time)
+        } else {
+            (self.smoothed_taker_sell_rate, self.last_taker_sell_time)
+        };
+
+        // Check rate threshold
+        if smoothed_rate < rate_threshold {
+            return false;
+        }
+
+        // Check time since last execution
+        let time_since_last = current_time - last_execution_time;
+        if time_since_last < min_interval_sec {
+            debug!(
+                "[TAKER RATE LIMIT] {} order blocked: last executed {:.1}s ago (min: {:.1}s)",
+                if is_buy { "BUY" } else { "SELL" },
+                time_since_last,
+                min_interval_sec
+            );
+            return false;
+        }
+
+        true
+    }
+
+    /// Record a taker execution (updates last execution time).
+    #[allow(dead_code)]
+    fn record_taker_execution(&mut self, is_buy: bool) {
+        let current_time = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        if is_buy {
+            self.last_taker_buy_time = current_time;
+        } else {
+            self.last_taker_sell_time = current_time;
+        }
+    }
+
+    /// Perform online learning using the Adam optimizer.
+    ///
+    /// This method computes gradients of the loss function with respect to
+    /// tuning parameters and updates them using the Adam optimizer.
+    ///
+    /// The loss function is designed to minimize:
+    /// - Inventory risk (quadratic penalty on position)
+    /// - Adverse selection costs (based on realized vs. expected mid-price moves)
+    /// - Spread tightness vs. fill rate tradeoff
+    ///
+    /// Returns the computed loss value.
+    #[allow(dead_code)]
+    fn perform_online_learning(&mut self, state: &CurrentState) -> f64 {
+        if !self.config.enable_online_learning {
+            return 0.0;
+        }
+
+        // Compute loss based on current performance
+        let inventory_loss = self.hjb_components.phi * state.position.powi(2);
+        let adverse_selection_loss = self.state_vector.adverse_selection_estimate.abs();
+        let spread_loss = state.market_spread_bps.max(0.0);
+
+        let total_loss = inventory_loss + adverse_selection_loss * 0.1 + spread_loss * 0.01;
+
+        // Compute gradients (simplified finite difference approximation)
+        // In a full implementation, this would use automatic differentiation
+        let tuning_params = self.tuning_params.read().clone();
+        let gradient_vector = self.compute_finite_difference_gradients(&tuning_params, total_loss);
+
+        // Update parameters using Adam optimizer
+        let mut adam = self.adam_optimizer.write();
+        let updates = adam.compute_update(&gradient_vector);
+        drop(adam);
+
+        // Apply updates to tuning parameters
+        self.apply_parameter_updates(&updates);
+
+        debug!(
+            "[ONLINE LEARNING] Loss: {:.4}, Gradient norm: {:.4}",
+            total_loss,
+            gradient_vector.iter().map(|g| g.powi(2)).sum::<f64>().sqrt()
+        );
+
+        total_loss
+    }
+
+    /// Compute finite difference gradients for online learning.
+    ///
+    /// This is a simplified gradient estimation using forward finite differences.
+    /// In production, use automatic differentiation or policy gradient methods.
+    fn compute_finite_difference_gradients(
+        &self,
+        _tuning_params: &crate::TuningParams,
+        _current_loss: f64,
+    ) -> Vec<f64> {
+        // Placeholder: return small random gradients for now
+        // In production, implement proper gradient computation
+        vec![0.001; 8]
+    }
+
+    /// Apply parameter updates from the Adam optimizer.
+    fn apply_parameter_updates(&mut self, updates: &[f64]) {
+        let mut tuning_params = self.tuning_params.write();
+
+        // Update phi parameters (in unconstrained space)
+        let mut params_vec = vec![
+            tuning_params.skew_adjustment_factor_phi,
+            tuning_params.adverse_selection_adjustment_factor_phi,
+            tuning_params.adverse_selection_lambda_phi,
+            tuning_params.inventory_urgency_threshold_phi,
+            tuning_params.liquidation_rate_multiplier_phi,
+            tuning_params.min_spread_base_ratio_phi,
+            tuning_params.adverse_selection_spread_scale_phi,
+            tuning_params.control_gap_threshold_phi,
+        ];
+
+        // Apply updates
+        for (i, update) in updates.iter().enumerate() {
+            if i < params_vec.len() {
+                params_vec[i] -= update; // Gradient descent: θ := θ - α * ∇L
+            }
+        }
+
+        // Write back
+        tuning_params.skew_adjustment_factor_phi = params_vec[0];
+        tuning_params.adverse_selection_adjustment_factor_phi = params_vec[1];
+        tuning_params.adverse_selection_lambda_phi = params_vec[2];
+        tuning_params.inventory_urgency_threshold_phi = params_vec[3];
+        tuning_params.liquidation_rate_multiplier_phi = params_vec[4];
+        tuning_params.min_spread_base_ratio_phi = params_vec[5];
+        tuning_params.adverse_selection_spread_scale_phi = params_vec[6];
+        tuning_params.control_gap_threshold_phi = params_vec[7];
     }
 }
