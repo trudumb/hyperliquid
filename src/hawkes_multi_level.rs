@@ -13,7 +13,7 @@
 
 use std::collections::VecDeque;
 use serde::{Deserialize, Serialize};
-use crate::market_maker_v2::ConstrainedTuningParams;
+use crate::ConstrainedTuningParams;
 
 /// Epsilon for numerical stability
 const EPSILON: f64 = 1e-10;
@@ -748,7 +748,7 @@ mod tests {
         let hawkes = HawkesFillModel::new(3);
 
         // Use default tuning params for test
-        use crate::market_maker_v2::TuningParams;
+        use crate::TuningParams;
         let tuning_params = TuningParams::default().get_constrained();
 
         let state = OptimizationState {

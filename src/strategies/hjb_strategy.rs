@@ -57,14 +57,8 @@ use crate::strategies::components::{
 // Import HJB implementation details from the sibling hjb_impl module
 // ----------------------------------------------------------------------------
 use super::hjb_impl::{
-    AdamOptimizerState, CachedVolatilityEstimate, OnlineAdverseSelectionModel, StateVector,
-    TuningParams,
-};
-
-// Import HJBComponents and ValueFunction from market_maker_v2
-// (These will be moved in a later refactoring step)
-use crate::market_maker_v2::{
-    HJBComponents, ValueFunction,
+    AdamOptimizerState, CachedVolatilityEstimate, ControlVector, HJBComponents,
+    OnlineAdverseSelectionModel, StateVector, TuningParams, ValueFunction,
 };
 
 // ============================================================================

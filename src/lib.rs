@@ -8,7 +8,7 @@ mod hawkes_multi_level;
 mod helpers;
 mod info;
 mod inventory_skew;
-pub mod market_maker_v2; // Still needed for HJBComponents and ValueFunction temporarily
+pub mod market_maker_v2; // Legacy v2 implementation (to be removed)
 mod meta;
 pub mod strategy;
 pub mod strategies;
@@ -32,9 +32,11 @@ pub use hawkes_multi_level::{
 pub use helpers::{bps_diff, truncate_float, BaseUrl};
 pub use info::{info_client::*, *};
 pub use inventory_skew::{InventorySkewCalculator, InventorySkewConfig, SkewResult};
-// Temporarily re-export ControlVector, HJBComponents, and ValueFunction from market_maker_v2
-// These will be moved to a better location in a future refactoring
-pub use market_maker_v2::{ControlVector, HJBComponents, ValueFunction};
+// Re-export core HJB types from the strategies module
+pub use strategies::{
+    ConstrainedTuningParams, ControlVector, HJBComponents, OnlineAdverseSelectionModel,
+    StateVector, TuningParams, ValueFunction,
+};
 pub use meta::{AssetContext, AssetMeta, Meta, MetaAndAssetCtxs, SpotAssetMeta, SpotMeta};
 pub use strategy::{
     CurrentState, MarketUpdate, RestingOrder, Strategy, StrategyAction, StrategyTuiMetrics, UserUpdate,
