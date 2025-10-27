@@ -55,10 +55,13 @@ use serde_json::Value;
 use crate::strategy::CurrentState;
 use crate::{
     ConstrainedTuningParams, HawkesFillModel, MultiLevelConfig, MultiLevelOptimizer,
-    OptimizationState, ParameterUncertainty, RobustConfig, RobustParameters,
-    TickLotValidator, EPSILON,
+    OptimizationState, TickLotValidator, EPSILON,
 };
 use super::quote_optimizer::{QuoteOptimizer, OptimizerInputs};
+use super::robust_control::{RobustControlModel, ParameterUncertainty};
+use super::robust_control_impl::{StandardRobustControl, RobustConfig};
+use super::inventory_skew::{InventorySkewModel};
+use super::inventory_skew_impl::{StandardInventorySkew, InventorySkewConfig};
 
 /// Extended optimizer output with metadata.
 ///
@@ -91,15 +94,18 @@ pub struct HjbMultiLevelOptimizer {
     /// Multi-level optimizer (contains Hawkes model, level logic)
     multi_level_optimizer: MultiLevelOptimizer,
 
-    /// Robust control configuration
-    robust_config: RobustConfig,
+    /// Robust control component
+    robust_control: StandardRobustControl,
+
+    /// Inventory skew component
+    inventory_skew: StandardInventorySkew,
 
     /// Tick/lot size validator for price/size rounding
     tick_lot_validator: TickLotValidator,
 
     /// Maximum absolute position size
     max_position_size: f64,
-    
+
     /// Tuning parameters (constrained, i.e., theta space)
     tuning_params: ConstrainedTuningParams,
 }
@@ -110,6 +116,7 @@ impl HjbMultiLevelOptimizer {
     /// Default configuration:
     /// - Standard multi-level config (3 levels, 10 bps spacing)
     /// - Standard robust config (robustness level 0.5)
+    /// - Standard inventory skew config
     /// - Asset: "HYPE"
     /// - Max position: 50.0
     /// - Default tuning parameters
@@ -118,6 +125,7 @@ impl HjbMultiLevelOptimizer {
         Self::new(
             MultiLevelConfig::default(),
             RobustConfig::default(),
+            InventorySkewConfig::default(),
             "HYPE".to_string(),
             50.0,
             TuningParams::default().get_constrained(),
@@ -129,17 +137,21 @@ impl HjbMultiLevelOptimizer {
     /// # Arguments
     /// - `multi_level_config`: Configuration for multi-level optimization
     /// - `robust_config`: Configuration for robust control
+    /// - `inventory_skew_config`: Configuration for inventory skew
     /// - `asset`: Asset symbol (for tick/lot validation)
     /// - `max_position_size`: Maximum absolute position size
     /// - `tuning_params`: Constrained tuning parameters (theta space)
     pub fn new(
         multi_level_config: MultiLevelConfig,
         robust_config: RobustConfig,
+        inventory_skew_config: InventorySkewConfig,
         asset: String,
         max_position_size: f64,
         tuning_params: ConstrainedTuningParams,
     ) -> Self {
         let multi_level_optimizer = MultiLevelOptimizer::new(multi_level_config);
+        let robust_control = StandardRobustControl::new(robust_config);
+        let inventory_skew = StandardInventorySkew::new(inventory_skew_config);
 
         // Initialize tick/lot validator (default to 3 sz_decimals for most assets)
         let tick_lot_validator = TickLotValidator::new(
@@ -150,7 +162,8 @@ impl HjbMultiLevelOptimizer {
 
         Self {
             multi_level_optimizer,
-            robust_config,
+            robust_control,
+            inventory_skew,
             tick_lot_validator,
             max_position_size,
             tuning_params,
@@ -176,6 +189,7 @@ impl HjbMultiLevelOptimizer {
     ///   "max_position_size": 50.0,
     ///   "multi_level_config": { ... },
     ///   "robust_config": { ... },
+    ///   "inventory_skew_config": { ... },
     ///   "tuning_params": { ... }
     /// }
     /// ```
@@ -198,13 +212,17 @@ impl HjbMultiLevelOptimizer {
         let robust_config = config.get("robust_config")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_else(|| RobustConfig::default());
-        
+
+        let inventory_skew_config = config.get("inventory_skew_config")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_else(|| InventorySkewConfig::default());
+
         let tuning_params = config.get("tuning_params")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .map(|tp: TuningParams| tp.get_constrained())
             .unwrap_or_else(|| TuningParams::default().get_constrained());
 
-        Self::new(multi_level_config, robust_config, asset, max_position_size, tuning_params)
+        Self::new(multi_level_config, robust_config, inventory_skew_config, asset, max_position_size, tuning_params)
     }
 }
 
@@ -231,23 +249,35 @@ impl HjbMultiLevelOptimizer {
         state: &CurrentState,
         fill_model: &HawkesFillModel,
     ) -> OptimizerOutput {
-        // 1. Compute parameter uncertainty from volatility uncertainty
-        let current_uncertainty = ParameterUncertainty::from_particle_filter_stats(
-            0.0,  // mu_std (not used currently)
-            inputs.vol_uncertainty_bps,
-            0.95,  // confidence level
-        );
-
-        // 2. Compute robust parameters (worst-case volatility and adverse selection)
-        let robust_params = RobustParameters::compute(
-            inputs.adverse_selection_bps,
+        // 1. Compute robust parameters using the robust control component
+        let robust_params = self.robust_control.compute_robust_parameters(
             inputs.volatility_bps,
-            state.position,
-            &current_uncertainty,
-            &self.robust_config,
+            inputs.vol_uncertainty_bps,
+            inputs.adverse_selection_bps,
+            0.0,  // as_uncertainty_bps (not used currently, could be added to OptimizerInputs)
         );
 
-        // 3. Prepare optimization state
+        // 2. Calculate base half-spread from volatility
+        let min_profitable_half_spread = self.multi_level_optimizer.config().min_profitable_spread_bps / 2.0;
+        let base_half_spread = (robust_params.sigma_worst_case * 0.1)
+            .max(min_profitable_half_spread);
+
+        // 3. Calculate inventory skew adjustment using the inventory skew component
+        // Analyze the order book if available
+        let book_analysis = state.order_book.as_ref()
+            .and_then(|book| book.analyze(5)); // Analyze top 5 levels
+
+        let skew_result = self.inventory_skew.calculate_skew(
+            state.position,
+            self.max_position_size,
+            book_analysis.as_ref(),
+            base_half_spread,
+        );
+
+        // 4. Apply spread multiplier from robust control
+        let robust_base_half_spread = base_half_spread * robust_params.spread_multiplier;
+
+        // 5. Prepare optimization state
         let opt_state = OptimizationState {
             mid_price: state.l2_mid_price,
             inventory: state.position,
@@ -259,21 +289,14 @@ impl HjbMultiLevelOptimizer {
             hawkes_model: fill_model,
         };
 
-        // 4. Calculate robust base half-spread
-        let min_profitable_half_spread = self.multi_level_optimizer.config().min_profitable_spread_bps / 2.0;
-        let robust_base_half_spread = (robust_params.sigma_worst_case * 0.1)
-            .max(min_profitable_half_spread)
-            * robust_params.spread_multiplier;
-
-        // 5. Run multi-level optimization
-        // Use the stored tuning params instead of defaults
+        // 6. Run multi-level optimization
         let multi_level_control = self.multi_level_optimizer.optimize(
             &opt_state,
             robust_base_half_spread,
             &self.tuning_params,
         );
 
-        // 6. Convert offsets to prices
+        // 7. Convert offsets to prices and apply inventory skew
         let mut target_bids = Vec::new();
         let mut target_asks = Vec::new();
 
@@ -287,7 +310,9 @@ impl HjbMultiLevelOptimizer {
                 continue;
             }
 
-            let price_raw = state.l2_mid_price * (1.0 - offset_bps / 10000.0);
+            // Apply inventory skew: skew is in bps, shift the mid price
+            let skewed_mid = state.l2_mid_price * (1.0 + skew_result.skew_bps / 10000.0);
+            let price_raw = skewed_mid * (1.0 - offset_bps / 10000.0);
             let price = self.tick_lot_validator.round_price(price_raw, false);
 
             // Ensure minimum notional value ($10)
@@ -306,7 +331,9 @@ impl HjbMultiLevelOptimizer {
                 continue;
             }
 
-            let price_raw = state.l2_mid_price * (1.0 + offset_bps / 10000.0);
+            // Apply inventory skew: skew is in bps, shift the mid price
+            let skewed_mid = state.l2_mid_price * (1.0 + skew_result.skew_bps / 10000.0);
+            let price_raw = skewed_mid * (1.0 + offset_bps / 10000.0);
             let price = self.tick_lot_validator.round_price(price_raw, true);
 
             // Ensure minimum notional value ($10)
@@ -315,7 +342,7 @@ impl HjbMultiLevelOptimizer {
             }
         }
 
-        // 7. Sort bids descending, asks ascending
+        // 8. Sort bids descending, asks ascending
         target_bids.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
         target_asks.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
