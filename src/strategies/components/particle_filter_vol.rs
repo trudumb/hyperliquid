@@ -58,6 +58,58 @@ use super::volatility::VolatilityModel;
 
 const SECONDS_PER_YEAR: f64 = 365.25 * 24.0 * 60.0 * 60.0;
 
+/// Logit transformation: (0,1) → ℝ
+#[inline]
+fn logit(p: f64) -> f64 {
+    let p_clamped = p.clamp(1e-10, 1.0 - 1e-10);
+    (p_clamped / (1.0 - p_clamped)).ln()
+}
+
+/// Inverse logit transformation: ℝ → (0,1)
+#[inline]
+fn inv_logit(x: f64) -> f64 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// Configuration for adaptive parameter learning (Liu-West filter)
+#[derive(Debug, Clone, Copy)]
+pub struct AdaptiveConfig {
+    /// Enable Liu-West adaptive parameter learning
+    pub enabled: bool,
+
+    /// Shrinkage parameter δ ∈ (0, 1), typically 0.95-0.99
+    pub delta: f64,
+
+    /// Parameter bounds
+    pub phi_bounds: (f64, f64),
+    pub sigma_eta_bounds: (f64, f64),
+    pub mu_bounds: (f64, f64),
+}
+
+impl Default for AdaptiveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            delta: 0.97,
+            phi_bounds: (0.75, 0.98),
+            sigma_eta_bounds: (0.3, 3.5),
+            mu_bounds: (-11.5, -7.5),
+        }
+    }
+}
+
+impl AdaptiveConfig {
+    pub fn liu_west() -> Self {
+        Self {
+            enabled: true,
+            delta: 0.97,
+            phi_bounds: (0.75, 0.98),
+            sigma_eta_bounds: (0.3, 3.5),
+            mu_bounds: (-11.5, -7.5),
+        }
+    }
+}
+
 /// Represents a single particle in the filter.
 #[derive(Debug, Clone, Copy)]
 pub struct Particle {
@@ -82,9 +134,12 @@ pub struct Particle {
 pub struct ParticleFilterState {
     /// Collection of all particles representing the distribution
     pub particles: Vec<Particle>,
-    
+
     /// Number of particles used in the filter
     num_particles: usize,
+
+    /// Adaptive learning configuration (Liu-West)
+    adaptive_config: AdaptiveConfig,
 
     /// Fixed parameters (used when adaptive mode is disabled)
     fixed_mu: f64,
@@ -93,19 +148,19 @@ pub struct ParticleFilterState {
 
     /// Random number generator for noise simulation and resampling
     rng: StdRng,
-    
+
     /// Timestamp of the last update. Used to calculate dt.
     last_update_time: Option<Instant>,
-    
+
     /// Previous mid-price observed. Needed to calculate log returns.
     prev_mid: Option<f64>,
-    
+
     /// Effective Sample Size (ESS). Used to monitor particle degeneracy.
     effective_sample_size: f64,
-    
+
     /// Threshold for ESS below which resampling is triggered
     resampling_threshold: f64,
-    
+
     /// Observation counter
     observation_count: usize,
 }
@@ -148,9 +203,57 @@ impl ParticleFilterState {
         Self {
             particles,
             num_particles,
+            adaptive_config: AdaptiveConfig::default(), // Disabled by default
             fixed_mu: mu,
             fixed_phi: phi,
             fixed_sigma_eta: sigma_eta,
+            rng,
+            last_update_time: None,
+            prev_mid: None,
+            effective_sample_size: num_particles as f64,
+            resampling_threshold: (num_particles as f64) * 0.4,
+            observation_count: 0,
+        }
+    }
+
+    /// Creates a new Particle Filter with LIU-WEST ADAPTIVE parameters
+    pub fn new_liu_west(
+        num_particles: usize,
+        initial_mu: f64,
+        initial_phi: f64,
+        initial_sigma_eta: f64,
+        initial_h: f64,
+        param_std_dev: f64,
+        state_std_dev: f64,
+        adaptive_config: AdaptiveConfig,
+        seed: u64,
+    ) -> Self {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let initial_weight = 1.0 / (num_particles as f64);
+
+        let state_dist = Normal::new(initial_h, state_std_dev).unwrap();
+        let mu_dist = Normal::new(initial_mu, param_std_dev * 0.3).unwrap();
+        let phi_dist = Normal::new(initial_phi, param_std_dev * 0.02).unwrap();
+        let sigma_eta_dist = Normal::new(initial_sigma_eta, param_std_dev * 0.3).unwrap();
+
+        let particles: Vec<Particle> = (0..num_particles)
+            .map(|_| Particle {
+                log_vol: state_dist.sample(&mut rng),
+                mu: mu_dist.sample(&mut rng).clamp(adaptive_config.mu_bounds.0, adaptive_config.mu_bounds.1),
+                phi: phi_dist.sample(&mut rng).clamp(adaptive_config.phi_bounds.0, adaptive_config.phi_bounds.1),
+                sigma_eta: sigma_eta_dist.sample(&mut rng)
+                    .clamp(adaptive_config.sigma_eta_bounds.0, adaptive_config.sigma_eta_bounds.1),
+                weight: initial_weight,
+            })
+            .collect();
+
+        Self {
+            particles,
+            num_particles,
+            adaptive_config,
+            fixed_mu: initial_mu,
+            fixed_phi: initial_phi,
+            fixed_sigma_eta: initial_sigma_eta,
             rng,
             last_update_time: None,
             prev_mid: None,
@@ -189,8 +292,13 @@ impl ParticleFilterState {
             }
         };
 
-        // Core filter steps (standard update for fixed parameters)
-        self.standard_update(dt);
+        // Core filter steps (different for adaptive vs fixed)
+        if self.adaptive_config.enabled {
+            self.liu_west_update(dt);
+        } else {
+            self.standard_update(dt);
+        }
+
         self.weight_step(y_t, dt);
         self.normalize_weights();
         self.resample_if_needed();
@@ -205,7 +313,7 @@ impl ParticleFilterState {
     /// Standard predict step (fixed parameters)
     fn standard_update(&mut self, dt: f64) {
         if dt <= 0.0 { return; }
-        
+
         let process_noise_std_dev = self.fixed_sigma_eta * dt.sqrt();
         let noise_dist = Normal::new(0.0, process_noise_std_dev).unwrap();
 
@@ -213,6 +321,94 @@ impl ParticleFilterState {
             let noise = noise_dist.sample(&mut self.rng);
             particle.log_vol = self.fixed_mu + self.fixed_phi * (particle.log_vol - self.fixed_mu) + noise;
         }
+    }
+
+    /// Liu-West predict step (adaptive parameters)
+    fn liu_west_update(&mut self, dt: f64) {
+        if dt <= 0.0 { return; }
+
+        // Step 1: Transform to UNCONSTRAINED space
+        let unconstrained_particles: Vec<(f64, f64, f64)> = self.particles.iter()
+            .map(|p| {
+                let logit_phi = logit(p.phi);
+                let log_sigma_eta = p.sigma_eta.ln();
+                (p.mu, logit_phi, log_sigma_eta)
+            })
+            .collect();
+
+        // Step 2: Compute parameter statistics in UNCONSTRAINED space
+        let (mu_m, mu_v) = self.compute_parameter_moments_unconstrained(&unconstrained_particles, 0);
+        let (logit_phi_m, logit_phi_v) = self.compute_parameter_moments_unconstrained(&unconstrained_particles, 1);
+        let (log_sigma_eta_m, log_sigma_eta_v) = self.compute_parameter_moments_unconstrained(&unconstrained_particles, 2);
+
+        // Liu-West coefficients
+        let delta = self.adaptive_config.delta;
+        let a = (1.0 - delta.powi(2)).sqrt();
+        let h_sq = 1.0 - a.powi(2);
+
+        // Kernel standard deviations in unconstrained space
+        let kernel_std_mu = (h_sq * mu_v).max(1e-8).sqrt();
+        let kernel_std_logit_phi = (h_sq * logit_phi_v).max(1e-8).sqrt();
+        let kernel_std_log_sigma_eta = (h_sq * log_sigma_eta_v).max(1e-8).sqrt();
+
+        let kernel_mu = Normal::new(0.0, kernel_std_mu).unwrap();
+        let kernel_logit_phi = Normal::new(0.0, kernel_std_logit_phi).unwrap();
+        let kernel_log_sigma_eta = Normal::new(0.0, kernel_std_log_sigma_eta).unwrap();
+
+        // Step 3: Liu-West transformation in UNCONSTRAINED space, then transform back
+        for (i, particle) in self.particles.iter_mut().enumerate() {
+            let (unc_mu, unc_logit_phi, unc_log_sigma_eta) = unconstrained_particles[i];
+
+            // Shrinkage + jittering in unconstrained space
+            let m_mu = a * unc_mu + (1.0 - a) * mu_m;
+            let m_logit_phi = a * unc_logit_phi + (1.0 - a) * logit_phi_m;
+            let m_log_sigma_eta = a * unc_log_sigma_eta + (1.0 - a) * log_sigma_eta_m;
+
+            let new_unc_mu = m_mu + kernel_mu.sample(&mut self.rng);
+            let new_unc_logit_phi = m_logit_phi + kernel_logit_phi.sample(&mut self.rng);
+            let new_unc_log_sigma_eta = m_log_sigma_eta + kernel_log_sigma_eta.sample(&mut self.rng);
+
+            // Transform back to CONSTRAINED space (with safety bounds)
+            particle.mu = new_unc_mu.clamp(self.adaptive_config.mu_bounds.0, self.adaptive_config.mu_bounds.1);
+            particle.phi = inv_logit(new_unc_logit_phi)
+                .clamp(self.adaptive_config.phi_bounds.0, self.adaptive_config.phi_bounds.1);
+            particle.sigma_eta = new_unc_log_sigma_eta.exp()
+                .clamp(self.adaptive_config.sigma_eta_bounds.0, self.adaptive_config.sigma_eta_bounds.1);
+
+            // State evolution using particle's own parameters
+            let process_noise_std = particle.sigma_eta * dt.sqrt();
+            let noise = Normal::new(0.0, process_noise_std).unwrap().sample(&mut self.rng);
+            particle.log_vol = particle.mu + particle.phi * (particle.log_vol - particle.mu) + noise;
+        }
+    }
+
+    /// Compute weighted mean and variance for unconstrained parameters
+    fn compute_parameter_moments_unconstrained(
+        &self,
+        unconstrained: &[(f64, f64, f64)],
+        index: usize
+    ) -> (f64, f64) {
+        let values: Vec<f64> = match index {
+            0 => unconstrained.iter().map(|(mu, _, _)| *mu).collect(),
+            1 => unconstrained.iter().map(|(_, logit_phi, _)| *logit_phi).collect(),
+            2 => unconstrained.iter().map(|(_, _, log_sigma_eta)| *log_sigma_eta).collect(),
+            _ => panic!("Invalid parameter index"),
+        };
+
+        let mean: f64 = values.iter()
+            .zip(self.particles.iter())
+            .map(|(val, p)| val * p.weight)
+            .sum();
+
+        let variance: f64 = values.iter()
+            .zip(self.particles.iter())
+            .map(|(val, p)| {
+                let dev = val - mean;
+                dev * dev * p.weight
+            })
+            .sum();
+
+        (mean, variance)
     }
 
     /// Weight step (measurement update) - LOG-SPACE for numerical stability
@@ -378,10 +574,10 @@ impl ParticleFilterState {
             .map(|p| p.log_vol)
             .collect();
 
-        if h_particles.len() < 2 { 
-            return 0.0; 
+        if h_particles.len() < 2 {
+            return 0.0;
         }
-        
+
         let h_mean: f64 = h_particles.iter().sum::<f64>() / h_particles.len() as f64;
         let h_variance: f64 = h_particles.iter()
             .map(|&h| (h - h_mean).powi(2))
@@ -393,6 +589,38 @@ impl ParticleFilterState {
         let sigma_std_approx = (0.5 * sigma_mean_approx) * h_std;
 
         sigma_std_approx * 10000.0
+    }
+
+    /// Get parameter estimates (weighted means)
+    pub fn get_parameter_estimates(&self) -> (f64, f64, f64) {
+        if self.adaptive_config.enabled {
+            let mu: f64 = self.particles.iter().map(|p| p.mu * p.weight).sum();
+            let phi: f64 = self.particles.iter().map(|p| p.phi * p.weight).sum();
+            let sigma_eta: f64 = self.particles.iter().map(|p| p.sigma_eta * p.weight).sum();
+            (mu, phi, sigma_eta)
+        } else {
+            (self.fixed_mu, self.fixed_phi, self.fixed_sigma_eta)
+        }
+    }
+
+    /// Check if using adaptive mode (Liu-West)
+    pub fn is_adaptive(&self) -> bool {
+        self.adaptive_config.enabled
+    }
+
+    /// Get Effective Sample Size
+    pub fn get_ess(&self) -> f64 {
+        self.effective_sample_size
+    }
+
+    /// Get observation count
+    pub fn get_observation_count(&self) -> usize {
+        self.observation_count
+    }
+
+    /// Get the number of particles in the filter
+    pub fn get_num_particles(&self) -> usize {
+        self.num_particles
     }
 }
 
