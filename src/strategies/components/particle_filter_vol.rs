@@ -613,6 +613,12 @@ impl ParticleFilterState {
         self.effective_sample_size
     }
 
+    /// Get the effective sample size (ESS) of the particle filter
+    /// Alias for get_ess() for backward compatibility
+    pub fn get_effective_sample_size(&self) -> f64 {
+        self.effective_sample_size
+    }
+
     /// Get observation count
     pub fn get_observation_count(&self) -> usize {
         self.observation_count
@@ -621,6 +627,30 @@ impl ParticleFilterState {
     /// Get the number of particles in the filter
     pub fn get_num_particles(&self) -> usize {
         self.num_particles
+    }
+
+    /// Get percentile estimate for volatility (for confidence intervals)
+    pub fn estimate_volatility_percentile_bps(&self, percentile: f64) -> f64 {
+        let mut weighted_samples: Vec<(f64, f64)> = self.particles.iter()
+            .map(|p| {
+                let vol_bps = p.log_vol.exp().sqrt() * 10000.0;
+                (vol_bps, p.weight)
+            })
+            .collect();
+
+        weighted_samples.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+        let default_val = weighted_samples.last().map(|(v, _)| *v).unwrap_or(0.0);
+
+        let mut cumulative = 0.0;
+        for (vol, weight) in &weighted_samples {
+            cumulative += weight;
+            if cumulative >= percentile {
+                return *vol;
+            }
+        }
+
+        default_val
     }
 }
 

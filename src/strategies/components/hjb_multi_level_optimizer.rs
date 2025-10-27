@@ -58,7 +58,7 @@ use crate::{
     OptimizationState, TickLotValidator, EPSILON,
 };
 use super::quote_optimizer::{QuoteOptimizer, OptimizerInputs};
-use super::robust_control::{RobustControlModel, ParameterUncertainty};
+use super::robust_control::RobustControlModel;
 use super::robust_control_impl::{StandardRobustControl, RobustConfig};
 use super::inventory_skew::{InventorySkewModel};
 use super::inventory_skew_impl::{StandardInventorySkew, InventorySkewConfig};
