@@ -21,5 +21,5 @@ pub use order::{
 };
 #[allow(unreachable_pub)]
 pub use parallel_order_executor::{
-    BatchExecutionResult, ExecutorConfig, ExecutorStats, ParallelOrderExecutor, StrategyAction,
+    BatchExecutionResult, ExecutorConfig, ExecutorStats, ParallelOrderExecutor,
 };

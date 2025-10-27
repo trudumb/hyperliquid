@@ -9,8 +9,7 @@
 /// - Provides type-safe access to message data
 /// - Reduces memory allocations
 
-use crate::ws::ws_manager::Message;
-use crate::ws::message_types::{AllMids, L2Book, Trades, User};
+use crate::ws::message_types::{AllMids, L2Book, Message, Trades, User};
 
 /// Process a message inline without cloning
 ///
