@@ -47,7 +47,7 @@
 // }
 // ```
 
-use crate::book_analyzer::BookAnalysis;
+use super::book_analyzer::BookAnalysis;
 
 /// Result of inventory skew calculation
 #[derive(Debug, Clone)]

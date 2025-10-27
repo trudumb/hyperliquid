@@ -53,7 +53,7 @@
 // // Result: skew_bps might be +8 bps (shift quotes up to sell)
 // ```
 
-use crate::book_analyzer::BookAnalysis;
+use super::book_analyzer::BookAnalysis;
 use super::inventory_skew::{InventorySkewModel, SkewResult};
 use log::info;
 
@@ -344,7 +344,7 @@ impl InventorySkewCalculator {
 #[cfg(test)]
 mod legacy_tests {
     use super::*;
-    use crate::book_analyzer::BookAnalysis;
+    use super::book_analyzer::BookAnalysis;
 
     #[test]
     fn test_legacy_position_skew_long() {

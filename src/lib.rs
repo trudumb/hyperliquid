@@ -1,5 +1,4 @@
 #![deny(unreachable_pub)]
-mod book_analyzer;
 mod consts;
 mod eip712;
 mod errors;
@@ -11,9 +10,7 @@ pub mod strategy;
 pub mod strategies;
 mod prelude;
 mod req;
-mod robust_hjb_control;
 mod signature;
-mod stochastic_volatility;
 mod tick_lot_size;
 pub mod tui;
 mod ws;
@@ -21,7 +18,6 @@ mod ws;
 // ============================================================================
 // Core SDK Exports
 // ============================================================================
-pub use book_analyzer::{BookAnalysis, OrderBook};
 pub use consts::{EPSILON, LOCAL_API_URL, MAINNET_API_URL, TESTNET_API_URL};
 pub use eip712::Eip712;
 pub use errors::Error;
@@ -56,6 +52,8 @@ pub use strategies::components::{
     ParticleFilterVolModel, StandardInventorySkew, StandardRobustControl,
     // Supporting types
     OptimizerInputs, OptimizerOutput, ParameterUncertainty, RobustParameters, SkewResult,
+    // Order book types
+    BookAnalysis, OrderBook,
 };
 
 // ============================================================================
@@ -82,12 +80,14 @@ pub use strategies::components::{
 // - Old: ParticleFilterState (direct use)
 // - New: ParticleFilterVolModel (component wrapper) implementing VolatilityModel trait
 
-// Note: Hawkes and multi-level types are now in strategies::hjb_impl but re-exported above for convenience
-// Note: InventorySkewCalculator is now in strategies::components but re-exported above for convenience
+// Note: All legacy types are now in strategies::components
+// These exports maintain backward compatibility for existing code
 pub use strategies::components::InventorySkewConfig as LegacyInventorySkewConfig;
-pub use robust_hjb_control::{
+pub use strategies::components::{
     RobustConfig as LegacyRobustConfig,
     RobustParameters as LegacyRobustParameters,
-    ParameterUncertainty as LegacyParameterUncertainty
+    ParameterUncertainty as LegacyParameterUncertainty,
 };
-pub use stochastic_volatility::{AdaptiveConfig, Particle, ParticleFilterState};
+
+// Re-export particle filter types from the new component location
+pub use strategies::components::particle_filter_vol::{AdaptiveConfig, Particle, ParticleFilterState};
