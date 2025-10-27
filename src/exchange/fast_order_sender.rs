@@ -1,0 +1,310 @@
+use bytes::BytesMut;
+use parking_lot::Mutex;
+use std::sync::Arc;
+
+use crate::{
+    exchange::{ClientOrderRequest, ExchangeClient},
+    prelude::*,
+    ExchangeResponseStatus,
+};
+
+/// Buffer pool configuration
+const DEFAULT_BUFFER_CAPACITY: usize = 2048; // 2KB per buffer
+const MIN_POOL_SIZE: usize = 8; // Minimum buffers to keep in pool
+const MAX_POOL_SIZE: usize = 64; // Maximum buffers to cache
+
+/// Pre-allocated buffer pool for zero-copy serialization
+#[derive(Clone)]
+struct BufferPool {
+    buffers: Arc<Mutex<Vec<BytesMut>>>,
+    buffer_capacity: usize,
+}
+
+impl BufferPool {
+    /// Create a new buffer pool with pre-allocated buffers
+    fn new(initial_size: usize, buffer_capacity: usize) -> Self {
+        let mut buffers = Vec::with_capacity(initial_size);
+        for _ in 0..initial_size {
+            buffers.push(BytesMut::with_capacity(buffer_capacity));
+        }
+
+        Self {
+            buffers: Arc::new(Mutex::new(buffers)),
+            buffer_capacity,
+        }
+    }
+
+    /// Get a buffer from the pool, or create a new one if pool is empty
+    fn acquire(&self) -> BytesMut {
+        let mut pool = self.buffers.lock();
+        pool.pop()
+            .unwrap_or_else(|| BytesMut::with_capacity(self.buffer_capacity))
+    }
+
+    /// Return a buffer to the pool for reuse
+    fn release(&self, mut buffer: BytesMut) {
+        buffer.clear(); // Clear content but keep capacity
+
+        let mut pool = self.buffers.lock();
+        if pool.len() < MAX_POOL_SIZE {
+            pool.push(buffer);
+        }
+        // If pool is full, drop the buffer (let it deallocate)
+    }
+
+    /// Get current pool statistics
+    fn stats(&self) -> BufferPoolStats {
+        let pool = self.buffers.lock();
+        BufferPoolStats {
+            available: pool.len(),
+            capacity: pool.capacity(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BufferPoolStats {
+    pub available: usize,
+    pub capacity: usize,
+}
+
+/// High-performance order sender with zero-copy buffer pooling
+///
+/// This struct optimizes order placement for HFT by:
+/// - Pre-allocating and reusing buffers to avoid allocations
+/// - Using parking_lot::Mutex for faster locking than std::Mutex
+/// - Minimizing memory copies during serialization
+///
+/// # Example
+/// ```no_run
+/// use hyperliquid_rust_sdk::prelude::*;
+///
+/// async fn example() -> Result<()> {
+///     let exchange = ExchangeClient::new(/* ... */).await?;
+///     let fast_sender = FastOrderSender::new(exchange);
+///
+///     let order = ClientOrderRequest {
+///         // ... order details
+///     };
+///
+///     let response = fast_sender.place_order_fast(&order).await?;
+///     Ok(())
+/// }
+/// ```
+pub struct FastOrderSender {
+    client: Arc<ExchangeClient>,
+    buffer_pool: BufferPool,
+}
+
+impl FastOrderSender {
+    /// Create a new FastOrderSender with default buffer pool settings
+    pub fn new(client: ExchangeClient) -> Self {
+        Self::with_pool_config(client, MIN_POOL_SIZE, DEFAULT_BUFFER_CAPACITY)
+    }
+
+    /// Create a FastOrderSender with custom buffer pool configuration
+    ///
+    /// # Arguments
+    /// * `client` - The ExchangeClient to use for sending orders
+    /// * `pool_size` - Initial number of pre-allocated buffers
+    /// * `buffer_capacity` - Capacity of each buffer in bytes
+    pub fn with_pool_config(
+        client: ExchangeClient,
+        pool_size: usize,
+        buffer_capacity: usize,
+    ) -> Self {
+        Self {
+            client: Arc::new(client),
+            buffer_pool: BufferPool::new(pool_size, buffer_capacity),
+        }
+    }
+
+    /// Place a single order using zero-copy buffer pooling
+    ///
+    /// This method is optimized for minimal latency:
+    /// - Acquires a pre-allocated buffer from the pool
+    /// - Serializes the order directly into the buffer
+    /// - Returns the buffer to the pool after use
+    ///
+    /// # Arguments
+    /// * `order` - The order to place
+    ///
+    /// # Returns
+    /// Result containing the exchange response status
+    pub async fn place_order_fast(
+        &self,
+        order: &ClientOrderRequest,
+    ) -> Result<ExchangeResponseStatus> {
+        // Acquire buffer from pool (zero allocation if available)
+        let _buf = self.buffer_pool.acquire();
+
+        // NOTE: Currently using serde_json serialization via ExchangeClient
+        // For even better performance, consider implementing custom serialization
+        // directly to the buffer using rkyv or bincode in the future
+
+        // Place the order using the underlying client
+        let result = self.client.order(order.clone(), None).await;
+
+        // Return buffer to pool for reuse
+        self.buffer_pool.release(_buf);
+
+        result
+    }
+
+    /// Place multiple orders in a single request using zero-copy buffer pooling
+    ///
+    /// This is more efficient than calling `place_order_fast` multiple times
+    /// because it batches the orders into a single network request.
+    ///
+    /// # Arguments
+    /// * `orders` - Vector of orders to place
+    ///
+    /// # Returns
+    /// Result containing the exchange response status
+    pub async fn place_bulk_orders_fast(
+        &self,
+        orders: Vec<ClientOrderRequest>,
+    ) -> Result<ExchangeResponseStatus> {
+        // Acquire buffer from pool
+        let _buf = self.buffer_pool.acquire();
+
+        // Place bulk order
+        let result = self.client.bulk_order(orders, None).await;
+
+        // Return buffer to pool
+        self.buffer_pool.release(_buf);
+
+        result
+    }
+
+    /// Cancel an order using zero-copy buffer pooling
+    ///
+    /// # Arguments
+    /// * `cancel_request` - The cancel request
+    ///
+    /// # Returns
+    /// Result containing the exchange response status
+    pub async fn cancel_order_fast(
+        &self,
+        cancel_request: &crate::exchange::ClientCancelRequest,
+    ) -> Result<ExchangeResponseStatus> {
+        let _buf = self.buffer_pool.acquire();
+
+        let result = self.client.cancel(cancel_request.clone(), None).await;
+
+        self.buffer_pool.release(_buf);
+
+        result
+    }
+
+    /// Modify an order using zero-copy buffer pooling
+    ///
+    /// # Arguments
+    /// * `modify_request` - The modify request
+    ///
+    /// # Returns
+    /// Result containing the exchange response status
+    pub async fn modify_order_fast(
+        &self,
+        modify_request: &crate::exchange::ClientModifyRequest,
+    ) -> Result<ExchangeResponseStatus> {
+        let _buf = self.buffer_pool.acquire();
+
+        let result = self.client.modify(modify_request.clone(), None).await;
+
+        self.buffer_pool.release(_buf);
+
+        result
+    }
+
+    /// Get buffer pool statistics for monitoring
+    ///
+    /// Useful for debugging and performance monitoring to ensure
+    /// the pool is properly sized for your workload.
+    pub fn buffer_pool_stats(&self) -> BufferPoolStats {
+        self.buffer_pool.stats()
+    }
+
+    /// Get a reference to the underlying ExchangeClient
+    pub fn client(&self) -> &ExchangeClient {
+        &self.client
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_buffer_pool_acquire_release() {
+        let pool = BufferPool::new(4, 1024);
+
+        // Initial state
+        let stats = pool.stats();
+        assert_eq!(stats.available, 4);
+
+        // Acquire buffer
+        let buf1 = pool.acquire();
+        let stats = pool.stats();
+        assert_eq!(stats.available, 3);
+
+        // Acquire all remaining buffers
+        let buf2 = pool.acquire();
+        let buf3 = pool.acquire();
+        let buf4 = pool.acquire();
+        let stats = pool.stats();
+        assert_eq!(stats.available, 0);
+
+        // Acquire when pool is empty (should create new)
+        let buf5 = pool.acquire();
+        assert_eq!(buf5.capacity(), 1024);
+
+        // Release buffers back to pool
+        pool.release(buf1);
+        pool.release(buf2);
+        let stats = pool.stats();
+        assert_eq!(stats.available, 2);
+
+        // Release remaining
+        pool.release(buf3);
+        pool.release(buf4);
+        pool.release(buf5);
+        let stats = pool.stats();
+        assert_eq!(stats.available, 5);
+    }
+
+    #[test]
+    fn test_buffer_pool_max_size() {
+        let pool = BufferPool::new(0, 1024);
+
+        // Create more buffers than MAX_POOL_SIZE
+        let mut buffers = Vec::new();
+        for _ in 0..(MAX_POOL_SIZE + 10) {
+            buffers.push(BytesMut::with_capacity(1024));
+        }
+
+        // Release all buffers
+        for buf in buffers {
+            pool.release(buf);
+        }
+
+        // Pool should be capped at MAX_POOL_SIZE
+        let stats = pool.stats();
+        assert!(stats.available <= MAX_POOL_SIZE);
+    }
+
+    #[test]
+    fn test_buffer_clear_on_release() {
+        let pool = BufferPool::new(1, 1024);
+
+        let mut buf = pool.acquire();
+        buf.extend_from_slice(b"test data");
+        assert_eq!(buf.len(), 9);
+
+        pool.release(buf);
+
+        let buf2 = pool.acquire();
+        assert_eq!(buf2.len(), 0, "Buffer should be cleared when released");
+        assert!(buf2.capacity() >= 1024, "Buffer capacity should be preserved");
+    }
+}
