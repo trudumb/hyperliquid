@@ -37,7 +37,7 @@ pub use inventory_skew::{InventorySkewCalculator, InventorySkewConfig, SkewResul
 pub use market_maker_v2::{ControlVector, HJBComponents, ValueFunction};
 pub use meta::{AssetContext, AssetMeta, Meta, MetaAndAssetCtxs, SpotAssetMeta, SpotMeta};
 pub use strategy::{
-    CurrentState, MarketUpdate, RestingOrder, Strategy, StrategyAction, UserUpdate,
+    CurrentState, MarketUpdate, RestingOrder, Strategy, StrategyAction, StrategyTuiMetrics, UserUpdate,
 };
 pub use robust_hjb_control::{ParameterUncertainty, RobustConfig, RobustParameters};
 pub use stochastic_volatility::{AdaptiveConfig, Particle, ParticleFilterState};

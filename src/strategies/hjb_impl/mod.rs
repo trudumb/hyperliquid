@@ -4,6 +4,9 @@
 //! that were originally in `market_maker_v2.rs`. They are now encapsulated
 //! here as an internal detail of the `hjb_strategy`.
 
+// Suppress unreachable_pub warnings for items that are pub for easier unit testing
+#![allow(unreachable_pub)]
+
 // Declare the internal modules
 mod cache;
 mod models;
