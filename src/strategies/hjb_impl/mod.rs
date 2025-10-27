@@ -13,9 +13,15 @@ mod models;
 mod state;
 mod tuning;
 mod utils;
+pub mod hawkes;
+pub mod multi_level;
 
 // Publicly re-export the structs needed by hjb_strategy.rs
 pub use cache::CachedVolatilityEstimate;
 pub use models::{ControlVector, HJBComponents, OnlineAdverseSelectionModel, ValueFunction};
 pub use state::StateVector;
 pub use tuning::{AdamOptimizerState, ConstrainedTuningParams, TuningParams};
+
+// Re-export hawkes and multi-level types for convenience
+pub use hawkes::{FillHistory, HawkesFillModel, HawkesParams};
+pub use multi_level::{MultiLevelConfig, MultiLevelControl, MultiLevelOptimizer, OptimizationState};
