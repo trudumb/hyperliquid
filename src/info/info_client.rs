@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
 use alloy::primitives::Address;
+use flume::Sender;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
     info::{
@@ -14,7 +14,7 @@ use crate::{
     meta::{AssetContext, Meta, SpotMeta, SpotMetaAndAssetCtxs},
     prelude::*,
     req::HttpClient,
-    ws::{Subscription, WsManager},
+    ws::{LockFreeWsManager, Subscription},
     BaseUrl, Error, Message, OrderStatusResponse, ReferralResponse, UserFeesResponse,
     UserFundingResponse, UserTokenBalanceResponse,
 };
@@ -99,7 +99,7 @@ pub enum InfoRequest {
 #[derive(Debug)]
 pub struct InfoClient {
     pub http_client: HttpClient,
-    pub(crate) ws_manager: Option<WsManager>,
+    pub(crate) ws_manager: Option<LockFreeWsManager>,
     reconnect: bool,
 }
 
@@ -133,10 +133,10 @@ impl InfoClient {
     pub async fn subscribe(
         &mut self,
         subscription: Subscription,
-        sender_channel: UnboundedSender<Message>,
+        sender_channel: Sender<Message>,
     ) -> Result<u32> {
         if self.ws_manager.is_none() {
-            let ws_manager = WsManager::new(
+            let ws_manager = LockFreeWsManager::new(
                 format!("ws{}/ws", &self.http_client.base_url[4..]),
                 self.reconnect,
             )
@@ -156,7 +156,7 @@ impl InfoClient {
 
     pub async fn unsubscribe(&mut self, subscription_id: u32) -> Result<()> {
         if self.ws_manager.is_none() {
-            let ws_manager = WsManager::new(
+            let ws_manager = LockFreeWsManager::new(
                 format!("ws{}/ws", &self.http_client.base_url[4..]),
                 self.reconnect,
             )
