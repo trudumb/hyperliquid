@@ -1,4 +1,5 @@
-use serde::Deserialize;
+use alloy::primitives::Address;
+use serde::{Deserialize, Serialize};
 
 use crate::ws::sub_structs::*;
 
@@ -75,4 +76,49 @@ pub struct ActiveAssetData {
 #[derive(Deserialize, Clone, Debug)]
 pub struct Bbo {
     pub data: BboData,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "type")]
+#[serde(rename_all = "camelCase")]
+pub enum Subscription {
+    AllMids,
+    Notification { user: Address },
+    WebData2 { user: Address },
+    Candle { coin: String, interval: String },
+    L2Book { coin: String },
+    Trades { coin: String },
+    OrderUpdates { user: Address },
+    UserEvents { user: Address },
+    UserFills { user: Address },
+    UserFundings { user: Address },
+    UserNonFundingLedgerUpdates { user: Address },
+    ActiveAssetCtx { coin: String },
+    ActiveAssetData { user: Address, coin: String },
+    Bbo { coin: String },
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(tag = "channel")]
+#[serde(rename_all = "camelCase")]
+pub enum Message {
+    NoData,
+    HyperliquidError(String),
+    AllMids(AllMids),
+    Trades(Trades),
+    L2Book(L2Book),
+    User(User),
+    UserFills(UserFills),
+    Candle(Candle),
+    SubscriptionResponse,
+    OrderUpdates(OrderUpdates),
+    UserFundings(UserFundings),
+    UserNonFundingLedgerUpdates(UserNonFundingLedgerUpdates),
+    Notification(Notification),
+    WebData2(WebData2),
+    ActiveAssetCtx(ActiveAssetCtx),
+    ActiveAssetData(ActiveAssetData),
+    ActiveSpotAssetCtx(ActiveSpotAssetCtx),
+    Bbo(Bbo),
+    Pong,
 }

@@ -56,8 +56,8 @@ pub struct LockFreeWsManager {
     total_messages: Arc<AtomicU64>,
 }
 
-// Re-use Subscription and Message from ws_manager module
-use crate::ws::ws_manager::{Message, Subscription};
+// Re-use Subscription and Message from message_types module
+use crate::ws::message_types::{Message, Subscription};
 
 #[derive(Serialize)]
 pub(crate) struct SubscriptionSendData<'a> {

@@ -6,6 +6,7 @@ mod exchange_responses;
 mod fast_order_sender;
 mod modify;
 mod order;
+mod order_pool;
 mod parallel_order_executor;
 
 pub use actions::*;
@@ -19,7 +20,8 @@ pub use order::{
     ClientLimit, ClientOrder, ClientOrderRequest, ClientTrigger, MarketCloseParams,
     MarketOrderParams, Order,
 };
+pub use order_pool::{OrderPool, OrderPoolStats};
 #[allow(unreachable_pub)]
 pub use parallel_order_executor::{
-    BatchExecutionResult, ExecutorConfig, ExecutorStats, ParallelOrderExecutor, StrategyAction,
+    BatchExecutionResult, ExecutorConfig, ExecutorStats, ParallelOrderExecutor,
 };
