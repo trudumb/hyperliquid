@@ -3,7 +3,7 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 
 use crate::{
-    exchange::{ClientOrderRequest, ExchangeClient},
+    exchange::{order_pool::OrderPool, ClientOrderRequest, ExchangeClient, OrderPoolStats},
     prelude::*,
     ExchangeResponseStatus,
 };
@@ -68,10 +68,11 @@ pub struct BufferPoolStats {
     pub capacity: usize,
 }
 
-/// High-performance order sender with zero-copy buffer pooling
+/// High-performance order sender with zero-copy buffer and object pooling
 ///
 /// This struct optimizes order placement for HFT by:
 /// - Pre-allocating and reusing buffers to avoid allocations
+/// - Pre-allocating and reusing order objects to reduce clones
 /// - Using parking_lot::Mutex for faster locking than std::Mutex
 /// - Minimizing memory copies during serialization
 ///
@@ -94,6 +95,7 @@ pub struct BufferPoolStats {
 pub struct FastOrderSender {
     client: Arc<ExchangeClient>,
     buffer_pool: BufferPool,
+    order_pool: OrderPool,
 }
 
 impl FastOrderSender {
@@ -116,6 +118,27 @@ impl FastOrderSender {
         Self {
             client: Arc::new(client),
             buffer_pool: BufferPool::new(pool_size, buffer_capacity),
+            order_pool: OrderPool::new(),
+        }
+    }
+
+    /// Create a FastOrderSender with custom buffer and order pool configuration
+    ///
+    /// # Arguments
+    /// * `client` - The ExchangeClient to use for sending orders
+    /// * `buffer_pool_size` - Initial number of pre-allocated buffers
+    /// * `buffer_capacity` - Capacity of each buffer in bytes
+    /// * `order_pool_size` - Initial number of pre-allocated order objects
+    pub fn with_full_pool_config(
+        client: ExchangeClient,
+        buffer_pool_size: usize,
+        buffer_capacity: usize,
+        order_pool_size: usize,
+    ) -> Self {
+        Self {
+            client: Arc::new(client),
+            buffer_pool: BufferPool::new(buffer_pool_size, buffer_capacity),
+            order_pool: OrderPool::with_initial_size(order_pool_size),
         }
     }
 
@@ -225,9 +248,40 @@ impl FastOrderSender {
         self.buffer_pool.stats()
     }
 
+    /// Get order pool statistics for monitoring
+    ///
+    /// Useful for debugging and performance monitoring to ensure
+    /// the order pool is properly sized for your workload.
+    pub fn order_pool_stats(&self) -> OrderPoolStats {
+        self.order_pool.stats()
+    }
+
+    /// Get the order pool hit rate (0.0 to 1.0)
+    ///
+    /// A higher hit rate indicates better pool utilization.
+    /// A hit rate below 0.8 might indicate the pool should be larger.
+    pub fn order_pool_hit_rate(&self) -> Option<f64> {
+        self.order_pool.hit_rate()
+    }
+
+    /// Reset order pool statistics
+    ///
+    /// Useful for benchmarking or monitoring specific time periods
+    pub fn reset_order_pool_stats(&self) {
+        self.order_pool.reset_stats();
+    }
+
     /// Get a reference to the underlying ExchangeClient
     pub fn client(&self) -> &ExchangeClient {
         &self.client
+    }
+
+    /// Get a reference to the order pool
+    ///
+    /// This allows manual acquisition and release of orders for
+    /// advanced use cases where you want to build orders yourself.
+    pub fn order_pool(&self) -> &OrderPool {
+        &self.order_pool
     }
 }
 
