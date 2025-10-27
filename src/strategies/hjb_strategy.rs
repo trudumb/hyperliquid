@@ -44,9 +44,10 @@ use crate::strategy::{CurrentState, MarketUpdate, Strategy, StrategyAction, Stra
 use crate::{
     AssetType, ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest,
     HawkesFillModel, L2BookData, MultiLevelConfig, MultiLevelOptimizer,
-    OrderBook, ParameterUncertainty, ParticleFilterState, RobustConfig,
+    OrderBook, ParameterUncertainty, ParticleFilterState,
     TickLotValidator, Trade, TradeInfo,
 };
+use crate::strategies::components::{RobustConfig, InventorySkewConfig};
 
 // Import the component-based architecture
 use crate::strategies::components::{
@@ -88,6 +89,9 @@ pub struct HjbStrategyConfig {
 
     /// Robust control configuration (robustness level, epsilon bounds)
     pub robust_config: Option<RobustConfig>,
+
+    /// Inventory skew configuration (position and book-based quote adjustments)
+    pub inventory_skew_config: Option<InventorySkewConfig>,
 
     /// HJB inventory aversion parameter (φ in the HJB equation)
     /// Higher = more aggressive inventory management
@@ -142,6 +146,11 @@ impl HjbStrategyConfig {
             None
         };
 
+        // Load inventory skew config
+        let inventory_skew_config = params.get("inventory_skew_config").and_then(|v| {
+            serde_json::from_value(v.clone()).ok()
+        });
+
         Self {
             asset: asset.to_string(),
             asset_type: AssetType::Perp,  // Default to Perp (can be configured via separate field if needed)
@@ -152,6 +161,7 @@ impl HjbStrategyConfig {
             multi_level_config,
             enable_robust_control,
             robust_config,
+            inventory_skew_config,
             phi: params.get("phi").and_then(|v| v.as_f64()).unwrap_or(0.01),
             lambda_base: params.get("lambda_base").and_then(|v| v.as_f64()).unwrap_or(1.0),
             maker_fee_bps: params.get("maker_fee_bps").and_then(|v| v.as_f64()).unwrap_or(1.5),
@@ -296,6 +306,10 @@ impl Strategy for HjbStrategy {
         let robust_config = strategy_config.robust_config.clone()
             .unwrap_or_else(|| RobustConfig::default());
 
+        // Initialize inventory skew config
+        let inventory_skew_config = strategy_config.inventory_skew_config.clone()
+            .unwrap_or_else(|| InventorySkewConfig::default());
+
         // Initialize multi-level optimizer
         let multi_level_config = strategy_config.multi_level_config.clone()
             .unwrap_or_else(|| MultiLevelConfig::default());
@@ -305,6 +319,7 @@ impl Strategy for HjbStrategy {
         let quote_optimizer = HjbMultiLevelOptimizer::new(
             multi_level_config.clone(),
             robust_config.clone(),
+            inventory_skew_config,
             strategy_config.asset.clone(),
             strategy_config.max_absolute_position_size,
             default_tuning_params,
