@@ -677,6 +677,16 @@ impl ParticleFilterState {
 
         sigma_std_approx * 10000.0 // Convert to BPS
     }
+
+    /// Get the effective sample size (ESS) of the particle filter
+    pub fn get_effective_sample_size(&self) -> f64 {
+        self.effective_sample_size
+    }
+
+    /// Get the number of particles in the filter
+    pub fn get_num_particles(&self) -> usize {
+        self.num_particles
+    }
 }
 
 #[cfg(test)]

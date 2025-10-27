@@ -152,6 +152,12 @@ struct BotRunner {
 
     /// Pending order placements (awaiting confirmation)
     pending_orders: HashMap<uuid::Uuid, ClientOrderRequest>,
+
+    /// Session start equity (for performance tracking)
+    session_start_equity: f64,
+
+    /// Total messages received (for throughput monitoring)
+    total_messages: u64,
 }
 
 impl BotRunner {
@@ -180,6 +186,9 @@ impl BotRunner {
 
         let account_equity = margin_summary.account_value.parse::<f64>().unwrap_or(0.0);
 
+        // Get max position size from strategy
+        let max_position_size = strategy.get_max_position_size();
+
         // Initialize current state
         let current_state = CurrentState {
             position: 0.0,
@@ -196,7 +205,7 @@ impl BotRunner {
             open_asks: Vec::new(),
             account_equity,
             margin_used: margin_summary.total_margin_used.parse::<f64>().unwrap_or(0.0),
-            max_position_size: 50.0, // Will be updated from strategy config
+            max_position_size,
             timestamp: chrono::Utc::now().timestamp() as f64,
             session_start_time: chrono::Utc::now().timestamp() as f64,
         };
@@ -219,6 +228,8 @@ impl BotRunner {
                 tui_tx,
                 cloid_to_oid: HashMap::new(),
                 pending_orders: HashMap::new(),
+                session_start_equity: account_equity,
+                total_messages: 0,
             },
             tui_rx,
         ))
@@ -305,6 +316,9 @@ impl BotRunner {
 
     /// Handle incoming WebSocket message
     async fn handle_message(&mut self, message: Message) {
+        // Increment message counter
+        self.total_messages += 1;
+
         match &message {
             Message::L2Book(_) => {
                 self.handle_l2_book(message).await;
@@ -517,6 +531,32 @@ impl BotRunner {
         }
     }
 
+    /// Calculate the order book level for a given price
+    fn calculate_order_level(&self, price: f64, is_buy: bool) -> usize {
+        if let Some(ref book) = self.current_state.order_book {
+            let levels = if is_buy { &book.bids } else { &book.asks };
+
+            for (idx, level) in levels.iter().enumerate() {
+                if let Ok(level_price) = level.px.parse::<f64>() {
+                    if is_buy {
+                        // For bids, higher price = better level
+                        if price >= level_price {
+                            return idx;
+                        }
+                    } else {
+                        // For asks, lower price = better level
+                        if price <= level_price {
+                            return idx;
+                        }
+                    }
+                }
+            }
+            // If we didn't find a match, it's deeper than the visible book
+            return levels.len();
+        }
+        0
+    }
+
     /// Execute a single order placement
     async fn execute_place_order(&mut self, order: ClientOrderRequest) {
         // Validate order
@@ -561,11 +601,12 @@ impl BotRunner {
                                         }
 
                                         // Update open orders in current state
+                                        let level = self.calculate_order_level(validated_order.limit_px, validated_order.is_buy);
                                         let resting_order = RestingOrder {
                                             oid: resting.oid,
                                             size: validated_order.sz,
                                             price: validated_order.limit_px,
-                                            level: 0, // TODO: Track actual level
+                                            level,
                                             pending_cancel: false,
                                         };
 
@@ -660,6 +701,9 @@ impl BotRunner {
 
     /// Update TUI dashboard
     fn update_tui(&self) {
+        // Get strategy-specific metrics
+        let strategy_metrics = self.strategy.get_tui_metrics();
+
         let dashboard_state = DashboardState {
             cur_position: self.current_state.position,
             avg_entry_price: self.current_state.avg_entry_price,
@@ -668,27 +712,27 @@ impl BotRunner {
             total_fees: self.current_state.total_fees,
             total_session_pnl: self.current_state.realized_pnl + self.current_state.unrealized_pnl - self.current_state.total_fees,
             account_equity: self.current_state.account_equity,
-            session_start_equity: self.current_state.account_equity, // TODO: Track actual start equity
-            sharpe_ratio: 0.0, // TODO: Calculate Sharpe ratio
+            session_start_equity: self.session_start_equity,
+            sharpe_ratio: strategy_metrics.sharpe_ratio,
             l2_mid_price: self.current_state.l2_mid_price,
             all_mids_price: self.current_state.l2_mid_price, // Using L2 mid as AllMids
             market_spread_bps: self.current_state.market_spread_bps,
             lob_imbalance: self.current_state.lob_imbalance,
-            volatility_ema_bps: 0.0, // TODO: Get from strategy
-            adverse_selection_estimate: 0.0, // TODO: Get from strategy
-            trade_flow_ema: 0.0, // TODO: Get from strategy
-            pf_ess: 0.0, // TODO: Get from strategy
-            pf_max_particles: 1000, // TODO: Get from strategy
-            pf_vol_5th: 0.0, // TODO: Get from strategy
-            pf_vol_95th: 0.0, // TODO: Get from strategy
-            pf_volatility_bps: 0.0, // TODO: Get from strategy
-            online_model_mae: 0.0, // TODO: Get from strategy
-            online_model_updates: 0, // TODO: Get from strategy
-            online_model_lr: 0.001, // TODO: Get from strategy
-            online_model_enabled: true, // TODO: Get from strategy
-            adam_gradient_samples: 0, // TODO: Get from strategy
-            adam_avg_loss: 0.0, // TODO: Get from strategy
-            adam_last_update_secs: 0.0, // TODO: Get from strategy
+            volatility_ema_bps: strategy_metrics.volatility_ema_bps,
+            adverse_selection_estimate: strategy_metrics.adverse_selection_estimate,
+            trade_flow_ema: strategy_metrics.trade_flow_ema,
+            pf_ess: strategy_metrics.pf_ess,
+            pf_max_particles: strategy_metrics.pf_max_particles,
+            pf_vol_5th: strategy_metrics.pf_vol_5th,
+            pf_vol_95th: strategy_metrics.pf_vol_95th,
+            pf_volatility_bps: strategy_metrics.pf_volatility_bps,
+            online_model_mae: strategy_metrics.online_model_mae,
+            online_model_updates: strategy_metrics.online_model_updates as usize,
+            online_model_lr: strategy_metrics.online_model_lr,
+            online_model_enabled: strategy_metrics.online_model_enabled,
+            adam_gradient_samples: strategy_metrics.adam_gradient_samples as usize,
+            adam_avg_loss: strategy_metrics.adam_avg_loss,
+            adam_last_update_secs: strategy_metrics.adam_last_update_secs,
             bid_levels: self.current_state.open_bids.iter().map(|o| {
                 hyperliquid_rust_sdk::tui::state::OrderLevel {
                     side: "BID".to_string(),
@@ -709,7 +753,7 @@ impl BotRunner {
             }).collect(),
             recent_fills: Default::default(),
             uptime_secs: (chrono::Utc::now().timestamp() as f64) - self.current_state.session_start_time,
-            total_messages: 0, // TODO: Track total messages
+            total_messages: self.total_messages,
         };
 
         let _ = self.tui_tx.send(dashboard_state);

@@ -40,7 +40,7 @@ use log::{debug, info};
 
 use serde_json::Value;
 
-use crate::strategy::{CurrentState, MarketUpdate, Strategy, StrategyAction, UserUpdate};
+use crate::strategy::{CurrentState, MarketUpdate, Strategy, StrategyAction, StrategyTuiMetrics, UserUpdate};
 use crate::{
     AssetType, ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest,
     HawkesFillModel, L2BookData, MultiLevelConfig, MultiLevelOptimizer,
@@ -307,12 +307,24 @@ impl Strategy for HjbStrategy {
             .unwrap_or_else(|| MultiLevelConfig::default());
 
         // Initialize the component-based quote optimizer (before moving multi_level_config)
+        // Convert tuning params from hjb_impl type to market_maker_v2 type
+        let default_tuning_params = TuningParams::default().get_constrained();
+        let converted_default_params = crate::market_maker_v2::ConstrainedTuningParams {
+            skew_adjustment_factor: default_tuning_params.skew_adjustment_factor,
+            adverse_selection_adjustment_factor: default_tuning_params.adverse_selection_adjustment_factor,
+            adverse_selection_lambda: default_tuning_params.adverse_selection_lambda,
+            inventory_urgency_threshold: default_tuning_params.inventory_urgency_threshold,
+            liquidation_rate_multiplier: default_tuning_params.liquidation_rate_multiplier,
+            min_spread_base_ratio: default_tuning_params.min_spread_base_ratio,
+            adverse_selection_spread_scale: default_tuning_params.adverse_selection_spread_scale,
+            control_gap_threshold: default_tuning_params.control_gap_threshold,
+        };
         let quote_optimizer = HjbMultiLevelOptimizer::new(
             multi_level_config.clone(),
             robust_config.clone(),
             strategy_config.asset.clone(),
             strategy_config.max_absolute_position_size,
-            TuningParams::default().get_constrained(),
+            converted_default_params,
         );
 
         let multi_level_optimizer = MultiLevelOptimizer::new(multi_level_config);
@@ -470,6 +482,69 @@ impl Strategy for HjbStrategy {
     fn name(&self) -> &str {
         "HJB Strategy v2"
     }
+
+    fn get_tui_metrics(&self) -> StrategyTuiMetrics {
+        // Read particle filter metrics
+        let pf = self.particle_filter.read();
+        let pf_ess = pf.get_effective_sample_size();
+        let pf_max_particles = pf.get_num_particles();
+        let pf_vol_5th = pf.estimate_volatility_percentile_bps(0.05);
+        let pf_vol_95th = pf.estimate_volatility_percentile_bps(0.95);
+        let pf_volatility_bps = pf.estimate_volatility_bps();
+        drop(pf);
+
+        // Read online model metrics
+        let model = self.online_adverse_selection_model.read();
+        let online_model_mae = model.mean_absolute_error;
+        let online_model_updates = model.update_count as u64;
+        let online_model_lr = model.learning_rate;
+        let online_model_enabled = model.enable_learning;
+        drop(model);
+
+        // Read Adam optimizer metrics
+        let adam = self.adam_optimizer.read();
+        let adam_gradient_samples = adam.t as u64;
+        // Calculate average loss from the optimizer's v (second moment)
+        let adam_avg_loss = if adam.t > 0 {
+            adam.v.iter().map(|&x| x.sqrt()).sum::<f64>() / adam.v.len() as f64
+        } else {
+            0.0
+        };
+        drop(adam);
+
+        // Calculate time since last update (for Adam)
+        let current_time = chrono::Utc::now().timestamp() as f64;
+        let cached_vol = self.cached_volatility.read();
+        let adam_last_update_secs = current_time - cached_vol.last_update_time;
+        drop(cached_vol);
+
+        // TODO: Calculate Sharpe ratio from historical returns
+        // For now, use a placeholder value
+        let sharpe_ratio = 0.0;
+
+        StrategyTuiMetrics {
+            volatility_ema_bps: self.state_vector.volatility_ema_bps,
+            pf_ess,
+            pf_max_particles,
+            pf_vol_5th,
+            pf_vol_95th,
+            pf_volatility_bps,
+            adverse_selection_estimate: self.state_vector.adverse_selection_estimate,
+            trade_flow_ema: self.state_vector.trade_flow_ema,
+            online_model_mae,
+            online_model_updates,
+            online_model_lr,
+            online_model_enabled,
+            adam_gradient_samples,
+            adam_avg_loss,
+            adam_last_update_secs,
+            sharpe_ratio,
+        }
+    }
+
+    fn get_max_position_size(&self) -> f64 {
+        self.config.max_absolute_position_size
+    }
 }
 
 // ============================================================================
@@ -477,6 +552,24 @@ impl Strategy for HjbStrategy {
 // ============================================================================
 
 impl HjbStrategy {
+    /// Convert from hjb_impl::ConstrainedTuningParams to market_maker_v2::ConstrainedTuningParams
+    ///
+    /// TODO: Remove this once the type duplication is resolved
+    fn convert_tuning_params(
+        params: &super::hjb_impl::ConstrainedTuningParams,
+    ) -> crate::market_maker_v2::ConstrainedTuningParams {
+        crate::market_maker_v2::ConstrainedTuningParams {
+            skew_adjustment_factor: params.skew_adjustment_factor,
+            adverse_selection_adjustment_factor: params.adverse_selection_adjustment_factor,
+            adverse_selection_lambda: params.adverse_selection_lambda,
+            inventory_urgency_threshold: params.inventory_urgency_threshold,
+            liquidation_rate_multiplier: params.liquidation_rate_multiplier,
+            min_spread_base_ratio: params.min_spread_base_ratio,
+            adverse_selection_spread_scale: params.adverse_selection_spread_scale,
+            control_gap_threshold: params.control_gap_threshold,
+        }
+    }
+
     /// Sync internal state vector with current bot state
     fn sync_state_vector(&mut self, state: &CurrentState) {
         self.state_vector.mid_price = state.l2_mid_price;
@@ -582,7 +675,8 @@ impl HjbStrategy {
         // --- COMPONENT CALL ---
         // Update the component's tuning params from the shared state
         let current_tuning_params = self.tuning_params.read().get_constrained();
-        self.quote_optimizer.set_tuning_params(current_tuning_params);
+        let converted_params = Self::convert_tuning_params(&current_tuning_params);
+        self.quote_optimizer.set_tuning_params(converted_params);
 
         // Call the component with metadata
         let hawkes_lock = self.hawkes_model.read();
