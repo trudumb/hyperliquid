@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::{
     exchange::{order_pool::OrderPool, ClientOrderRequest, ExchangeClient, OrderPoolStats},
     prelude::*,
+    rate_limiter::{RateLimitConfig, RateLimiter, RequestWeight},
     ExchangeResponseStatus,
 };
 
@@ -75,6 +76,7 @@ pub struct BufferPoolStats {
 /// - Pre-allocating and reusing order objects to reduce clones
 /// - Using parking_lot::Mutex for faster locking than std::Mutex
 /// - Minimizing memory copies during serialization
+/// - Rate limiting to comply with Hyperliquid's API limits
 ///
 /// # Example
 /// ```no_run
@@ -96,6 +98,7 @@ pub struct FastOrderSender {
     client: Arc<ExchangeClient>,
     buffer_pool: BufferPool,
     order_pool: OrderPool,
+    rate_limiter: RateLimiter,
 }
 
 impl FastOrderSender {
@@ -119,6 +122,7 @@ impl FastOrderSender {
             client: Arc::new(client),
             buffer_pool: BufferPool::new(pool_size, buffer_capacity),
             order_pool: OrderPool::new(),
+            rate_limiter: RateLimiter::new(RateLimitConfig::rest_api()),
         }
     }
 
@@ -139,12 +143,37 @@ impl FastOrderSender {
             client: Arc::new(client),
             buffer_pool: BufferPool::new(buffer_pool_size, buffer_capacity),
             order_pool: OrderPool::with_initial_size(order_pool_size),
+            rate_limiter: RateLimiter::new(RateLimitConfig::rest_api()),
         }
     }
 
-    /// Place a single order using zero-copy buffer pooling
+    /// Create a FastOrderSender with all custom configurations including rate limiting
+    ///
+    /// # Arguments
+    /// * `client` - The ExchangeClient to use for sending orders
+    /// * `buffer_pool_size` - Initial number of pre-allocated buffers
+    /// * `buffer_capacity` - Capacity of each buffer in bytes
+    /// * `order_pool_size` - Initial number of pre-allocated order objects
+    /// * `rate_limit_config` - Rate limiter configuration
+    pub fn with_complete_config(
+        client: ExchangeClient,
+        buffer_pool_size: usize,
+        buffer_capacity: usize,
+        order_pool_size: usize,
+        rate_limit_config: RateLimitConfig,
+    ) -> Self {
+        Self {
+            client: Arc::new(client),
+            buffer_pool: BufferPool::new(buffer_pool_size, buffer_capacity),
+            order_pool: OrderPool::with_initial_size(order_pool_size),
+            rate_limiter: RateLimiter::new(rate_limit_config),
+        }
+    }
+
+    /// Place a single order using zero-copy buffer pooling with rate limiting
     ///
     /// This method is optimized for minimal latency:
+    /// - Waits for rate limit capacity if needed
     /// - Acquires a pre-allocated buffer from the pool
     /// - Serializes the order directly into the buffer
     /// - Returns the buffer to the pool after use
@@ -158,6 +187,9 @@ impl FastOrderSender {
         &self,
         order: &ClientOrderRequest,
     ) -> Result<ExchangeResponseStatus> {
+        // Wait for rate limit capacity (weight = 1 for single order)
+        self.rate_limiter.acquire(RequestWeight::Exchange { batch_length: 0 }).await;
+
         // Acquire buffer from pool (zero allocation if available)
         let _buf = self.buffer_pool.acquire();
 
@@ -174,10 +206,11 @@ impl FastOrderSender {
         result
     }
 
-    /// Place multiple orders in a single request using zero-copy buffer pooling
+    /// Place multiple orders in a single request using zero-copy buffer pooling with rate limiting
     ///
     /// This is more efficient than calling `place_order_fast` multiple times
-    /// because it batches the orders into a single network request.
+    /// because it batches the orders into a single network request and uses
+    /// much less rate limit weight (1 + floor(batch_length / 40)).
     ///
     /// # Arguments
     /// * `orders` - Vector of orders to place
@@ -188,6 +221,11 @@ impl FastOrderSender {
         &self,
         orders: Vec<ClientOrderRequest>,
     ) -> Result<ExchangeResponseStatus> {
+        let batch_length = orders.len();
+
+        // Wait for rate limit capacity (batched weight is much lower!)
+        self.rate_limiter.acquire(RequestWeight::Exchange { batch_length }).await;
+
         // Acquire buffer from pool
         let _buf = self.buffer_pool.acquire();
 
@@ -200,7 +238,7 @@ impl FastOrderSender {
         result
     }
 
-    /// Cancel an order using zero-copy buffer pooling
+    /// Cancel an order using zero-copy buffer pooling with rate limiting
     ///
     /// # Arguments
     /// * `cancel_request` - The cancel request
@@ -211,6 +249,9 @@ impl FastOrderSender {
         &self,
         cancel_request: &crate::exchange::ClientCancelRequest,
     ) -> Result<ExchangeResponseStatus> {
+        // Wait for rate limit capacity (weight = 1 for single cancel)
+        self.rate_limiter.acquire(RequestWeight::Exchange { batch_length: 0 }).await;
+
         let _buf = self.buffer_pool.acquire();
 
         let result = self.client.cancel(cancel_request.clone(), None).await;
@@ -220,7 +261,32 @@ impl FastOrderSender {
         result
     }
 
-    /// Modify an order using zero-copy buffer pooling
+    /// Cancel multiple orders in a single request with rate limiting
+    ///
+    /// # Arguments
+    /// * `cancel_requests` - Vector of cancel requests
+    ///
+    /// # Returns
+    /// Result containing the exchange response status
+    pub async fn cancel_bulk_orders_fast(
+        &self,
+        cancel_requests: Vec<crate::exchange::ClientCancelRequest>,
+    ) -> Result<ExchangeResponseStatus> {
+        let batch_length = cancel_requests.len();
+
+        // Wait for rate limit capacity (batched weight is much lower!)
+        self.rate_limiter.acquire(RequestWeight::Exchange { batch_length }).await;
+
+        let _buf = self.buffer_pool.acquire();
+
+        let result = self.client.bulk_cancel(cancel_requests, None).await;
+
+        self.buffer_pool.release(_buf);
+
+        result
+    }
+
+    /// Modify an order using zero-copy buffer pooling with rate limiting
     ///
     /// # Arguments
     /// * `modify_request` - The modify request
@@ -231,6 +297,9 @@ impl FastOrderSender {
         &self,
         modify_request: &crate::exchange::ClientModifyRequest,
     ) -> Result<ExchangeResponseStatus> {
+        // Wait for rate limit capacity (weight = 1 for single modify)
+        self.rate_limiter.acquire(RequestWeight::Exchange { batch_length: 0 }).await;
+
         let _buf = self.buffer_pool.acquire();
 
         let result = self.client.modify(modify_request.clone(), None).await;
@@ -282,6 +351,35 @@ impl FastOrderSender {
     /// advanced use cases where you want to build orders yourself.
     pub fn order_pool(&self) -> &OrderPool {
         &self.order_pool
+    }
+
+    /// Get rate limiter statistics for monitoring
+    ///
+    /// Useful for monitoring API usage and ensuring you stay within limits
+    pub fn rate_limiter_stats(&self) -> crate::rate_limiter::RateLimitStats {
+        self.rate_limiter.stats()
+    }
+
+    /// Get rate limiter utilization (0.0 to 1.0)
+    ///
+    /// Returns the percentage of rate limit capacity currently in use.
+    /// Values > 0.8 indicate high usage and potential for delays.
+    pub fn rate_limiter_utilization(&self) -> f64 {
+        self.rate_limiter.utilization()
+    }
+
+    /// Get remaining rate limit capacity
+    ///
+    /// Returns the number of weight units available before rate limiting occurs
+    pub fn rate_limiter_remaining_capacity(&self) -> u32 {
+        self.rate_limiter.remaining_capacity()
+    }
+
+    /// Reset rate limiter statistics
+    ///
+    /// Useful for benchmarking or monitoring specific time periods
+    pub fn reset_rate_limiter_stats(&self) {
+        self.rate_limiter.reset_stats();
     }
 }
 
