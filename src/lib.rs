@@ -4,10 +4,8 @@ mod consts;
 mod eip712;
 mod errors;
 mod exchange;
-mod hawkes_multi_level;
 mod helpers;
 mod info;
-mod inventory_skew;
 mod meta;
 pub mod strategy;
 pub mod strategies;
@@ -43,8 +41,9 @@ pub use ws::*;
 
 // Re-export core HJB types from the strategies module
 pub use strategies::{
-    ConstrainedTuningParams, ControlVector, HJBComponents, OnlineAdverseSelectionModel,
-    StateVector, TuningParams, ValueFunction,
+    ConstrainedTuningParams, ControlVector, FillHistory, HawkesFillModel, HawkesParams,
+    HJBComponents, MultiLevelConfig, MultiLevelControl, MultiLevelOptimizer,
+    OnlineAdverseSelectionModel, OptimizationState, StateVector, TuningParams, ValueFunction,
 };
 
 // Re-export component-based strategy building blocks (NEW - recommended for new code)
@@ -53,7 +52,7 @@ pub use strategies::components::{
     AdverseSelectionModel, FillModel, InventorySkewModel, QuoteOptimizer,
     RobustControlModel, VolatilityModel,
     // Implementations
-    HawkesFillModelImpl, HjbMultiLevelOptimizer, OnlineSgdAsModel,
+    HawkesFillModelImpl, HjbMultiLevelOptimizer, InventorySkewCalculator, OnlineSgdAsModel,
     ParticleFilterVolModel, StandardInventorySkew, StandardRobustControl,
     // Supporting types
     OptimizerInputs, OptimizerOutput, ParameterUncertainty, RobustParameters, SkewResult,
@@ -83,11 +82,9 @@ pub use strategies::components::{
 // - Old: ParticleFilterState (direct use)
 // - New: ParticleFilterVolModel (component wrapper) implementing VolatilityModel trait
 
-pub use hawkes_multi_level::{
-    FillHistory, HawkesFillModel, HawkesParams, MultiLevelConfig,
-    MultiLevelControl, MultiLevelOptimizer, OptimizationState,
-};
-pub use inventory_skew::{InventorySkewCalculator, InventorySkewConfig as LegacyInventorySkewConfig};
+// Note: Hawkes and multi-level types are now in strategies::hjb_impl but re-exported above for convenience
+// Note: InventorySkewCalculator is now in strategies::components but re-exported above for convenience
+pub use strategies::components::InventorySkewConfig as LegacyInventorySkewConfig;
 pub use robust_hjb_control::{
     RobustConfig as LegacyRobustConfig,
     RobustParameters as LegacyRobustParameters,

@@ -37,8 +37,9 @@ mod hjb_impl;
 // Re-export core HJB types from the private implementation module
 // These are needed by users of the hjb_strategy and other modules
 pub use hjb_impl::{
-    ConstrainedTuningParams, ControlVector, HJBComponents,
-    OnlineAdverseSelectionModel, StateVector, TuningParams, ValueFunction,
+    ConstrainedTuningParams, ControlVector, FillHistory, HawkesFillModel, HawkesParams,
+    HJBComponents, MultiLevelConfig, MultiLevelControl, MultiLevelOptimizer,
+    OnlineAdverseSelectionModel, OptimizationState, StateVector, TuningParams, ValueFunction,
 };
 
 // Future strategies can be added here:

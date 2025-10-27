@@ -65,5 +65,5 @@ pub use particle_filter_vol::ParticleFilterVolModel;
 pub use hawkes_fill_model::HawkesFillModelImpl;
 pub use online_sgd_as::OnlineSgdAsModel;
 pub use hjb_multi_level_optimizer::{HjbMultiLevelOptimizer, OptimizerOutput};
-pub use inventory_skew_impl::{StandardInventorySkew, InventorySkewConfig};
+pub use inventory_skew_impl::{StandardInventorySkew, InventorySkewConfig, InventorySkewCalculator};
 pub use robust_control_impl::{StandardRobustControl, RobustConfig};
