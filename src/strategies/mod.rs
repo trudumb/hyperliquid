@@ -28,6 +28,9 @@
 
 pub mod hjb_strategy;
 
+// Component-based architecture for strategies
+pub mod components;
+
 // Future strategies can be added here:
 // pub mod grid_strategy;
 // pub mod momentum_strategy;
