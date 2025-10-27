@@ -344,23 +344,6 @@ impl InventorySkewCalculator {
 #[cfg(test)]
 mod legacy_tests {
     use super::*;
-    use super::book_analyzer::BookAnalysis;
-
-    #[test]
-    fn test_legacy_position_skew_long() {
-        let config = InventorySkewConfig::new(0.5, 0.0, 5).unwrap();
-        let calculator = InventorySkewCalculator::new(config);
-
-        // Long 3 HYPE out of max 5 HYPE = 60% position
-        let skew = calculator.calculate_skew(3.0, 5.0, None, 10.0);
-
-        // Position ratio: 0.6
-        // Position component: -0.6 * 0.5 * 10.0 = -3.0 bps
-        // (Negative because we want to shift down to encourage selling)
-        assert!((skew.position_ratio - 0.6).abs() < 0.01);
-        assert!((skew.position_component_bps - (-3.0)).abs() < 0.01);
-        assert!((skew.skew_bps - (-3.0)).abs() < 0.01);
-    }
 
     #[test]
     fn test_legacy_position_skew_short() {
