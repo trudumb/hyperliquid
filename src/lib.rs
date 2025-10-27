@@ -13,7 +13,6 @@ mod prelude;
 mod req;
 mod signature;
 mod tick_lot_size;
-pub mod tui;
 mod ws;
 
 // ============================================================================
@@ -27,7 +26,7 @@ pub use helpers::{bps_diff, truncate_float, BaseUrl};
 pub use info::{info_client::*, *};
 pub use meta::{AssetContext, AssetMeta, Meta, MetaAndAssetCtxs, SpotAssetMeta, SpotMeta};
 pub use strategy::{
-    CurrentState, MarketUpdate, RestingOrder, Strategy, StrategyAction, StrategyTuiMetrics, UserUpdate,
+    CurrentState, MarketUpdate, RestingOrder, Strategy, StrategyAction, UserUpdate,
 };
 pub use tick_lot_size::{AssetType, TickLotValidator};
 pub use ws::*;
