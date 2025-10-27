@@ -97,7 +97,7 @@ use std::env;
 use std::fs;
 use std::sync::Arc;
 use tokio::signal;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 // ============================================================================
@@ -240,7 +240,7 @@ impl BotRunner {
         info!("🚀 Starting bot runner event loop...");
 
         // Set up websocket subscriptions
-        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = flume::unbounded();
 
         // Subscribe to user events (fills)
         self.info_client
@@ -294,12 +294,15 @@ impl BotRunner {
                 }
 
                 // Handle WebSocket messages
-                message = receiver.recv() => {
-                    if let Some(message) = message {
-                        self.handle_message(message).await;
-                    } else {
-                        error!("WebSocket channel closed");
-                        break;
+                message = receiver.recv_async() => {
+                    match message {
+                        Ok(message) => {
+                            self.handle_message(message).await;
+                        }
+                        Err(_) => {
+                            error!("WebSocket channel closed");
+                            break;
+                        }
                     }
                 }
 
