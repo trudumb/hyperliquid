@@ -16,6 +16,7 @@ use alloy::signers::local::PrivateKeySigner;
 use hyperliquid_rust_sdk::AssetType;
 use hyperliquid_rust_sdk::market_maker_v2::{MarketMaker, MarketMakerInput};
 use hyperliquid_rust_sdk::{MultiLevelConfig, RobustConfig};
+use hyperliquid_rust_sdk::tui::run_tui;
 use std::env;
 use tokio::signal;
 use log::info;
@@ -27,11 +28,7 @@ async fn main() {
     let file_appender = tracing_appender::rolling::never("./", "market_maker.log");
     let (non_blocking_writer, _guard) = tracing_appender::non_blocking(file_appender);
 
-    // Create console layer (human-readable)
-    let console_layer = fmt::layer()
-        .with_writer(std::io::stderr);
-
-    // Create file layer (JSON format)
+    // Create file layer (JSON format) - NO CONSOLE OUTPUT (using TUI instead)
     let file_layer = fmt::layer()
         .json()
         .with_writer(non_blocking_writer);
@@ -40,14 +37,11 @@ async fn main() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
-    // Combine layers and initialize global logger
+    // Initialize global logger with ONLY file output (TUI replaces console)
     tracing_subscriber::registry()
         .with(filter)
-        .with(console_layer)
         .with(file_layer)
         .init();
-
-    log::info!("Logger initialized. Logging to console and market_maker.log");
 
     // Load environment variables from .env file
     dotenv::dotenv().ok();
@@ -90,39 +84,51 @@ async fn main() {
         robust_config: Some(robust_config),  // Provide configuration
     };
     
-    let mut market_maker = MarketMaker::new(market_maker_input).await
+    let (mut market_maker, tui_state_rx) = MarketMaker::new(market_maker_input).await
         .expect("Failed to create market maker");
-    
+
+    // Log initialization to file only
     info!("=== Market Maker V2 Initialized ===");
     info!("Asset: HYPE-USD");
-    info!("Max Position: 3.0 HYPE");
+    info!("Max Position: 50.0 HYPE");
     info!("Multi-Level: ENABLED (3 levels per side)");
-    info!("  - Total size per side: 0.3 HYPE");
+    info!("  - Total size per side: 1.0 HYPE");
     info!("  - Level spacing: 1.5 bps");
     info!("  - Min profitable spread: 4.0 bps");
     info!("Robust Control: ENABLED (70% robustness level)");
-    info!("Trading Enablement: Starts disabled, enables when performance gap < 15%");
+    info!("Trading Enablement: Starts disabled, enables when performance gap < 30%");
     info!("Features:");
     info!("  - State Vector with adverse selection estimation");
     info!("  - Multi-Level Optimizer with Hawkes fill model");
     info!("  - Particle Filter for stochastic volatility");
     info!("  - Robust HJB with uncertainty bounds");
     info!("  - Adam Optimizer for autonomous parameter tuning");
+    info!("  - TUI Dashboard for real-time monitoring");
     info!("====================================");
-    
+
+    // Spawn TUI dashboard task
+    let tui_handle = tokio::spawn(async move {
+        if let Err(e) = run_tui(tui_state_rx).await {
+            eprintln!("TUI error: {}", e);
+        }
+    });
+
     // Set up shutdown signal channel
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    
-    // Set up Ctrl+C handler
+
+    // Set up Ctrl+C handler (TUI handles this too with 'q' key)
     tokio::spawn(async move {
         signal::ctrl_c().await.expect("Failed to install Ctrl+C handler");
         info!("Received Ctrl+C signal, sending shutdown signal...");
         let _ = shutdown_tx.send(());
     });
-    
+
     // Start market maker with shutdown signal
-    info!("Starting V2 market maker with multi-level optimization...");
+    info!("Starting V2 market maker with multi-level optimization and TUI dashboard...");
     market_maker.start_with_shutdown_signal(Some(shutdown_rx)).await;
-    
+
+    // Wait for TUI to finish
+    let _ = tui_handle.await;
+
     info!("Market Maker V2 shutdown complete.");
 }

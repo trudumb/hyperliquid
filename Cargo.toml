@@ -40,3 +40,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-log = "0.2"
 tracing-appender = "0.2"
 parking_lot = "0.12"  # Faster RwLock implementation
+ratatui = "0.29"
+crossterm = "0.28"

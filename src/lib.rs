@@ -8,7 +8,6 @@ mod hawkes_multi_level;
 mod helpers;
 mod info;
 mod inventory_skew;
-mod market_maker;
 pub mod market_maker_v2;
 mod meta;
 mod prelude;
@@ -17,6 +16,7 @@ mod robust_hjb_control;
 mod signature;
 mod stochastic_volatility;
 mod tick_lot_size;
+pub mod tui;
 mod ws;
 pub use book_analyzer::{BookAnalysis, OrderBook};
 pub use consts::{EPSILON, LOCAL_API_URL, MAINNET_API_URL, TESTNET_API_URL};
@@ -30,7 +30,6 @@ pub use hawkes_multi_level::{
 pub use helpers::{bps_diff, truncate_float, BaseUrl};
 pub use info::{info_client::*, *};
 pub use inventory_skew::{InventorySkewCalculator, InventorySkewConfig, SkewResult};
-pub use market_maker::{MarketMaker, MarketMakerInput, MarketMakerRestingOrder};
 pub use market_maker_v2::{
     MarketMaker as MarketMakerV2, MarketMakerInput as MarketMakerInputV2, 
     MarketMakerRestingOrder as MarketMakerRestingOrderV2, StateVector, ControlVector,
