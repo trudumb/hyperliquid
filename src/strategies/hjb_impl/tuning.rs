@@ -56,6 +56,7 @@ impl Default for AdamOptimizerState {
 }
 
 impl AdamOptimizerState {
+    #[allow(dead_code)]
     pub fn new(alpha: f64, beta1: f64, beta2: f64) -> Self {
         Self {
             m: vec![0.0; 8],
@@ -85,12 +86,14 @@ impl AdamOptimizerState {
         updates
     }
 
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.m = vec![0.0; 8];
         self.v = vec![0.0; 8];
         self.t = 0;
     }
 
+    #[allow(dead_code)]
     pub fn get_effective_learning_rate(&self, param_index: usize) -> f64 {
         if self.t == 0 || param_index >= 8 {
             return 0.0;
