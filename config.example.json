@@ -1,0 +1,35 @@
+{
+  "asset": "HYPE",
+  "strategy_name": "hjb_v1",
+  "strategy_params": {
+    "max_absolute_position_size": 50.0,
+    "asset_type": "Perp",
+    "enable_multi_level": true,
+    "enable_robust_control": true,
+    "enable_online_learning": true,
+    "enable_trading_gap_threshold_percent": 30.0,
+    "phi": 0.01,
+    "lambda_base": 1.0,
+    "maker_fee_bps": 1.5,
+    "taker_fee_bps": 4.5,
+    "multi_level_config": {
+      "max_levels": 3,
+      "min_profitable_spread_bps": 4.0,
+      "level_spacing_bps": 1.5,
+      "total_size_per_side": 1.0,
+      "inventory_risk_limit": 0.7,
+      "directional_aggression": 1.0,
+      "momentum_threshold": 1.5,
+      "momentum_tightening_bps": 0.5,
+      "inventory_urgency_threshold": 0.9
+    },
+    "robust_config": {
+      "enabled": true,
+      "robustness_level": 0.7,
+      "min_epsilon_mu": 0.0001,
+      "min_epsilon_sigma": 0.0001,
+      "max_spread_multiplier": 2.0,
+      "max_inventory_multiplier": 1.5
+    }
+  }
+}
