@@ -11,6 +11,7 @@ use crate::{
         ExchangeResponseStatus,
     },
     prelude::*,
+    rate_limiter::{RateLimitConfig, RateLimiter, RequestWeight},
     Error,
 };
 
@@ -57,6 +58,8 @@ pub struct ExecutorConfig {
     pub request_timeout_ms: u64,
     /// Maximum timeout for entire batch (milliseconds)
     pub batch_timeout_ms: u64,
+    /// Rate limiter configuration
+    pub rate_limit_config: RateLimitConfig,
 }
 
 impl Default for ExecutorConfig {
@@ -66,6 +69,7 @@ impl Default for ExecutorConfig {
             batch_window_us: 100,        // 100μs batching window
             request_timeout_ms: 500,     // 500ms per request (matches HTTP timeout)
             batch_timeout_ms: 2000,      // 2s for entire batch
+            rate_limit_config: RateLimitConfig::rest_api(), // Default REST API limits
         }
     }
 }
@@ -102,6 +106,7 @@ impl Default for ExecutorConfig {
 pub struct ParallelOrderExecutor {
     exchange: Arc<ExchangeClient>,
     semaphore: Arc<Semaphore>,
+    rate_limiter: RateLimiter,
     config: ExecutorConfig,
     /// Statistics tracking
     stats: Arc<Mutex<ExecutorStats>>,
@@ -137,6 +142,7 @@ impl ParallelOrderExecutor {
         Self {
             exchange,
             semaphore: Arc::new(Semaphore::new(config.max_concurrent)),
+            rate_limiter: RateLimiter::new(config.rate_limit_config.clone()),
             config,
             stats: Arc::new(Mutex::new(ExecutorStats::default())),
         }
@@ -184,11 +190,16 @@ impl ParallelOrderExecutor {
 
         // Batch place orders
         if !places.is_empty() {
+            let batch_length = places.len();
             let permit = self.semaphore.clone().acquire_owned().await.ok();
             let exchange = self.exchange.clone();
+            let rate_limiter = self.rate_limiter.clone();
             let timeout_ms = self.config.request_timeout_ms;
 
             handles.push(tokio::spawn(async move {
+                // Acquire rate limit capacity for this batch
+                rate_limiter.acquire(RequestWeight::Exchange { batch_length }, 0).await;
+
                 let result = timeout(
                     Duration::from_millis(timeout_ms),
                     exchange.bulk_order(places, None),
@@ -207,11 +218,16 @@ impl ParallelOrderExecutor {
 
         // Batch cancel orders
         if !cancels.is_empty() {
+            let batch_length = cancels.len();
             let permit = self.semaphore.clone().acquire_owned().await.ok();
             let exchange = self.exchange.clone();
+            let rate_limiter = self.rate_limiter.clone();
             let timeout_ms = self.config.request_timeout_ms;
 
             handles.push(tokio::spawn(async move {
+                // Acquire rate limit capacity for this batch
+                rate_limiter.acquire(RequestWeight::Exchange { batch_length }, 0).await;
+
                 let result = timeout(
                     Duration::from_millis(timeout_ms),
                     exchange.bulk_cancel(cancels, None),
@@ -230,11 +246,16 @@ impl ParallelOrderExecutor {
 
         // Batch modify orders
         if !modifies.is_empty() {
+            let batch_length = modifies.len();
             let permit = self.semaphore.clone().acquire_owned().await.ok();
             let exchange = self.exchange.clone();
+            let rate_limiter = self.rate_limiter.clone();
             let timeout_ms = self.config.request_timeout_ms;
 
             handles.push(tokio::spawn(async move {
+                // Acquire rate limit capacity for this batch
+                rate_limiter.acquire(RequestWeight::Exchange { batch_length }, 0).await;
+
                 let result = timeout(
                     Duration::from_millis(timeout_ms),
                     exchange.bulk_modify(modifies, None),
