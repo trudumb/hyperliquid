@@ -132,8 +132,8 @@ struct BotRunner {
     /// Exchange client for order management
     exchange_client: Arc<ExchangeClient>,
 
-    /// Info client for market data queries
-    info_client: InfoClient,
+    /// Info client for market data queries (Option to allow explicit drop on shutdown)
+    info_client: Option<InfoClient>,
 
     /// User wallet address
     user_address: alloy::primitives::Address,
@@ -211,7 +211,7 @@ impl BotRunner {
             asset,
             strategy,
             exchange_client,
-            info_client,
+            info_client: Some(info_client),
             user_address,
             tick_lot_validator,
             current_state,
@@ -230,6 +230,8 @@ impl BotRunner {
 
         // Subscribe to user events (fills)
         self.info_client
+            .as_mut()
+            .unwrap()
             .subscribe(
                 Subscription::UserEvents {
                     user: self.user_address,
@@ -240,11 +242,15 @@ impl BotRunner {
 
         // Subscribe to AllMids (mid-price updates)
         self.info_client
+            .as_mut()
+            .unwrap()
             .subscribe(Subscription::AllMids, sender.clone())
             .await?;
 
         // Subscribe to L2Book (order book updates)
         self.info_client
+            .as_mut()
+            .unwrap()
             .subscribe(
                 Subscription::L2Book {
                     coin: self.asset.clone(),
@@ -255,6 +261,8 @@ impl BotRunner {
 
         // Subscribe to Trades (market trades for flow analysis)
         self.info_client
+            .as_mut()
+            .unwrap()
             .subscribe(
                 Subscription::Trades {
                     coin: self.asset.clone(),
@@ -272,6 +280,8 @@ impl BotRunner {
         // Main event loop
         loop {
             tokio::select! {
+                biased;  // Prioritize shutdown signal over other branches
+
                 // Check for shutdown signal
                 _ = &mut shutdown_rx => {
                     info!("🛑 Shutdown signal received");
@@ -299,7 +309,15 @@ impl BotRunner {
             }
         }
 
-        info!("✅ Bot runner event loop terminated");
+        // Explicit cleanup: Drop info_client to trigger stop_flag and terminate background tasks
+        info!("🔌 Closing WebSocket connections...");
+        if let Some(info_client) = self.info_client.take() {
+            drop(info_client);
+        }
+        // Give background tasks time to see stop_flag and terminate
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        info!("✅ Bot runner stopped");
         Ok(())
     }
 
@@ -771,11 +789,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set up shutdown signals
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
-    // Set up Ctrl+C handler
+    // Set up Ctrl+C handler with timeout safety net
     tokio::spawn(async move {
         signal::ctrl_c().await.expect("Failed to install Ctrl+C handler");
-        info!("Received Ctrl+C signal");
+        info!("🛑 Ctrl+C - shutting down...");
         let _ = shutdown_tx.send(());
+
+        // Spawn a timeout task that will force-exit if shutdown hangs
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = signal::ctrl_c() => {
+                    warn!("⚠️  Second Ctrl+C - forcing exit!");
+                    std::process::exit(0);
+                }
+                _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {
+                    error!("❌ Shutdown timeout - forcing exit!");
+                    std::process::exit(1);
+                }
+            }
+        });
     });
 
     // Run bot runner
