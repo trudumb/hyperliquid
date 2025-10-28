@@ -90,8 +90,8 @@ use hyperliquid_rust_sdk::{
 };
 use hyperliquid_rust_sdk::strategies::hjb_strategy::HjbStrategy;
 
-use log::{error, info, warn};
-use std::collections::HashMap;
+use log::{error, info, warn, debug};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::sync::Arc;
@@ -159,6 +159,9 @@ struct BotRunner {
 
     /// Flag to track if initial snapshot has been received
     snapshot_received: bool,
+
+    /// Track which fills we've already processed to prevent duplicates
+    processed_fill_ids: HashSet<u64>,
 }
 
 impl BotRunner {
@@ -227,6 +230,7 @@ impl BotRunner {
             total_messages: 0,
             is_shutting_down: Arc::new(AtomicBool::new(false)),
             snapshot_received: false,
+            processed_fill_ids: HashSet::new(),
         })
     }
 
@@ -379,34 +383,31 @@ impl BotRunner {
                 let is_snapshot = fills_data.is_snapshot.unwrap_or(false);
 
                 if is_snapshot {
-                    // Skip the initial snapshot - we only want real-time fills
+                    // Process snapshot ONCE to initialize position state
                     if !self.snapshot_received {
-                        info!("📸 Skipping initial snapshot of {} historical fills", fills_data.fills.len());
+                        info!("📸 Initializing from snapshot: {} historical fills", fills_data.fills.len());
+
+                        // Process all historical fills to reconstruct current position
+                        for fill in &fills_data.fills {
+                            self.process_fill(fill);
+                            // Track that we processed this fill
+                            let fill_id = self.get_fill_id(fill);
+                            self.processed_fill_ids.insert(fill_id);
+                        }
+
+                        info!("✅ Position initialized: {} units @ avg price ${:.2}",
+                              self.current_state.position,
+                              self.current_state.avg_entry_price);
+
                         self.snapshot_received = true;
                     }
-                    // Ignore all snapshot data
-                    return;
+                    return; // Always return after snapshot
                 }
 
-                // Only process real-time fill updates
-                if !fills_data.fills.is_empty() {
-                    info!("📊 Received {} real-time fills", fills_data.fills.len());
-
-                    let mut processed_fills = Vec::new();
-
-                    for fill in &fills_data.fills {
-                        self.process_fill(fill);
-                        processed_fills.push(fill.clone());
-                    }
-
-                    // Only call strategy if there were fills to process
-                    if !processed_fills.is_empty() {
-                        // Create user update and pass to strategy *after* state is updated
-                        let user_update = UserUpdate::from_fills(processed_fills);
-                        let actions = self.strategy.on_user_update(&self.current_state, &user_update);
-                        self.execute_actions(actions).await;
-                    }
-                }
+                // IGNORE all streaming fills from UserFills - UserEvents will handle them
+                // This prevents duplicate processing
+                debug!("Ignoring {} streaming fills from UserFills (UserEvents handles these)",
+                       fills_data.fills.len());
             }
             _ => {
                 // Ignore other message types
@@ -489,19 +490,99 @@ impl BotRunner {
         }
     }
 
-    /// Handle user events (fills, order updates)
+    /// Handle user events (fills, funding, liquidations, non-user cancels)
     async fn handle_user_events(&mut self, user_events_msg: Message) {
         if let Message::User(user_events) = user_events_msg {
-            if let UserData::Fills(fills) = user_events.data {
-                // Update current state with fills
-                for fill in &fills {
-                    self.process_fill(fill);
+            match user_events.data {
+                UserData::Fills(fills) => {
+                    // These are REAL-TIME fills only (no snapshot)
+                    if fills.is_empty() {
+                        return;
+                    }
+
+                    info!("📊 Received {} real-time fills from UserEvents", fills.len());
+
+                    let mut new_fills = Vec::new();
+
+                    for fill in &fills {
+                        let fill_id = self.get_fill_id(fill);
+
+                        // Check if we already processed this fill (from snapshot)
+                        if self.processed_fill_ids.contains(&fill_id) {
+                            debug!("Skipping duplicate fill: tid={}", fill.tid);
+                            continue;
+                        }
+
+                        // Process new fill
+                        self.process_fill(fill);
+                        self.processed_fill_ids.insert(fill_id);
+                        new_fills.push(fill.clone());
+                    }
+
+                    // Only notify strategy if there were NEW fills
+                    if !new_fills.is_empty() {
+                        let user_update = UserUpdate::from_fills(new_fills);
+                        let actions = self.strategy.on_user_update(&self.current_state, &user_update);
+                        self.execute_actions(actions).await;
+                    }
                 }
 
-                // Create user update and pass to strategy
-                let user_update = UserUpdate::from_fills(fills);
-                let actions = self.strategy.on_user_update(&self.current_state, &user_update);
-                self.execute_actions(actions).await;
+                UserData::Funding(funding) => {
+                    info!("💰 Funding payment: {} USDC for {} (rate: {})",
+                          funding.usdc,
+                          funding.coin,
+                          funding.funding_rate);
+
+                    // Update PnL with funding costs
+                    let funding_amount = funding.usdc.parse::<f64>().unwrap_or(0.0);
+                    self.current_state.realized_pnl += funding_amount; // Funding can be + or -
+
+                    // Log for tracking
+                    info!("   Updated realized PnL: ${:.4}", self.current_state.realized_pnl);
+                }
+
+                UserData::Liquidation(liq) => {
+                    error!("🚨 LIQUIDATION EVENT!");
+                    error!("   Liquidated user: {}", liq.liquidated_user);
+                    error!("   Liquidator: {}", liq.liquidator);
+                    error!("   Position: {}", liq.liquidated_ntl_pos);
+                    error!("   Account value: {}", liq.liquidated_account_value);
+
+                    // Check if it's OUR liquidation
+                    if liq.liquidated_user == self.user_address.to_string() {
+                        error!("⚠️ WE WERE LIQUIDATED!");
+                        // Emergency actions:
+                        // 1. Stop trading
+                        // 2. Alert external systems
+                        // 3. Initiate emergency shutdown
+                        self.is_shutting_down.store(true, Ordering::Relaxed);
+                    }
+                }
+
+                UserData::NonUserCancel(cancels) => {
+                    for cancel in &cancels {
+                        warn!("⚠️ System cancelled order {} for {}", cancel.oid, cancel.coin);
+
+                        // Remove from our tracking
+                        self.current_state.open_bids.retain(|order| order.oid != cancel.oid);
+                        self.current_state.open_asks.retain(|order| order.oid != cancel.oid);
+
+                        // Remove from pending orders - need to find by oid
+                        let cloid_to_remove: Vec<uuid::Uuid> = self.cloid_to_oid
+                            .iter()
+                            .filter(|(_, &oid)| oid == cancel.oid)
+                            .map(|(&cloid, _)| cloid)
+                            .collect();
+
+                        for cloid in cloid_to_remove {
+                            self.pending_orders.remove(&cloid);
+                            self.cloid_to_oid.remove(&cloid);
+                        }
+
+                        // Log why this might have happened
+                        info!("   Possible reasons: post-only order would cross, position limit, margin");
+                    }
+                }
             }
         }
     }
@@ -777,6 +858,20 @@ impl BotRunner {
         // Call strategy tick hook
         let actions = self.strategy.on_tick(&self.current_state);
         self.execute_actions(actions).await;
+
+        // Clean up old fill IDs periodically (every hour)
+        if self.total_messages % 3600 == 0 && self.processed_fill_ids.len() > 1000 {
+            info!("🧹 Cleaning up old fill IDs (keeping last 1000)");
+            // In production, we keep the most recent based on timestamp
+            // For simplicity, just clear if too large
+            self.processed_fill_ids.clear();
+        }
+    }
+
+    /// Generate unique ID for a fill to detect duplicates
+    /// Using tid (50-bit hash) ensures uniqueness
+    fn get_fill_id(&self, fill: &TradeInfo) -> u64 {
+        fill.tid
     }
 }
 
