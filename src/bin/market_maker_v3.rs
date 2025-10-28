@@ -187,8 +187,8 @@ impl BotRunner {
         let executor_config = ExecutorConfig {
             max_concurrent: 8,         // Allow up to 8 parallel requests
             batch_window_us: 100,      // 100μs batching window
-            request_timeout_ms: 1500,   // Slightly longer timeout for batched requests
-            batch_timeout_ms: 3000,    // 3s total batch timeout
+            request_timeout_ms: 2500,   // Slightly longer timeout for batched requests
+            batch_timeout_ms: 4000,    // 3s total batch timeout
             ..Default::default()       // Use default rate limit config
         };
 
