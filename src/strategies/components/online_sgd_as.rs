@@ -43,6 +43,9 @@ use super::adverse_selection::AdverseSelectionModel;
 use log::info;
 use std::collections::VecDeque;
 
+/// Number of seconds in a year for annualizing volatility
+const SECONDS_PER_YEAR: f64 = 365.25 * 24.0 * 60.0 * 60.0;
+
 /// Internal state representation extracted from market updates
 /// This mirrors the StateVector structure from market_maker_v2.rs
 #[derive(Clone, Debug)]
@@ -345,17 +348,25 @@ impl OnlineSgdAsModel {
             if self.state.previous_mid_price > 0.0 && self.state.mid_price > 0.0 {
                 if let Some(last_time) = self.last_update_time {
                     let dt = now.duration_since(last_time).as_secs_f64();
-                    if dt > 0.0 {
+                    if dt > 1e-9 { // Use a small epsilon instead of just > 0.0
                         let log_return = (self.state.mid_price / self.state.previous_mid_price).ln();
-                        let realized_vol = log_return.abs() / dt.sqrt();
-                        let realized_vol_bps = realized_vol * 10000.0;
 
-                        // EMA update
+                        // Calculate instantaneous volatility (std dev per sqrt(second))
+                        let realized_vol_inst = log_return.abs() / dt.sqrt();
+
+                        // Annualize the volatility
+                        let realized_vol_annualized = realized_vol_inst * SECONDS_PER_YEAR.sqrt();
+
+                        // Convert annualized volatility to basis points
+                        let realized_vol_bps = realized_vol_annualized * 10000.0;
+
+                        // EMA update (ensure volatility_ema_bps is treated as annualized bps)
                         if self.state.volatility_ema_bps > 0.0 {
                             self.state.volatility_ema_bps =
                                 self.ema_alpha * realized_vol_bps +
                                 (1.0 - self.ema_alpha) * self.state.volatility_ema_bps;
                         } else {
+                            // Initialize EMA
                             self.state.volatility_ema_bps = realized_vol_bps;
                         }
                     }

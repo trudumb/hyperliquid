@@ -25,9 +25,9 @@
 // }
 //
 // impl FillModel for SimplePoissonFillModel {
-//     fn on_fills(&mut self, fills: &[TradeInfo], _current_time_sec: f64) {
+//     fn on_fills(&mut self, fills_with_levels: &[(TradeInfo, Option<usize>)], _current_time_sec: f64) {
 //         // Could use fill data to update base_rate estimate
-//         self.base_rate = fills.len() as f64 / 60.0;  // fills per second
+//         self.base_rate = fills_with_levels.len() as f64 / 60.0;  // fills per second
 //     }
 //
 //     fn get_hawkes_model(&self) -> &crate::HawkesFillModel {
@@ -57,20 +57,24 @@ pub trait FillModel: Send {
     /// The model should use this information to update its internal parameters.
     ///
     /// # Arguments
-    /// - `fills`: List of trade confirmations from the exchange
+    /// - `fills_with_levels`: List of (TradeInfo, Option<level>) tuples where:
+    ///   - TradeInfo: Trade confirmation from the exchange
+    ///   - Option<usize>: The level at which the fill occurred (0=L1, 1=L2, etc.)
+    ///     - Some(level): Level was successfully identified from the resting order
+    ///     - None: Level could not be determined (order already removed)
     /// - `current_time_sec`: Current time in seconds (Unix timestamp)
     ///
     /// # Notes
     /// - Fills are reported by the exchange after execution
-    /// - The model should extract level information if available
-    /// - For multi-level models, tracking which level got filled is crucial
+    /// - Level information is critical for accurate multi-level fill rate learning
+    /// - If level is None, implementations should use a sensible default (usually L1)
     ///
     /// # Example
     /// ```text
-    /// If we get filled on a bid at level 0 (L1), the Hawkes model
-    /// records this event and updates its intensity estimate for L1 bids.
+    /// If we get filled on a bid at level 1 (L2), the Hawkes model
+    /// records this event and updates its intensity estimate for L2 bids.
     /// ```
-    fn on_fills(&mut self, fills: &[TradeInfo], current_time_sec: f64);
+    fn on_fills(&mut self, fills_with_levels: &[(TradeInfo, Option<usize>)], current_time_sec: f64);
 
     /// Provides a reference to the internal Hawkes model for the optimizer.
     ///

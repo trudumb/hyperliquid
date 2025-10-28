@@ -109,8 +109,10 @@ impl MarketUpdate {
 /// The bot runner updates CurrentState BEFORE passing UserUpdate to the strategy.
 #[derive(Debug, Clone)]
 pub struct UserUpdate {
-    /// New fills that occurred since last update
-    pub fills: Vec<TradeInfo>,
+    /// New fills that occurred since last update, with their identified level
+    /// Each tuple is (TradeInfo, Option<level>) where level is 0=L1, 1=L2, etc.
+    /// None indicates the level could not be determined (order already removed)
+    pub fills: Vec<(TradeInfo, Option<usize>)>,
 
     /// Order IDs that were successfully placed
     pub orders_placed: Vec<u64>,
@@ -133,10 +135,22 @@ impl UserUpdate {
         }
     }
 
-    /// Create a user update from fills only
+    /// Create a user update from fills only (backward compatibility)
+    /// Sets all levels to None
     pub fn from_fills(fills: Vec<TradeInfo>) -> Self {
+        let fills_with_levels = fills.into_iter().map(|f| (f, None)).collect();
         Self {
-            fills,
+            fills: fills_with_levels,
+            orders_placed: Vec::new(),
+            orders_cancelled: Vec::new(),
+            orders_failed: Vec::new(),
+        }
+    }
+
+    /// Create a user update from fills with their identified levels
+    pub fn from_fills_with_levels(fills_with_levels: Vec<(TradeInfo, Option<usize>)>) -> Self {
+        Self {
+            fills: fills_with_levels,
             orders_placed: Vec::new(),
             orders_cancelled: Vec::new(),
             orders_failed: Vec::new(),

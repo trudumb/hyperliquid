@@ -572,14 +572,22 @@ impl HjbStrategy {
     }
 
     /// Handle fills (update Hawkes model)
-    fn handle_fills(&mut self, _state: &CurrentState, fills: &[TradeInfo]) {
+    fn handle_fills(&mut self, _state: &CurrentState, fills: &[(TradeInfo, Option<usize>)]) {
         let current_time = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
 
         let mut hawkes = self.hawkes_model.write();
-        for fill in fills {
-            let is_bid_fill = fill.side == "B"; // Assuming "B" = bid fill (we got filled on sell)
-            // Record fill at level 0 (L1) by default - in production, track actual levels
-            hawkes.record_fill(0, is_bid_fill, current_time);
+        for (fill, filled_level) in fills {
+            let is_bid_fill = fill.side == "B"; // "B" = bid fill (we got filled on our bid)
+
+            // Use the level passed from UserUpdate (already looked up in BotRunner)
+            let level = filled_level.unwrap_or_else(|| {
+                warn!("Fill for unknown OID {} has no level, defaulting to level 0", fill.oid);
+                0
+            });
+
+            hawkes.record_fill(level, is_bid_fill, current_time);
+
+            debug!("Hawkes model updated: level={}, is_bid={}, time={:.2}", level, is_bid_fill, current_time);
         }
     }
 
@@ -618,20 +626,19 @@ impl HjbStrategy {
         }
 
         // --- MODEL INPUTS PREPARATION ---
-        // --- MODEL INPUTS PREPARATION ---
-        // Get cached volatility uncertainty
+        // Get volatility AND uncertainty from the Particle Filter cache/state
         let cached_vol = self.cached_volatility.read();
-        let (_mu_std, _, _) = cached_vol.param_std_devs;
-        let sigma_std = cached_vol.volatility_std_dev_bps;
+        let volatility_bps_pf = cached_vol.volatility_bps; // Get PF point estimate
+        let vol_uncertainty_bps_pf = cached_vol.volatility_std_dev_bps; // Get PF uncertainty
         drop(cached_vol);
 
-        // Prepare optimizer inputs
+        // Prepare optimizer inputs USING PARTICLE FILTER ESTIMATES
         let inputs = OptimizerInputs {
             current_time_sec: current_time,
-            volatility_bps: self.state_vector.volatility_ema_bps,
-            vol_uncertainty_bps: sigma_std,
-            adverse_selection_bps: self.state_vector.adverse_selection_estimate,
-            lob_imbalance: self.state_vector.lob_imbalance,
+            volatility_bps: volatility_bps_pf, // USE PF ESTIMATE HERE
+            vol_uncertainty_bps: vol_uncertainty_bps_pf, // USE PF UNCERTAINTY HERE
+            adverse_selection_bps: self.state_vector.adverse_selection_estimate, // Keep AS from state_vector
+            lob_imbalance: self.state_vector.lob_imbalance, // Keep LOB from state_vector
         };
 
         // --- COMPONENT CALL ---

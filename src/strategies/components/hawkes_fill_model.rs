@@ -323,17 +323,23 @@ impl HawkesFillModelImpl {
 }
 
 impl FillModel for HawkesFillModelImpl {
-    fn on_fills(&mut self, fills: &[TradeInfo], current_time_sec: f64) {
-        for fill in fills {
+    fn on_fills(&mut self, fills_with_levels: &[(TradeInfo, Option<usize>)], current_time_sec: f64) {
+        for (fill, level_opt) in fills_with_levels {
             // Determine if this was a bid fill or ask fill
             // Convention from market_maker_v2.rs:
             // "B" = buy side = we got filled on our bid
             // "A" = sell side = we got filled on our ask
             let is_bid_fill = fill.side == "B";
 
-            // For now, assume all fills are at L1 (level 0)
-            // TODO: Extract level information from fill metadata
-            let level = 0;
+            // Use the level from the tuple (passed from BotRunner via UserUpdate)
+            let level = if let Some(level) = level_opt {
+                *level
+            } else {
+                // Fallback: If level couldn't be determined (order already removed),
+                // default to L1 (level 0) with a warning
+                log::warn!("Could not determine level for fill OID {}, defaulting to L1", fill.oid);
+                0
+            };
 
             self.model.record_fill(level, is_bid_fill, current_time_sec);
         }
