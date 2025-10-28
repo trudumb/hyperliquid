@@ -452,17 +452,21 @@ impl Strategy for HjbStrategy {
         let mut actions = Vec::new();
 
         for order in &state.open_bids {
-            actions.push(StrategyAction::Cancel(ClientCancelRequest {
-                asset: self.config.asset.clone(),
-                oid: order.oid,
-            }));
+            if let Some(oid) = order.oid {
+                actions.push(StrategyAction::Cancel(ClientCancelRequest {
+                    asset: self.config.asset.clone(),
+                    oid,
+                }));
+            }
         }
 
         for order in &state.open_asks {
-            actions.push(StrategyAction::Cancel(ClientCancelRequest {
-                asset: self.config.asset.clone(),
-                oid: order.oid,
-            }));
+            if let Some(oid) = order.oid {
+                actions.push(StrategyAction::Cancel(ClientCancelRequest {
+                    asset: self.config.asset.clone(),
+                    oid,
+                }));
+            }
         }
 
         // --- Add Position Closing Logic ---
@@ -579,11 +583,18 @@ impl HjbStrategy {
         for (fill, filled_level) in fills {
             let is_bid_fill = fill.side == "B"; // "B" = bid fill (we got filled on our bid)
 
-            // Use the level passed from UserUpdate (already looked up in BotRunner)
-            let level = filled_level.unwrap_or_else(|| {
-                warn!("Fill for unknown OID {} has no level, defaulting to level 0", fill.oid);
-                0
-            });
+            // Use the level passed from UserUpdate (already looked up in BotRunner from active orders or cache)
+            let level = match filled_level {
+                Some(level) => *level, // Level was determined by BotRunner
+                None => {
+                    // Warning now only triggers if BotRunner genuinely couldn't find the level
+                    warn!(
+                        "Fill OID {} received by strategy without level (order not found in active or cache). Defaulting to L0 for Hawkes.",
+                        fill.oid
+                    );
+                    0 // Fallback level
+                }
+            };
 
             hawkes.record_fill(level, is_bid_fill, current_time);
 
@@ -753,10 +764,12 @@ impl HjbStrategy {
                 remaining_target_bids.remove(matched.unwrap());
             } else {
                 // No match, cancel this order
-                actions.push(StrategyAction::Cancel(ClientCancelRequest {
-                    asset: self.config.asset.clone(),
-                    oid: order.oid,
-                }));
+                if let Some(oid) = order.oid {
+                    actions.push(StrategyAction::Cancel(ClientCancelRequest {
+                        asset: self.config.asset.clone(),
+                        oid,
+                    }));
+                }
             }
         }
 
@@ -772,10 +785,12 @@ impl HjbStrategy {
                 remaining_target_asks.remove(matched.unwrap());
             } else {
                 // No match, cancel this order
-                actions.push(StrategyAction::Cancel(ClientCancelRequest {
-                    asset: self.config.asset.clone(),
-                    oid: order.oid,
-                }));
+                if let Some(oid) = order.oid {
+                    actions.push(StrategyAction::Cancel(ClientCancelRequest {
+                        asset: self.config.asset.clone(),
+                        oid,
+                    }));
+                }
             }
         }
 
