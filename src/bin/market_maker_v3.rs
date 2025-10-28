@@ -85,7 +85,8 @@ use alloy::signers::local::PrivateKeySigner;
 use hyperliquid_rust_sdk::{
     AssetType, BaseUrl,
     CurrentState, ExchangeClient, InfoClient, MarketUpdate, Message,
-    OrderBook, OrderState, OrderUpdate, RestingOrder, Strategy, StrategyAction, Subscription, TickLotValidator,
+    OrderBook, OrderState, OrderStateManager, OrderUpdate, OrderUpdateResult,
+    RestingOrder, Strategy, StrategyAction, Subscription, TickLotValidator,
     TradeInfo, UserData, UserUpdate,
     // New imports for optimized execution
     ParallelOrderExecutor, ExecutorConfig,
@@ -153,22 +154,8 @@ struct BotRunner {
     /// Current bot state (maintained by bot runner)
     current_state: CurrentState,
 
-    /// --- Order Tracking (Enhanced) ---
-    /// Maps Cloid -> OID (filled once confirmed by WS)
-    cloid_to_oid: HashMap<Cloid, u64>,
-
-    /// Maps OID -> Cloid (reverse lookup)
-    oid_to_cloid: HashMap<u64, Cloid>,
-
-    /// Orders pending placement confirmation (Cloid -> RestingOrder)
-    pending_place_orders: HashMap<Cloid, RestingOrder>,
-
-    /// Cache for recently completed orders (OID -> RestingOrder)
-    /// Stores orders briefly after fill/cancel/reject/expire for level lookup
-    recently_completed_orders: HashMap<u64, RestingOrder>,
-
-    /// Last time we pruned the completed orders cache
-    last_cache_prune_time: Instant,
+    /// Order state manager (handles order lifecycle tracking)
+    order_state_mgr: OrderStateManager,
 
     /// Total messages received (for throughput monitoring)
     total_messages: u64,
@@ -263,11 +250,7 @@ impl BotRunner {
             user_address,
             tick_lot_validator,
             current_state,
-            cloid_to_oid: HashMap::new(),
-            oid_to_cloid: HashMap::new(),
-            pending_place_orders: HashMap::new(),
-            recently_completed_orders: HashMap::new(),
-            last_cache_prune_time: Instant::now(),
+            order_state_mgr: OrderStateManager::new(),
             total_messages: 0,
             is_shutting_down: Arc::new(AtomicBool::new(false)),
             snapshot_received: false,
