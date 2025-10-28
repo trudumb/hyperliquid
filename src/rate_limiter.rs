@@ -20,7 +20,7 @@ pub struct RateLimitConfig {
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
-            max_weight: 1200,
+            max_weight: 1200, // REST API default
             window_duration: Duration::from_secs(60),
             safety_margin: 0.9, // Use 90% of limit by default
         }
@@ -62,43 +62,65 @@ impl RateLimitConfig {
 pub enum RequestWeight {
     /// Exchange API request weight: 1 + floor(batch_length / 40)
     Exchange { batch_length: usize },
-    /// Info requests with weight 2
-    InfoLight, // l2Book, allMids, clearinghouseState, orderStatus, etc.
-    /// Info requests with weight 20
-    InfoStandard, // Most info requests
-    /// Info requests with weight 60
-    InfoHeavy, // userRole
+    /// Info requests with weight 2: l2Book, allMids, clearinghouseState, orderStatus, spotClearinghouseState, exchangeStatus
+    InfoLight,
+    /// Info requests with weight 20 (Most other info requests)
+    InfoStandard,
+    /// Info requests with weight 60: userRole
+    InfoHeavy,
     /// Explorer API requests with weight 40
     Explorer,
+    /// Info request type for candle snapshots (base weight 20)
+    InfoCandleSnapshot,
+    /// Info request type for endpoints with +1 weight per 20 items (base weight 20)
+    InfoPaginatedStandard,
     /// Custom weight
     Custom(u32),
 }
 
 impl RequestWeight {
-    /// Calculate the actual weight for this request
-    pub fn weight(&self) -> u32 {
+    /// Calculate the base weight for this request type (without pagination)
+    pub fn base_weight(&self) -> u32 {
         match self {
             RequestWeight::Exchange { batch_length } => 1 + (*batch_length as u32 / 40),
             RequestWeight::InfoLight => 2,
             RequestWeight::InfoStandard => 20,
             RequestWeight::InfoHeavy => 60,
             RequestWeight::Explorer => 40,
+            RequestWeight::InfoCandleSnapshot => 20, // Base weight for candles is standard
+            RequestWeight::InfoPaginatedStandard => 20, // Base weight is standard
             RequestWeight::Custom(w) => *w,
         }
     }
 
-    /// Calculate weight for paginated responses
-    /// Additional weight per 20 items for certain endpoints
-    pub fn with_pagination_weight(self, items_returned: usize) -> u32 {
-        self.weight() + (items_returned as u32 / 20)
-    }
+    /// Calculate the total weight including pagination costs
+    ///
+    /// # Arguments
+    /// * `items_returned` - The number of items returned in the response (for pagination calculation).
+    ///                      Should be 0 if the request type doesn't support pagination.
+    ///
+    /// # Returns
+    /// Total calculated weight for the request.
+    pub fn total_weight(&self, items_returned: usize) -> u32 {
+        let base = self.base_weight();
+        let pagination_cost = match self {
+            // Specific pagination rules
+            RequestWeight::InfoCandleSnapshot => items_returned as u32 / 60, // +1 per 60 items
+            RequestWeight::InfoPaginatedStandard => items_returned as u32 / 20, // +1 per 20 items
 
-    /// Calculate weight for candle snapshot
-    /// Additional weight per 60 items
-    pub fn with_candle_pagination(self, items_returned: usize) -> u32 {
-        self.weight() + (items_returned as u32 / 60)
+            // Endpoints without specific pagination costs mentioned just use base weight
+            RequestWeight::Exchange { .. } | // Exchange actions don't have item-based pagination cost
+            RequestWeight::InfoLight |
+            RequestWeight::InfoStandard | // Assuming standard doesn't paginate unless specified
+            RequestWeight::InfoHeavy |
+            RequestWeight::Explorer | // Assuming explorer doesn't paginate unless specified
+            RequestWeight::Custom(_) => 0,
+        };
+        base + pagination_cost
     }
 }
+
+// ... (RateLimitStats, RateLimiterState, RateLimiter, RateLimiterBuilder remain the same) ...
 
 /// Statistics for rate limiter monitoring
 #[derive(Debug, Clone, Default)]
@@ -112,24 +134,6 @@ pub struct RateLimitStats {
 }
 
 /// Token bucket rate limiter with sliding window
-///
-/// This implementation uses a token bucket algorithm with a sliding window
-/// to ensure compliance with Hyperliquid's rate limits.
-///
-/// # Thread Safety
-/// Uses parking_lot::Mutex for efficient concurrent access.
-///
-/// # Example
-/// ```rust
-/// use hyperliquid_rust_sdk::rate_limiter::{RateLimiter, RateLimitConfig, RequestWeight};
-///
-/// let limiter = RateLimiter::new(RateLimitConfig::rest_api());
-///
-/// // Wait for capacity before making a request
-/// limiter.acquire(RequestWeight::Exchange { batch_length: 0 }).await;
-///
-/// // Make your API call...
-/// ```
 #[derive(Clone)]
 pub struct RateLimiter {
     config: RateLimitConfig,
@@ -158,26 +162,22 @@ impl RateLimiter {
         }
     }
 
-    /// Acquire capacity for a request, waiting if necessary
-    ///
-    /// This method will block until there is sufficient capacity available.
-    /// It automatically cleans up old requests outside the time window.
+    /// Acquire capacity for a request, waiting if necessary.
+    /// Use this for essential requests that must eventually succeed.
     ///
     /// # Arguments
-    /// * `weight` - The weight of the request
-    pub async fn acquire(&self, weight: RequestWeight) {
-        let weight_value = weight.weight();
+    /// * `weight_type` - The type of request being made.
+    /// * `items_returned` - Number of items expected/returned (for pagination cost). Use 0 if not applicable.
+    pub async fn acquire(&self, weight_type: RequestWeight, items_returned: usize) {
+        let weight_value = weight_type.total_weight(items_returned); // Calculate total weight
         loop {
             let wait_duration = {
                 let mut state = self.state.lock();
+                self.cleanup_old_requests(&mut state); // Clean before checking
 
-                // Clean up old requests outside the window
-                self.cleanup_old_requests(&mut state);
-
-                // Check if we have capacity
                 let effective_max = self.config.effective_max_weight();
                 if state.current_weight + weight_value <= effective_max {
-                    // We have capacity, add the request
+                    // Capacity available
                     let now = Instant::now();
                     state.requests.push((now, weight_value));
                     state.current_weight += weight_value;
@@ -188,42 +188,43 @@ impl RateLimiter {
                     state.stats.current_weight_in_window = state.current_weight;
                     state.stats.requests_in_current_window = state.requests.len() as u32;
 
-                    return; // Successfully acquired
+                    return; // Acquired successfully
                 }
-
-                // Not enough capacity, calculate wait time
+                // No capacity, calculate wait time based on oldest request
                 self.calculate_wait_time(&state)
             };
 
             // Wait outside the lock
             if wait_duration > Duration::ZERO {
-                let mut state = self.state.lock();
-                state.stats.times_waited += 1;
-                state.stats.total_wait_time_ms += wait_duration.as_millis() as u64;
-                drop(state);
-
+                { // Scope for lock guard
+                    let mut state = self.state.lock();
+                    state.stats.times_waited += 1;
+                    state.stats.total_wait_time_ms += wait_duration.as_millis() as u64;
+                } // Lock released here
                 sleep(wait_duration).await;
             } else {
-                // Small yield to prevent tight spin
-                tokio::task::yield_now().await;
+                tokio::task::yield_now().await; // Yield if no wait needed but failed acquire
             }
         }
     }
 
-    /// Try to acquire capacity without waiting
+    /// Try to acquire capacity without waiting.
+    /// Use this for non-essential requests or checks.
+    ///
+    /// # Arguments
+    /// * `weight_type` - The type of request being made.
+    /// * `items_returned` - Number of items expected/returned (for pagination cost). Use 0 if not applicable.
     ///
     /// # Returns
-    /// `true` if capacity was acquired, `false` if rate limited
-    pub fn try_acquire(&self, weight: RequestWeight) -> bool {
-        let weight_value = weight.weight();
+    /// `true` if capacity was acquired, `false` otherwise.
+    pub fn try_acquire(&self, weight_type: RequestWeight, items_returned: usize) -> bool {
+        let weight_value = weight_type.total_weight(items_returned); // Calculate total weight
         let mut state = self.state.lock();
+        self.cleanup_old_requests(&mut state); // Clean before checking
 
-        // Clean up old requests
-        self.cleanup_old_requests(&mut state);
-
-        // Check capacity
         let effective_max = self.config.effective_max_weight();
         if state.current_weight + weight_value <= effective_max {
+            // Capacity available
             let now = Instant::now();
             state.requests.push((now, weight_value));
             state.current_weight += weight_value;
@@ -233,12 +234,13 @@ impl RateLimiter {
             state.stats.total_weight_used += weight_value as u64;
             state.stats.current_weight_in_window = state.current_weight;
             state.stats.requests_in_current_window = state.requests.len() as u32;
-
             true
         } else {
+            // No capacity
             false
         }
     }
+
 
     /// Get current rate limiter statistics
     pub fn stats(&self) -> RateLimitStats {
@@ -274,23 +276,33 @@ impl RateLimiter {
         effective_max.saturating_sub(state.current_weight)
     }
 
-    /// Estimate time until capacity is available
-    pub fn time_until_capacity(&self, weight: RequestWeight) -> Duration {
+    /// Estimate time until capacity is available for a given request weight.
+    /// Note: This is an estimate, the actual wait time might differ slightly.
+    pub fn time_until_capacity(&self, weight_type: RequestWeight, items_returned: usize) -> Duration {
+        let weight_value = weight_type.total_weight(items_returned);
         let state = self.state.lock();
-        let weight_value = weight.weight();
         let effective_max = self.config.effective_max_weight();
 
         if state.current_weight + weight_value <= effective_max {
             Duration::ZERO
         } else {
-            self.calculate_wait_time(&state)
+            // Calculate wait time based on oldest requests needed to free up space
+            self.calculate_wait_time_for_weight(&state, weight_value)
         }
     }
+
 
     /// Clean up requests that have fallen outside the time window
     fn cleanup_old_requests(&self, state: &mut RateLimiterState) {
         let now = Instant::now();
-        let window_start = now - self.config.window_duration;
+        let window_start = now.checked_sub(self.config.window_duration);
+
+        // If window_start is None (e.g., duration is zero or negative), don't clean up
+        let window_start = match window_start {
+             Some(start) => start,
+             None => return,
+        };
+
 
         // Remove requests older than the window
         let mut removed_weight = 0u32;
@@ -308,29 +320,63 @@ impl RateLimiter {
         state.stats.requests_in_current_window = state.requests.len() as u32;
     }
 
-    /// Calculate how long to wait before retrying
+    /// Calculate how long to wait until the oldest request expires
     fn calculate_wait_time(&self, state: &RateLimiterState) -> Duration {
         if state.requests.is_empty() {
             return Duration::ZERO;
         }
 
         // Find the oldest request
-        let oldest = state
-            .requests
-            .first()
-            .map(|(timestamp, _)| *timestamp)
-            .unwrap();
-
+        let oldest_timestamp = state.requests[0].0;
         let now = Instant::now();
-        let elapsed = now.duration_since(oldest);
 
-        // Wait until the oldest request falls out of the window
+        // Time elapsed since the oldest request
+        let elapsed = now.duration_since(oldest_timestamp);
+
+        // Required wait time for the oldest request to expire
         if elapsed < self.config.window_duration {
-            self.config.window_duration - elapsed + Duration::from_millis(10) // Small buffer
+             self.config.window_duration - elapsed + Duration::from_millis(5) // Add small buffer
         } else {
-            Duration::from_millis(10) // Small delay
+             Duration::from_millis(5) // Already expired, small delay before retry
         }
     }
+
+     /// Calculate how long to wait until enough capacity is freed up for `needed_weight`.
+     fn calculate_wait_time_for_weight(&self, state: &RateLimiterState, needed_weight: u32) -> Duration {
+        if state.requests.is_empty() {
+            return Duration::ZERO; // Should not happen if called correctly
+        }
+
+        let effective_max = self.config.effective_max_weight();
+        let weight_to_free = (state.current_weight + needed_weight).saturating_sub(effective_max);
+
+        if weight_to_free == 0 {
+            return Duration::ZERO; // Enough capacity already
+        }
+
+        let mut cumulative_weight = 0;
+        let now = Instant::now();
+
+        for (timestamp, weight) in state.requests.iter() {
+            cumulative_weight += weight;
+            if cumulative_weight >= weight_to_free {
+                // This is the request that needs to expire (or one after it)
+                let elapsed = now.duration_since(*timestamp);
+                if elapsed < self.config.window_duration {
+                    // Return the time until this request expires
+                    return self.config.window_duration - elapsed + Duration::from_millis(5); // Small buffer
+                } else {
+                    // This request already expired, something might be slightly off, suggest short wait
+                    return Duration::from_millis(5);
+                }
+            }
+        }
+
+        // Should theoretically not reach here if weight_to_free > 0
+        // Fallback to waiting for the oldest request
+        self.calculate_wait_time(state)
+    }
+
 }
 
 /// Rate limiter builder for easy configuration
@@ -371,44 +417,57 @@ impl Default for RateLimiterBuilder {
     }
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_request_weight_calculation() {
-        assert_eq!(RequestWeight::Exchange { batch_length: 0 }.weight(), 1);
-        assert_eq!(RequestWeight::Exchange { batch_length: 39 }.weight(), 1);
-        assert_eq!(RequestWeight::Exchange { batch_length: 40 }.weight(), 2);
-        assert_eq!(RequestWeight::Exchange { batch_length: 79 }.weight(), 2);
-        assert_eq!(RequestWeight::Exchange { batch_length: 80 }.weight(), 3);
+        // Exchange weights
+        assert_eq!(RequestWeight::Exchange { batch_length: 0 }.base_weight(), 1);
+        assert_eq!(RequestWeight::Exchange { batch_length: 39 }.base_weight(), 1);
+        assert_eq!(RequestWeight::Exchange { batch_length: 40 }.base_weight(), 2);
+        assert_eq!(RequestWeight::Exchange { batch_length: 79 }.base_weight(), 2);
+        assert_eq!(RequestWeight::Exchange { batch_length: 80 }.base_weight(), 3);
 
-        assert_eq!(RequestWeight::InfoLight.weight(), 2);
-        assert_eq!(RequestWeight::InfoStandard.weight(), 20);
-        assert_eq!(RequestWeight::InfoHeavy.weight(), 60);
-        assert_eq!(RequestWeight::Explorer.weight(), 40);
+        // Info weights
+        assert_eq!(RequestWeight::InfoLight.base_weight(), 2);
+        assert_eq!(RequestWeight::InfoStandard.base_weight(), 20);
+        assert_eq!(RequestWeight::InfoHeavy.base_weight(), 60);
+        assert_eq!(RequestWeight::Explorer.base_weight(), 40);
+        assert_eq!(RequestWeight::InfoCandleSnapshot.base_weight(), 20);
+        assert_eq!(RequestWeight::InfoPaginatedStandard.base_weight(), 20);
+        assert_eq!(RequestWeight::Custom(5).base_weight(), 5);
     }
 
-    #[test]
+     #[test]
     fn test_pagination_weight() {
-        let weight = RequestWeight::InfoStandard;
-        assert_eq!(weight.with_pagination_weight(0), 20);
-        assert_eq!(weight.with_pagination_weight(19), 20);
-        assert_eq!(weight.with_pagination_weight(20), 21);
-        assert_eq!(weight.with_pagination_weight(40), 22);
-    }
+        // Standard pagination (+1 per 20)
+        let weight_paginated = RequestWeight::InfoPaginatedStandard;
+        assert_eq!(weight_paginated.total_weight(0), 20); // Base
+        assert_eq!(weight_paginated.total_weight(19), 20); // Base
+        assert_eq!(weight_paginated.total_weight(20), 21); // Base + 1
+        assert_eq!(weight_paginated.total_weight(39), 21); // Base + 1
+        assert_eq!(weight_paginated.total_weight(40), 22); // Base + 2
 
-    #[test]
-    fn test_candle_pagination_weight() {
-        let weight = RequestWeight::InfoLight;
-        assert_eq!(weight.with_candle_pagination(0), 2);
-        assert_eq!(weight.with_candle_pagination(59), 2);
-        assert_eq!(weight.with_candle_pagination(60), 3);
-        assert_eq!(weight.with_candle_pagination(120), 4);
+        // Candle pagination (+1 per 60)
+        let weight_candle = RequestWeight::InfoCandleSnapshot;
+        assert_eq!(weight_candle.total_weight(0), 20);   // Base
+        assert_eq!(weight_candle.total_weight(59), 20);  // Base
+        assert_eq!(weight_candle.total_weight(60), 21);  // Base + 1
+        assert_eq!(weight_candle.total_weight(119), 21); // Base + 1
+        assert_eq!(weight_candle.total_weight(120), 22); // Base + 2
+
+        // Non-paginated types should ignore items_returned
+        let weight_exchange = RequestWeight::Exchange { batch_length: 0 };
+        assert_eq!(weight_exchange.total_weight(100), 1); // Only base weight applies
+        let weight_light = RequestWeight::InfoLight;
+        assert_eq!(weight_light.total_weight(100), 2); // Only base weight applies
     }
 
     #[tokio::test]
-    async fn test_rate_limiter_basic() {
+    async fn test_rate_limiter_basic_acquire() {
         let config = RateLimitConfig {
             max_weight: 100,
             window_duration: Duration::from_secs(1),
@@ -416,12 +475,12 @@ mod tests {
         };
         let limiter = RateLimiter::new(config);
 
-        // Should succeed immediately
-        limiter.acquire(RequestWeight::Custom(10)).await;
+        // Acquire weight, no items returned
+        limiter.acquire(RequestWeight::Custom(10), 0).await;
         assert_eq!(limiter.remaining_capacity(), 90);
 
         // Acquire more
-        limiter.acquire(RequestWeight::Custom(20)).await;
+        limiter.acquire(RequestWeight::Custom(20), 0).await;
         assert_eq!(limiter.remaining_capacity(), 70);
 
         let stats = limiter.stats();
@@ -430,25 +489,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rate_limiter_window_cleanup() {
+    async fn test_rate_limiter_acquire_with_pagination() {
         let config = RateLimitConfig {
             max_weight: 100,
-            window_duration: Duration::from_millis(100),
+            window_duration: Duration::from_secs(1),
             safety_margin: 1.0,
         };
         let limiter = RateLimiter::new(config);
 
-        // Fill up capacity
-        limiter.acquire(RequestWeight::Custom(100)).await;
-        assert_eq!(limiter.remaining_capacity(), 0);
+        // Acquire paginated weight (base 20 + 2 for 40 items)
+        limiter.acquire(RequestWeight::InfoPaginatedStandard, 40).await;
+        assert_eq!(limiter.remaining_capacity(), 100 - 22); // 78
 
-        // Wait for window to expire
-        sleep(Duration::from_millis(150)).await;
-
-        // Should have capacity again
-        limiter.acquire(RequestWeight::Custom(50)).await;
-        assert_eq!(limiter.remaining_capacity(), 50);
+        let stats = limiter.stats();
+        assert_eq!(stats.total_requests, 1);
+        assert_eq!(stats.total_weight_used, 22);
     }
+
+    #[tokio::test]
+    async fn test_rate_limiter_wait() {
+        let config = RateLimitConfig {
+            max_weight: 50,
+            window_duration: Duration::from_millis(200),
+            safety_margin: 1.0,
+        };
+        let limiter = RateLimiter::new(config);
+
+        // Acquire initial capacity
+        limiter.acquire(RequestWeight::Custom(40), 0).await;
+        let start = Instant::now();
+
+        // This should wait
+        limiter.acquire(RequestWeight::Custom(20), 0).await;
+        let elapsed = start.elapsed();
+
+        // Should have waited roughly until the first request expired
+        assert!(elapsed >= Duration::from_millis(190) && elapsed < Duration::from_millis(300));
+        assert!(limiter.stats().times_waited >= 1);
+    }
+
 
     #[test]
     fn test_try_acquire() {
@@ -459,42 +538,70 @@ mod tests {
         };
         let limiter = RateLimiter::new(config);
 
-        assert!(limiter.try_acquire(RequestWeight::Custom(50)));
-        assert!(limiter.try_acquire(RequestWeight::Custom(50)));
-        assert!(!limiter.try_acquire(RequestWeight::Custom(1))); // Should fail
+        assert!(limiter.try_acquire(RequestWeight::Custom(50), 0));
+        assert!(limiter.try_acquire(RequestWeight::Custom(50), 0));
+        assert!(!limiter.try_acquire(RequestWeight::Custom(1), 0)); // Should fail
     }
 
-    #[test]
-    fn test_utilization() {
+     #[test]
+    fn test_try_acquire_with_pagination() {
         let config = RateLimitConfig {
-            max_weight: 100,
+            max_weight: 30,
             window_duration: Duration::from_secs(1),
             safety_margin: 1.0,
         };
         let limiter = RateLimiter::new(config);
 
-        assert_eq!(limiter.utilization(), 0.0);
+        // Acquire paginated (base 20 + 1 for 20 items = 21 weight)
+        assert!(limiter.try_acquire(RequestWeight::InfoPaginatedStandard, 20));
+        assert_eq!(limiter.remaining_capacity(), 30 - 21); // 9 remaining
 
-        limiter.try_acquire(RequestWeight::Custom(50));
-        assert_eq!(limiter.utilization(), 0.5);
+        // Try to acquire another standard request (weight 20) - should fail
+        assert!(!limiter.try_acquire(RequestWeight::InfoStandard, 0));
 
-        limiter.try_acquire(RequestWeight::Custom(25));
-        assert_eq!(limiter.utilization(), 0.75);
+         // Try to acquire a light request (weight 2) - should succeed
+        assert!(limiter.try_acquire(RequestWeight::InfoLight, 0));
+        assert_eq!(limiter.remaining_capacity(), 9 - 2); // 7 remaining
     }
+
 
     #[test]
     fn test_safety_margin() {
         let config = RateLimitConfig {
             max_weight: 100,
             window_duration: Duration::from_secs(1),
-            safety_margin: 0.9,
+            safety_margin: 0.9, // Effective max weight = 90
         };
-
-        // Effective max is 90 with 90% safety margin
-        assert_eq!(config.effective_max_weight(), 90);
-
         let limiter = RateLimiter::new(config);
-        assert!(limiter.try_acquire(RequestWeight::Custom(90)));
-        assert!(!limiter.try_acquire(RequestWeight::Custom(1)));
+
+        assert_eq!(limiter.remaining_capacity(), 90);
+        assert!(limiter.try_acquire(RequestWeight::Custom(90), 0));
+        assert_eq!(limiter.remaining_capacity(), 0);
+        assert!(!limiter.try_acquire(RequestWeight::Custom(1), 0));
+    }
+
+    #[tokio::test]
+    async fn test_time_until_capacity() {
+        let config = RateLimitConfig {
+            max_weight: 50,
+            window_duration: Duration::from_millis(500),
+            safety_margin: 1.0,
+        };
+        let limiter = RateLimiter::new(config);
+
+        // Acquire 40 weight
+        limiter.acquire(RequestWeight::Custom(40), 0).await;
+        sleep(Duration::from_millis(100)).await; // Wait 100ms
+
+        // Check time until 20 weight is available
+        // Need to free 10 weight (40 + 20 > 50). Oldest request (40) was 100ms ago.
+        // It expires in 500 - 100 = 400ms.
+        let wait_time = limiter.time_until_capacity(RequestWeight::Custom(20), 0);
+        println!("Estimated wait time: {:?}", wait_time);
+        assert!(wait_time > Duration::from_millis(390) && wait_time < Duration::from_millis(410)); // Around 400ms + buffer
+
+         // Check time until 5 weight is available (should be 0)
+        let wait_time_small = limiter.time_until_capacity(RequestWeight::Custom(5), 0);
+         assert_eq!(wait_time_small, Duration::ZERO);
     }
 }

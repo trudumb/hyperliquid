@@ -188,7 +188,7 @@ impl FastOrderSender {
         order: &ClientOrderRequest,
     ) -> Result<ExchangeResponseStatus> {
         // Wait for rate limit capacity (weight = 1 for single order)
-        self.rate_limiter.acquire(RequestWeight::Exchange { batch_length: 0 }).await;
+        self.rate_limiter.acquire(RequestWeight::Exchange { batch_length: 0 }, 0).await;
 
         // Acquire buffer from pool (zero allocation if available)
         let _buf = self.buffer_pool.acquire();
@@ -224,7 +224,7 @@ impl FastOrderSender {
         let batch_length = orders.len();
 
         // Wait for rate limit capacity (batched weight is much lower!)
-        self.rate_limiter.acquire(RequestWeight::Exchange { batch_length }).await;
+        self.rate_limiter.acquire(RequestWeight::Exchange { batch_length }, 0).await;
 
         // Acquire buffer from pool
         let _buf = self.buffer_pool.acquire();
@@ -250,7 +250,7 @@ impl FastOrderSender {
         cancel_request: &crate::exchange::ClientCancelRequest,
     ) -> Result<ExchangeResponseStatus> {
         // Wait for rate limit capacity (weight = 1 for single cancel)
-        self.rate_limiter.acquire(RequestWeight::Exchange { batch_length: 0 }).await;
+        self.rate_limiter.acquire(RequestWeight::Exchange { batch_length: 0 }, 0).await;
 
         let _buf = self.buffer_pool.acquire();
 
@@ -275,7 +275,7 @@ impl FastOrderSender {
         let batch_length = cancel_requests.len();
 
         // Wait for rate limit capacity (batched weight is much lower!)
-        self.rate_limiter.acquire(RequestWeight::Exchange { batch_length }).await;
+        self.rate_limiter.acquire(RequestWeight::Exchange { batch_length }, 0).await;
 
         let _buf = self.buffer_pool.acquire();
 
@@ -298,7 +298,7 @@ impl FastOrderSender {
         modify_request: &crate::exchange::ClientModifyRequest,
     ) -> Result<ExchangeResponseStatus> {
         // Wait for rate limit capacity (weight = 1 for single modify)
-        self.rate_limiter.acquire(RequestWeight::Exchange { batch_length: 0 }).await;
+        self.rate_limiter.acquire(RequestWeight::Exchange { batch_length: 0 }, 0).await;
 
         let _buf = self.buffer_pool.acquire();
 
