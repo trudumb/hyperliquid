@@ -572,27 +572,16 @@ impl HjbStrategy {
     }
 
     /// Handle fills (update Hawkes model)
-    fn handle_fills(&mut self, state: &CurrentState, fills: &[TradeInfo]) {
+    fn handle_fills(&mut self, _state: &CurrentState, fills: &[(TradeInfo, Option<usize>)]) {
         let current_time = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
 
         let mut hawkes = self.hawkes_model.write();
-        for fill in fills {
+        for (fill, filled_level) in fills {
             let is_bid_fill = fill.side == "B"; // "B" = bid fill (we got filled on our bid)
 
-            // Look up the actual level from the resting order
-            let filled_level = if is_bid_fill {
-                state.open_bids.iter()
-                    .find(|o| o.oid == fill.oid)
-                    .map(|o| o.level)
-            } else {
-                state.open_asks.iter()
-                    .find(|o| o.oid == fill.oid)
-                    .map(|o| o.level)
-            };
-
-            // Record fill with actual level (default to 0 if not found)
+            // Use the level passed from UserUpdate (already looked up in BotRunner)
             let level = filled_level.unwrap_or_else(|| {
-                warn!("Fill for unknown OID {}, defaulting to level 0", fill.oid);
+                warn!("Fill for unknown OID {} has no level, defaulting to level 0", fill.oid);
                 0
             });
 

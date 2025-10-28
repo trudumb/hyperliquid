@@ -500,7 +500,7 @@ impl BotRunner {
                         return;
                     }
 
-                    let mut new_fills = Vec::new();
+                    let mut new_fills_with_levels = Vec::new();
 
                     for fill in &fills {
                         let fill_id = self.get_fill_id(fill);
@@ -511,15 +511,31 @@ impl BotRunner {
                             continue;
                         }
 
-                        // Process new fill
+                        // --- IDENTIFY FILL LEVEL ---
+                        let mut filled_level: Option<usize> = None;
+                        let is_buy = fill.side == "B";
+
+                        if is_buy {
+                            // This was a fill on our BID order
+                            if let Some(order) = self.current_state.open_bids.iter().find(|o| o.oid == fill.oid) {
+                                filled_level = Some(order.level);
+                            }
+                        } else {
+                            // This was a fill on our ASK order
+                            if let Some(order) = self.current_state.open_asks.iter().find(|o| o.oid == fill.oid) {
+                                filled_level = Some(order.level);
+                            }
+                        }
+
+                        // Process new fill (updates position, PnL, etc.)
                         self.process_fill(fill);
                         self.processed_fill_ids.insert(fill_id);
-                        new_fills.push(fill.clone());
+                        new_fills_with_levels.push((fill.clone(), filled_level));
                     }
 
                     // Only notify strategy if there were NEW fills
-                    if !new_fills.is_empty() {
-                        let user_update = UserUpdate::from_fills(new_fills);
+                    if !new_fills_with_levels.is_empty() {
+                        let user_update = UserUpdate::from_fills_with_levels(new_fills_with_levels);
                         let actions = self.strategy.on_user_update(&self.current_state, &user_update);
                         self.execute_actions(actions).await;
                     }
