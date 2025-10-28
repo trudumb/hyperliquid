@@ -743,29 +743,77 @@ impl BotRunner {
 
             // Process results (log errors, potentially update pending state)
             if result.failed > 0 {
-                error!("[{}] {} failed actions out of {} submitted.",
-                       asset_name, result.failed, result.failed + result.successful);
+                error!(
+                    "[{}] {} failed actions out of {} submitted in {} ms.",
+                    asset_name,
+                    result.failed,
+                    result.failed + result.successful,
+                    result.execution_time_ms
+                );
 
-                for response_res in &result.responses {
-                    if let Err(e) = response_res {
-                        error!("[{}] Execution Error: {}", asset_name, e);
-                    } else if let Ok(ExchangeResponseStatus::Err(msg)) = response_res {
-                        error!("[{}] Exchange returned error: {}", asset_name, msg);
-                    } else if let Ok(ExchangeResponseStatus::Ok(resp)) = response_res {
-                        if let Some(ref data) = resp.data {
-                            for status in &data.statuses {
-                                if let ExchangeDataStatus::Error(err_msg) = status {
-                                    error!("[{}] Specific action failed: {}", asset_name, err_msg);
+                // Track if we encountered a timeout error
+                let mut timeout_occurred = false;
+
+                for (index, response_res) in result.responses.iter().enumerate() {
+                    match response_res {
+                        // Case 1: The entire HTTP request failed (e.g., network error, timeout before response)
+                        Err(e) => {
+                            error!("[{}] Batch {} - Execution Error: {}", asset_name, index, e);
+                            // Check if it's likely a timeout error
+                            if e.to_string().contains("timeout") {
+                                timeout_occurred = true;
+                            }
+                        }
+                        // Case 2: The HTTP request succeeded, but the exchange wrapper returned a top-level error message
+                        Ok(ExchangeResponseStatus::Err(msg)) => {
+                            error!(
+                                "[{}] Batch {} - Exchange returned top-level error: {}",
+                                asset_name, index, msg
+                            );
+                            // Explicitly check for margin errors here if the exchange ever returns them at this level
+                            if msg.contains("margin") || msg.contains("Margin") {
+                                error!("[{}] POSSIBLE MARGIN ISSUE DETECTED (Top-level response)", asset_name);
+                            }
+                        }
+                        // Case 3: The HTTP request succeeded, and we got a structured response from the exchange
+                        Ok(ExchangeResponseStatus::Ok(resp)) => {
+                            // Check if the exchange sent back specific statuses for the actions within the batch
+                            if let Some(ref data) = resp.data {
+                                // Iterate through statuses (should align with submitted actions if applicable)
+                                for (status_index, status) in data.statuses.iter().enumerate() {
+                                    if let ExchangeDataStatus::Error(err_msg) = status {
+                                        error!(
+                                            "[{}] Batch {} - Specific action {} failed: {}",
+                                            asset_name, index, status_index, err_msg
+                                        );
+                                        // Explicitly check for known margin error messages
+                                        if err_msg.contains("margin") || err_msg.contains("Margin") {
+                                            error!("[{}] MARGIN ISSUE DETECTED: {}", asset_name, err_msg);
+                                        } else if err_msg.contains("balance") {
+                                            error!("[{}] BALANCE ISSUE DETECTED: {}", asset_name, err_msg);
+                                        }
+                                    }
+                                    // You could add logging for other statuses like Resting, Filled here if needed for debugging
+                                    // else if let ExchangeDataStatus::Resting(r) = status { ... }
                                 }
+                            } else {
+                                // This case might indicate success but needs confirmation based on API behavior
+                                debug!("[{}] Batch {} - Received Ok status but no detailed data/statuses.", asset_name, index);
                             }
                         }
                     }
                 }
-            }
 
-            if result.successful > 0 {
-                debug!("[{}] {} actions executed successfully in {} ms.",
-                       asset_name, result.successful, result.execution_time_ms);
+                // If a timeout occurred, add a suggestion to check margin/network
+                if timeout_occurred {
+                    warn!("[{}] Timeout error detected. Check network connectivity and available margin.", asset_name);
+                }
+
+            } else if result.successful > 0 { // Only log success if there were no failures in the batch
+                debug!(
+                    "[{}] {} actions executed successfully in {} ms.",
+                    asset_name, result.successful, result.execution_time_ms
+                );
             }
 
             // NOTE: Successful placements/cancellations are confirmed via WebSocket UserEvents,
