@@ -86,7 +86,7 @@ use hyperliquid_rust_sdk::{
     AssetType, BaseUrl, ClientCancelRequest, ClientOrderRequest,
     CurrentState, ExchangeClient, InfoClient, MarketUpdate, Message,
     OrderBook, RestingOrder, Strategy, StrategyAction, Subscription, TickLotValidator,
-    TradeInfo, UserData, UserUpdate,
+    TradeInfo, UserData, UserFills, UserUpdate,
 };
 use hyperliquid_rust_sdk::strategies::hjb_strategy::HjbStrategy;
 
@@ -245,6 +245,18 @@ impl BotRunner {
             )
             .await?;
 
+        // Subscribe specifically to user fills (snapshot + stream)
+        self.info_client
+            .as_mut()
+            .unwrap()
+            .subscribe(
+                Subscription::UserFills {
+                    user: self.user_address,
+                },
+                sender.clone(),
+            )
+            .await?;
+
         // Subscribe to AllMids (mid-price updates)
         self.info_client
             .as_mut()
@@ -356,6 +368,30 @@ impl BotRunner {
             }
             Message::User(_) => {
                 self.handle_user_events(message).await;
+            }
+            Message::UserFills(user_fills) => {
+                // This stream is dedicated to fills, including the initial snapshot.
+                let fills_data = &user_fills.data;
+                if !fills_data.fills.is_empty() {
+                    // Log whether it's a snapshot or a stream update
+                    let update_type = if fills_data.is_snapshot.unwrap_or(false) { "Snapshot" } else { "Stream" };
+                    info!("Received {} UserFills ({}): {} fills.", update_type, fills_data.user, fills_data.fills.len());
+
+                    let mut processed_fills = Vec::new();
+
+                    for fill in &fills_data.fills {
+                        self.process_fill(fill);
+                        processed_fills.push(fill.clone());
+                    }
+
+                    // Only call strategy if there were fills to process
+                    if !processed_fills.is_empty() {
+                        // Create user update and pass to strategy *after* state is updated
+                        let user_update = UserUpdate::from_fills(processed_fills);
+                        let actions = self.strategy.on_user_update(&self.current_state, &user_update);
+                        self.execute_actions(actions).await;
+                    }
+                }
             }
             _ => {
                 // Ignore other message types
