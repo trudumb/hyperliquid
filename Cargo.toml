@@ -30,7 +30,7 @@ rmp-serde = "1.0"
 thiserror = "2.0"
 tokio = { version = "1.0", features = ["full"] }
 tokio-tungstenite = { version = "0.20.0", features = ["native-tls"] }
-uuid = { version = "1.0", features = ["v4"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
 dotenv = "0.15.0"
 rand = "0.8"
 rand_distr = "0.4"

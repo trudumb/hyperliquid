@@ -6,6 +6,7 @@ mod exchange;
 mod helpers;
 mod info;
 mod meta;
+pub mod order_state;
 pub mod rate_limiter;
 pub mod strategy;
 pub mod strategies;
@@ -25,8 +26,9 @@ pub use exchange::*;
 pub use helpers::{bps_diff, truncate_float, BaseUrl};
 pub use info::{info_client::*, *};
 pub use meta::{AssetContext, AssetMeta, Meta, MetaAndAssetCtxs, SpotAssetMeta, SpotMeta};
+pub use order_state::{Cloid, OrderStateManager, OrderUpdateResult};
 pub use strategy::{
-    CurrentState, MarketUpdate, RestingOrder, Strategy, StrategyAction, UserUpdate,
+    CurrentState, MarketUpdate, OrderState, RestingOrder, Strategy, StrategyAction, UserUpdate,
 };
 pub use tick_lot_size::{AssetType, TickLotValidator};
 pub use ws::*;

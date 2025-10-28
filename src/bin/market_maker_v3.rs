@@ -83,9 +83,10 @@ let strategy: Box<dyn Strategy> = match config.strategy_name.as_str() {
 
 use alloy::signers::local::PrivateKeySigner;
 use hyperliquid_rust_sdk::{
-    AssetType, BaseUrl, ClientOrderRequest,
+    AssetType, BaseUrl,
     CurrentState, ExchangeClient, InfoClient, MarketUpdate, Message,
-    OrderBook, Strategy, StrategyAction, Subscription, TickLotValidator,
+    OrderBook, OrderState, OrderStateManager, OrderUpdate, OrderUpdateResult,
+    RestingOrder, Strategy, StrategyAction, Subscription, TickLotValidator,
     TradeInfo, UserData, UserUpdate,
     // New imports for optimized execution
     ParallelOrderExecutor, ExecutorConfig,
@@ -99,6 +100,7 @@ use std::env;
 use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use tokio::signal;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -126,6 +128,9 @@ fn load_config(path: &str) -> Config {
 // Bot Runner
 // ============================================================================
 
+// Type alias for clarity
+type Cloid = uuid::Uuid;
+
 struct BotRunner {
     /// Trading asset
     asset: String,
@@ -149,11 +154,8 @@ struct BotRunner {
     /// Current bot state (maintained by bot runner)
     current_state: CurrentState,
 
-    /// Order tracking: cloid -> oid mapping
-    cloid_to_oid: HashMap<uuid::Uuid, u64>,
-
-    /// Pending order placements (awaiting confirmation)
-    pending_orders: HashMap<uuid::Uuid, ClientOrderRequest>,
+    /// Order state manager (handles order lifecycle tracking)
+    order_state_mgr: OrderStateManager,
 
     /// Total messages received (for throughput monitoring)
     total_messages: u64,
@@ -248,13 +250,80 @@ impl BotRunner {
             user_address,
             tick_lot_validator,
             current_state,
-            cloid_to_oid: HashMap::new(),
-            pending_orders: HashMap::new(),
+            order_state_mgr: OrderStateManager::new(),
             total_messages: 0,
             is_shutting_down: Arc::new(AtomicBool::new(false)),
             snapshot_received: false,
             processed_fill_ids: HashSet::new(),
         })
+    }
+
+    /// Add or update an order in CurrentState (open_bids/open_asks)
+    fn add_or_update_order(&mut self, order_to_add: RestingOrder) {
+        let oid = match order_to_add.oid {
+            Some(id) => id,
+            None => {
+                warn!("Attempted to add/update order without OID (Cloid: {:?})", order_to_add.cloid);
+                return;
+            }
+        };
+
+        let orders_list = if order_to_add.is_buy {
+            &mut self.current_state.open_bids
+        } else {
+            &mut self.current_state.open_asks
+        };
+
+        if let Some(existing_order) = orders_list.iter_mut().find(|o| o.oid == Some(oid)) {
+            // Update existing order state, size, timestamp
+            *existing_order = order_to_add;
+        } else {
+            // Add new order
+            orders_list.push(order_to_add);
+        }
+
+        // Ensure lists remain sorted
+        // Sort bids descending by price, asks ascending by price
+        self.current_state.open_bids.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
+        self.current_state.open_asks.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
+    /// Remove an order from active lists and cache it with a final state
+    fn remove_and_cache_order(&mut self, oid: u64, final_state: OrderState) {
+        let mut removed_order: Option<RestingOrder> = None;
+        let current_timestamp = chrono::Utc::now().timestamp_millis() as u64;
+
+        self.current_state.open_bids.retain(|o| {
+            if o.oid == Some(oid) { removed_order = Some(o.clone()); false } else { true }
+        });
+        if removed_order.is_none() {
+            self.current_state.open_asks.retain(|o| {
+                if o.oid == Some(oid) { removed_order = Some(o.clone()); false } else { true }
+            });
+        }
+
+        // Also check pending orders (though unlikely to be cancelled directly by OID)
+        if removed_order.is_none() {
+            if let Some(cloid) = self.oid_to_cloid.get(&oid) {
+                if let Some(order) = self.pending_place_orders.remove(cloid) {
+                    removed_order = Some(order);
+                }
+            }
+        }
+
+        // If found, update state and move to cache
+        if let Some(mut order) = removed_order {
+            order.state = final_state.clone();
+            order.timestamp = current_timestamp;
+            self.recently_completed_orders.insert(oid, order);
+            info!("Order OID {} moved to cache with state {:?}", oid, final_state);
+            // Clean up mappings
+            if let Some(cloid) = self.oid_to_cloid.remove(&oid) {
+                self.cloid_to_oid.remove(&cloid);
+            }
+        } else {
+            debug!("Attempted to remove/cache OID {}, but not found in active/pending lists.", oid);
+        }
     }
 
     /// Start the bot runner event loop
@@ -314,6 +383,18 @@ impl BotRunner {
             .subscribe(
                 Subscription::Trades {
                     coin: self.asset.clone(),
+                },
+                sender.clone(),
+            )
+            .await?;
+
+        // Subscribe to OrderUpdates (order status confirmations)
+        self.info_client
+            .as_mut()
+            .unwrap()
+            .subscribe(
+                Subscription::OrderUpdates {
+                    user: self.user_address,
                 },
                 sender.clone(),
             )
@@ -399,6 +480,9 @@ impl BotRunner {
             }
             Message::User(_) => {
                 self.handle_user_events(message).await;
+            }
+            Message::OrderUpdates(order_updates) => {
+                self.handle_order_updates(order_updates.data.clone()).await;
             }
             Message::UserFills(user_fills) => {
                 // This stream is dedicated to fills, including the initial snapshot.
@@ -536,18 +620,31 @@ impl BotRunner {
 
                         // --- IDENTIFY FILL LEVEL ---
                         let mut filled_level: Option<usize> = None;
+                        let mut order_state_found: Option<OrderState> = None;
+                        let oid = fill.oid;
                         let is_buy = fill.side == "B";
 
-                        if is_buy {
-                            // This was a fill on our BID order
-                            if let Some(order) = self.current_state.open_bids.iter().find(|o| o.oid == fill.oid) {
-                                filled_level = Some(order.level);
+                        // 1. Check active orders (including PendingCancel, PartiallyFilled)
+                        let open_orders = if is_buy { &self.current_state.open_bids } else { &self.current_state.open_asks };
+                        if let Some(order) = open_orders.iter().find(|o| o.oid == Some(oid)) {
+                            filled_level = Some(order.level);
+                            order_state_found = Some(order.state.clone());
+                        }
+
+                        // 2. Check recently completed cache
+                        if filled_level.is_none() {
+                            if let Some(cached_order) = self.recently_completed_orders.get(&oid) {
+                                filled_level = Some(cached_order.level);
+                                order_state_found = Some(cached_order.state.clone());
+                                debug!("Fill OID {} found in cache (State: {:?}). Level {} retrieved.", oid, cached_order.state, filled_level.unwrap_or(999));
                             }
+                        }
+
+                        // 3. Log warning if still not found
+                        if filled_level.is_none() {
+                            warn!("Fill received for unknown or too-old OID: {}. Cannot determine level.", oid);
                         } else {
-                            // This was a fill on our ASK order
-                            if let Some(order) = self.current_state.open_asks.iter().find(|o| o.oid == fill.oid) {
-                                filled_level = Some(order.level);
-                            }
+                            debug!("Determined level {} for fill OID {} (Order State was: {:?})", filled_level.unwrap_or(999), oid, order_state_found);
                         }
 
                         // Process new fill (updates position, PnL, etc.)
@@ -599,26 +696,182 @@ impl BotRunner {
                 UserData::NonUserCancel(cancels) => {
                     for cancel in &cancels {
                         warn!("⚠️ System cancelled order {} for {}", cancel.oid, cancel.coin);
-
-                        // Remove from our tracking
-                        self.current_state.open_bids.retain(|order| order.oid != cancel.oid);
-                        self.current_state.open_asks.retain(|order| order.oid != cancel.oid);
-
-                        // Remove from pending orders - need to find by oid
-                        let cloid_to_remove: Vec<uuid::Uuid> = self.cloid_to_oid
-                            .iter()
-                            .filter(|(_, &oid)| oid == cancel.oid)
-                            .map(|(&cloid, _)| cloid)
-                            .collect();
-
-                        for cloid in cloid_to_remove {
-                            self.pending_orders.remove(&cloid);
-                            self.cloid_to_oid.remove(&cloid);
-                        }
-
-                        // Log why this might have happened
+                        // Use the helper method to remove and cache
+                        self.remove_and_cache_order(cancel.oid, OrderState::Cancelled);
                         info!("   Possible reasons: post-only order would cross, position limit, margin");
                     }
+                }
+            }
+        }
+    }
+
+    /// Handle order status updates from WebSocket
+    async fn handle_order_updates(&mut self, updates: Vec<OrderUpdate>) {
+        let current_timestamp = chrono::Utc::now().timestamp_millis() as u64;
+
+        for update in updates {
+            let oid = update.order.oid;
+            let status = update.status.as_str();
+            let cloid_opt: Option<Cloid> = update.order.cloid.as_deref().and_then(|s| s.parse().ok());
+
+            debug!("Processing OrderUpdate: OID {}, Cloid {:?}, Status: {}", oid, cloid_opt, status);
+
+            match status {
+                "open" | "resting" => {
+                    // Order confirmed active/resting on the book
+                    let mut order_details: Option<RestingOrder> = None;
+
+                    // 1. Check if it confirms a pending order
+                    if let Some(cloid) = cloid_opt {
+                        if let Some(mut pending_order) = self.pending_place_orders.remove(&cloid) {
+                            pending_order.oid = Some(oid); // Assign the OID
+                            pending_order.state = OrderState::Active;
+                            pending_order.timestamp = current_timestamp;
+                            order_details = Some(pending_order);
+
+                            // Update mappings
+                            self.cloid_to_oid.insert(cloid, oid);
+                            self.oid_to_cloid.insert(oid, cloid);
+                            info!("Order placement confirmed: Cloid {} -> OID {}", cloid, oid);
+                        }
+                    }
+
+                    // 2. If not from pending, check if it's an update to an existing active order
+                    if order_details.is_none() {
+                        let orders = if update.order.side == "B" {
+                            &mut self.current_state.open_bids
+                        } else {
+                            &mut self.current_state.open_asks
+                        };
+                        if let Some(existing_order) = orders.iter_mut().find(|o| o.oid == Some(oid)) {
+                            // Update status if it was PendingCancel or something else
+                            if existing_order.state != OrderState::Active && existing_order.state != OrderState::PartiallyFilled {
+                                debug!("Order OID {} state updated from {:?} to Active.", oid, existing_order.state);
+                                existing_order.state = OrderState::Active;
+                            }
+                            existing_order.timestamp = current_timestamp;
+                            order_details = Some(existing_order.clone());
+                        }
+                    }
+
+                    // 3. Add/Update in CurrentState
+                    if let Some(order) = order_details {
+                        self.add_or_update_order(order);
+                    } else {
+                        // Order appeared without being pending or active? Might happen on reconnect/resync.
+                        warn!("Received 'resting' update for unknown OID {}. Adding to state.", oid);
+                        let price = update.order.limit_px.parse().unwrap_or(0.0);
+                        let size = update.order.sz.parse().unwrap_or(0.0);
+                        let is_buy = update.order.side == "B";
+                        let level = self.calculate_order_level(price, is_buy);
+                        if price > 0.0 && size > 0.0 {
+                            let new_order = RestingOrder {
+                                oid: Some(oid),
+                                cloid: cloid_opt,
+                                size,
+                                orig_size: update.order.orig_sz.parse().unwrap_or(size),
+                                price,
+                                is_buy,
+                                level,
+                                state: OrderState::Active,
+                                timestamp: current_timestamp,
+                            };
+                            self.add_or_update_order(new_order);
+                            if let Some(cloid) = cloid_opt {
+                                self.cloid_to_oid.insert(cloid, oid);
+                                self.oid_to_cloid.insert(oid, cloid);
+                            }
+                        }
+                    }
+                },
+                "canceled" | "cancelled" => {
+                    info!("Order OID {} confirmed Canceled.", oid);
+                    self.remove_and_cache_order(oid, OrderState::Cancelled);
+                },
+                "rejected" => {
+                    error!("Order OID {} Rejected!", oid);
+                    // Remove from pending if it exists
+                    if let Some(cloid) = cloid_opt {
+                        if self.pending_place_orders.contains_key(&cloid) {
+                            let order = self.pending_place_orders.remove(&cloid);
+                            warn!("Placement Rejected for Cloid {}: {:?}", cloid, order);
+                            // Move to cache with Rejected state
+                            if let Some(mut rej_order) = order {
+                                rej_order.oid = Some(oid);
+                                rej_order.state = OrderState::Rejected;
+                                rej_order.timestamp = current_timestamp;
+                                self.recently_completed_orders.insert(oid, rej_order);
+                            }
+                        } else {
+                            warn!("'Rejected' status received for OID {}, Cloid {:?}, not found in pending.", oid, cloid_opt);
+                            // Check if it was PendingCancel and revert?
+                            let orders_lists = [&mut self.current_state.open_bids, &mut self.current_state.open_asks];
+                            for list in orders_lists {
+                                if let Some(order) = list.iter_mut().find(|o| o.oid == Some(oid) && o.state == OrderState::PendingCancel) {
+                                    warn!("Cancel request for OID {} was Rejected. Reverting state to Active.", oid);
+                                    order.state = OrderState::Active;
+                                    order.timestamp = current_timestamp;
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        warn!("'Rejected' status received for OID {} without Cloid.", oid);
+                        self.remove_and_cache_order(oid, OrderState::Rejected);
+                    }
+                },
+                "filled" => {
+                    info!("Order OID {} confirmed Fully Filled.", oid);
+                    self.remove_and_cache_order(oid, OrderState::Filled);
+                },
+                "partiallyFilled" => {
+                    debug!("Order OID {} is Partially Filled.", oid);
+                    // Update remaining size and state in active lists
+                    let remaining_size = update.order.sz.parse().unwrap_or(0.0);
+                    let orders = if update.order.side == "B" {
+                        &mut self.current_state.open_bids
+                    } else {
+                        &mut self.current_state.open_asks
+                    };
+                    if let Some(order) = orders.iter_mut().find(|o| o.oid == Some(oid)) {
+                        order.size = remaining_size;
+                        order.state = OrderState::PartiallyFilled;
+                        order.timestamp = current_timestamp;
+                    } else {
+                        warn!("Received 'partiallyFilled' for unknown OID {}. Adding to state.", oid);
+                        let price = update.order.limit_px.parse().unwrap_or(0.0);
+                        let is_buy = update.order.side == "B";
+                        let level = self.calculate_order_level(price, is_buy);
+                        if price > 0.0 && remaining_size > 0.0 {
+                            let new_order = RestingOrder {
+                                oid: Some(oid),
+                                cloid: cloid_opt,
+                                size: remaining_size,
+                                orig_size: update.order.orig_sz.parse().unwrap_or(remaining_size),
+                                price,
+                                is_buy,
+                                level,
+                                state: OrderState::PartiallyFilled,
+                                timestamp: current_timestamp,
+                            };
+                            self.add_or_update_order(new_order);
+                            if let Some(cloid) = cloid_opt {
+                                self.cloid_to_oid.insert(cloid, oid);
+                                self.oid_to_cloid.insert(oid, cloid);
+                            }
+                        }
+                    }
+                },
+                "expired" => {
+                    info!("Order OID {} Expired.", oid);
+                    self.remove_and_cache_order(oid, OrderState::Expired);
+                },
+                // Ignore transient states
+                "sending" | "pendingCancel" => {
+                    debug!("Order OID {} has transient status: {}", oid, status);
+                }
+                _ => {
+                    warn!("Received unknown order status '{}' for OID {}", status, oid);
                 }
             }
         }
@@ -637,14 +890,14 @@ impl BotRunner {
         // Find the matched order and its level
         if is_buy {
             // This was a fill on our BID order
-            if let Some(order) = self.current_state.open_bids.iter().find(|o| o.oid == fill.oid) {
+            if let Some(order) = self.current_state.open_bids.iter().find(|o| o.oid == Some(fill.oid)) {
                 filled_level = Some(order.level);
             } else {
                 warn!("Fill received for unknown/already removed bid OID: {}", fill.oid);
             }
         } else {
             // This was a fill on our ASK order
-            if let Some(order) = self.current_state.open_asks.iter().find(|o| o.oid == fill.oid) {
+            if let Some(order) = self.current_state.open_asks.iter().find(|o| o.oid == Some(fill.oid)) {
                 filled_level = Some(order.level);
             } else {
                 warn!("Fill received for unknown/already removed ask OID: {}", fill.oid);
@@ -718,17 +971,92 @@ impl BotRunner {
 
     /// Execute strategy actions using ParallelOrderExecutor
     async fn execute_actions(&mut self, actions: Vec<StrategyAction>) {
-        // Convert strategy actions to executor actions and filter out NoOp
-        let executor_actions: Vec<ExecutorAction> = actions
-            .into_iter()
-            .filter_map(|action| match action {
-                StrategyAction::Place(order) => Some(ExecutorAction::Place(order)),
-                StrategyAction::Cancel(cancel) => Some(ExecutorAction::Cancel(cancel)),
-                StrategyAction::BatchPlace(orders) => Some(ExecutorAction::BatchPlace(orders)),
-                StrategyAction::BatchCancel(cancels) => Some(ExecutorAction::BatchCancel(cancels)),
-                StrategyAction::NoOp => None,  // Filter out NoOp
-            })
-            .collect();
+        let mut executor_actions: Vec<ExecutorAction> = Vec::new();
+        let current_timestamp = chrono::Utc::now().timestamp_millis() as u64;
+
+        for action in actions {
+            match action {
+                StrategyAction::Place(order) => {
+                    if let Some(cloid) = order.cloid {
+                        // Create RestingOrder and add to pending
+                        let level = self.calculate_order_level(order.limit_px, order.is_buy);
+                        let resting_order = RestingOrder::new(
+                            None, // OID unknown yet
+                            Some(cloid),
+                            order.sz,
+                            order.limit_px,
+                            order.is_buy,
+                            level,
+                        );
+                        self.pending_place_orders.insert(cloid, resting_order);
+                        executor_actions.push(ExecutorAction::Place(order));
+                        debug!("Order Cloid {} added to pending_place_orders.", cloid);
+                    } else {
+                        warn!("StrategyAction::Place missing Cloid, cannot track pending status properly.");
+                        executor_actions.push(ExecutorAction::Place(order));
+                    }
+                },
+                StrategyAction::Cancel(cancel) => {
+                    let oid_to_cancel = cancel.oid;
+                    let mut found = false;
+                    // Mark as PendingCancel
+                    let orders_lists = [&mut self.current_state.open_bids, &mut self.current_state.open_asks];
+                    for list in orders_lists {
+                        if let Some(order) = list.iter_mut().find(|o| o.oid == Some(oid_to_cancel) && o.state == OrderState::Active) {
+                            order.state = OrderState::PendingCancel;
+                            order.timestamp = current_timestamp;
+                            executor_actions.push(ExecutorAction::Cancel(cancel.clone()));
+                            found = true;
+                            debug!("Marked OID {} as PendingCancel.", oid_to_cancel);
+                            break;
+                        }
+                    }
+                    if !found {
+                        debug!("Skipping cancel for OID {}, not found or not Active.", oid_to_cancel);
+                    }
+                },
+                StrategyAction::BatchPlace(orders) => {
+                    for order in &orders {
+                        if let Some(cloid) = order.cloid {
+                            let level = self.calculate_order_level(order.limit_px, order.is_buy);
+                            let resting_order = RestingOrder::new(
+                                None, Some(cloid), order.sz, order.limit_px, order.is_buy, level
+                            );
+                            self.pending_place_orders.insert(cloid, resting_order);
+                            debug!("Order Cloid {} added to pending_place_orders (batch).", cloid);
+                        } else {
+                            warn!("StrategyAction::BatchPlace contains order missing Cloid.");
+                        }
+                    }
+                    executor_actions.push(ExecutorAction::BatchPlace(orders));
+                },
+                StrategyAction::BatchCancel(cancels) => {
+                    let mut valid_executor_cancels = Vec::new();
+                    for cancel in cancels {
+                        let oid_to_cancel = cancel.oid;
+                        let mut found = false;
+                        let orders_lists = [&mut self.current_state.open_bids, &mut self.current_state.open_asks];
+                        for list in orders_lists {
+                            if let Some(order) = list.iter_mut().find(|o| o.oid == Some(oid_to_cancel) && o.state == OrderState::Active) {
+                                order.state = OrderState::PendingCancel;
+                                order.timestamp = current_timestamp;
+                                valid_executor_cancels.push(cancel.clone());
+                                found = true;
+                                debug!("Marked OID {} as PendingCancel (batch).", oid_to_cancel);
+                                break;
+                            }
+                        }
+                        if !found {
+                            debug!("Skipping batch cancel for OID {}, not found or not Active.", oid_to_cancel);
+                        }
+                    }
+                    if !valid_executor_cancels.is_empty() {
+                        executor_actions.push(ExecutorAction::BatchCancel(valid_executor_cancels));
+                    }
+                },
+                StrategyAction::NoOp => {}
+            }
+        }
 
         if executor_actions.is_empty() {
             return; // Nothing to execute
@@ -902,6 +1230,20 @@ impl BotRunner {
                 self.current_state.unrealized_pnl = 
                     self.current_state.position.abs() * (self.current_state.avg_entry_price - self.current_state.l2_mid_price);
             }
+        }
+
+        // Prune recently_completed_orders cache
+        let now = Instant::now();
+        if now.duration_since(self.last_cache_prune_time) > Duration::from_secs(10) {
+            // Prune orders older than 30 seconds
+            let cutoff_timestamp = (chrono::Utc::now() - chrono::Duration::seconds(30)).timestamp_millis() as u64;
+            let initial_size = self.recently_completed_orders.len();
+            self.recently_completed_orders.retain(|_oid, order| order.timestamp >= cutoff_timestamp);
+            let removed_count = initial_size - self.recently_completed_orders.len();
+            if removed_count > 0 {
+                debug!("Pruned {} orders from recently_completed_orders cache.", removed_count);
+            }
+            self.last_cache_prune_time = now;
         }
 
         // Call strategy tick hook

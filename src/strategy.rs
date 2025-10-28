@@ -11,6 +11,7 @@
 // Any object implementing the Strategy trait can be dropped into the main
 // binary without modifying core infrastructure code.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
@@ -224,23 +225,84 @@ pub struct CurrentState {
     pub session_start_time: f64,
 }
 
-/// Simplified representation of a resting order for strategy consumption
-#[derive(Debug, Clone)]
-pub struct RestingOrder {
-    /// Order ID
-    pub oid: u64,
+// ============================================================================
+// ORDER STATE TRACKING
+// ============================================================================
 
-    /// Order size (positive)
+/// Possible states an order can be in during its lifecycle
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OrderState {
+    /// Order sent, awaiting confirmation
+    PendingPlace,
+    /// Order is currently active on the book
+    Active,
+    /// A cancel request has been sent, awaiting confirmation
+    PendingCancel,
+    /// Order has been partially filled but still active
+    PartiallyFilled,
+    /// Order has been fully filled
+    Filled,
+    /// Order has been successfully cancelled
+    Cancelled,
+    /// Order placement was rejected
+    Rejected,
+    /// Order expired (e.g., IOC/FOK not filled, or TIF expired)
+    Expired,
+}
+
+/// Simplified representation of a resting order for strategy consumption
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestingOrder {
+    /// Order ID (Option because it might not be known immediately after placing with Cloid)
+    pub oid: Option<u64>,
+
+    /// Client Order ID (UUID) - Important for tracking before OID is known
+    pub cloid: Option<uuid::Uuid>,
+
+    /// Remaining order size (positive)
     pub size: f64,
+
+    /// Original order size (useful for partial fill tracking)
+    pub orig_size: f64,
 
     /// Order price
     pub price: f64,
 
+    /// Side (true for buy, false for sell)
+    pub is_buy: bool,
+
     /// Order level (0 = L1/tightest, 1 = L2, etc.)
     pub level: usize,
 
-    /// Whether a cancel has been sent but not yet confirmed
-    pub pending_cancel: bool,
+    /// Current state of the order
+    pub state: OrderState,
+
+    /// Timestamp when the order was placed or last updated (Unix millis)
+    pub timestamp: u64,
+}
+
+impl RestingOrder {
+    /// Create a new RestingOrder (initially in PendingPlace state)
+    pub fn new(
+        oid: Option<u64>,
+        cloid: Option<uuid::Uuid>,
+        size: f64,
+        price: f64,
+        is_buy: bool,
+        level: usize,
+    ) -> Self {
+        RestingOrder {
+            oid,
+            cloid,
+            size,
+            orig_size: size, // Initially, size and orig_size are the same
+            price,
+            is_buy,
+            level,
+            state: OrderState::PendingPlace, // Start as PendingPlace
+            timestamp: chrono::Utc::now().timestamp_millis() as u64,
+        }
+    }
 }
 
 impl Default for CurrentState {
