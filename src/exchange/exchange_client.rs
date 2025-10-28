@@ -182,7 +182,6 @@ impl ExchangeClient {
         };
         let res = serde_json::to_string(&exchange_payload)
             .map_err(|e| Error::JsonParse(e.to_string()))?;
-        info!("📦 Serialized order JSON: {}", res);
         debug!("Sending request {res:?}");
 
         // Retry logic with exponential backoff for network errors
