@@ -238,12 +238,18 @@ fn count_decimal_places(num: f64) -> u32 {
 fn limit_decimal_places(num: f64, max_decimals: u32, round_up: bool) -> f64 {
     let multiplier = 10f64.powi(max_decimals as i32);
     let scaled = num * multiplier;
-    
-    if round_up {
-        scaled.ceil() / multiplier
+    let rounded = if round_up {
+        scaled.ceil()
     } else {
-        scaled.floor() / multiplier
-    }
+        scaled.floor()
+    };
+    let result = rounded / multiplier;
+
+    // Critical fix: ensure exact decimal precision when serialized
+    // This prevents floating-point representation issues like 0.333 becoming 0.33300000000000001776
+    format!("{:.prec$}", result, prec = max_decimals as usize)
+        .parse::<f64>()
+        .unwrap_or(result)
 }
 
 /// Limit a number to a specific number of significant figures

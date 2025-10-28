@@ -4,7 +4,7 @@ use alloy::{
     primitives::{keccak256, Address, Signature, B256},
     signers::local::PrivateKeySigner,
 };
-use log::debug;
+use log::{debug, info};
 use reqwest::Client;
 use serde::{ser::SerializeStruct, Deserialize, Serialize, Serializer};
 
@@ -182,6 +182,7 @@ impl ExchangeClient {
         };
         let res = serde_json::to_string(&exchange_payload)
             .map_err(|e| Error::JsonParse(e.to_string()))?;
+        info!("📦 Serialized order JSON: {}", res);
         debug!("Sending request {res:?}");
 
         // Retry logic with exponential backoff for network errors
