@@ -549,6 +549,10 @@ impl BotRunner {
         let validated_px = self.tick_lot_validator.round_price(order.limit_px, order.is_buy);
         let validated_sz = self.tick_lot_validator.round_size(order.sz, false);
 
+        // Debug logging for order validation
+        info!("🔍 Order validation: original_sz={}, validated_sz={}, original_px={}, validated_px={}",
+              order.sz, validated_sz, order.limit_px, validated_px);
+
         if validated_sz < 0.001 {
             warn!("Order size too small after rounding: {}", order.sz);
             return;
@@ -557,6 +561,12 @@ impl BotRunner {
         let mut validated_order = order.clone();
         validated_order.limit_px = validated_px;
         validated_order.sz = validated_sz;
+
+        // Debug logging before sending to exchange
+        info!("📤 Sending order to exchange: {} {} @ {} (validated)",
+              if validated_order.is_buy { "BUY" } else { "SELL" },
+              validated_order.sz,
+              validated_order.limit_px);
 
         // Track pending order
         if let Some(cloid) = validated_order.cloid {
@@ -743,6 +753,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         AssetType::Perp,
         3, // sz_decimals
     );
+
+    // Log TickLotValidator configuration for debugging
+    info!("🔧 TickLotValidator config: asset={}, szDecimals={}, max_price_decimals={}",
+          tick_lot_validator.asset,
+          tick_lot_validator.sz_decimals,
+          tick_lot_validator.max_price_decimals());
 
     // Create bot runner
     let mut bot_runner = BotRunner::new(
