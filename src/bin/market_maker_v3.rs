@@ -500,8 +500,6 @@ impl BotRunner {
                         return;
                     }
 
-                    info!("📊 Received {} real-time fills from UserEvents", fills.len());
-
                     let mut new_fills = Vec::new();
 
                     for fill in &fills {
@@ -717,10 +715,6 @@ impl BotRunner {
         let validated_px = self.tick_lot_validator.round_price(order.limit_px, order.is_buy);
         let validated_sz = self.tick_lot_validator.round_size(order.sz, false);
 
-        // Debug logging for order validation
-        info!("🔍 Order validation: original_sz={}, validated_sz={}, original_px={}, validated_px={}",
-              order.sz, validated_sz, order.limit_px, validated_px);
-
         if validated_sz < 0.001 {
             warn!("Order size too small after rounding: {}", order.sz);
             return;
@@ -729,12 +723,6 @@ impl BotRunner {
         let mut validated_order = order.clone();
         validated_order.limit_px = validated_px;
         validated_order.sz = validated_sz;
-
-        // Debug logging before sending to exchange
-        info!("📤 Sending order to exchange: {} {} @ {} (validated)",
-              if validated_order.is_buy { "BUY" } else { "SELL" },
-              validated_order.sz,
-              validated_order.limit_px);
 
         // Track pending order
         if let Some(cloid) = validated_order.cloid {
@@ -911,15 +899,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load config
     let config = load_config("config.json");
 
-    info!("=== Market Maker V3 (Generic Bot Runner) ===");
-    info!("Asset: {}", config.asset);
-    info!("Strategy: {}", config.strategy_name);
-    info!("============================================");
+    info!("=== Market Maker V3 | Asset: {} | Strategy: {} ===", config.asset, config.strategy_name);
 
     // --- STRATEGY FACTORY ---
     let strategy: Box<dyn Strategy> = match config.strategy_name.as_str() {
         "hjb_v1" => {
-            info!("Loading strategy: HJB Strategy v2");
             Box::new(HjbStrategy::new(&config.asset, &serde_json::json!({
                 "strategy_params": config.strategy_params
             })))
@@ -937,7 +921,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Log TickLotValidator configuration for debugging
-    info!("🔧 TickLotValidator config: asset={}, szDecimals={}, max_price_decimals={}",
+    debug!("TickLotValidator config: asset={}, szDecimals={}, max_price_decimals={}",
           tick_lot_validator.asset,
           tick_lot_validator.sz_decimals,
           tick_lot_validator.max_price_decimals());

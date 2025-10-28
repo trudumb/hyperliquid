@@ -355,13 +355,8 @@ impl Strategy for HjbStrategy {
         let trading_enabled_default = strategy_config.enable_online_learning; // Enable if online learning is on
         let trading_enabled = Arc::new(RwLock::new(trading_enabled_default));
 
-        info!("✅ Initialized HJB Strategy for {}", asset);
-        info!("   - Trading enabled: {}", trading_enabled_default);
-        info!("   - Multi-level: {}", strategy_config.enable_multi_level);
-        info!("   - Robust control: {}", strategy_config.enable_robust_control);
-        info!("   - φ (inventory aversion): {}", strategy_config.phi);
-        info!("   - λ_base (fill rate): {}", strategy_config.lambda_base);
-        info!("   - Max position: {}", strategy_config.max_absolute_position_size);
+        info!("✅ Initialized HJB Strategy for {} | Trading: {} | Max Position: {}",
+              asset, trading_enabled_default, strategy_config.max_absolute_position_size);
 
         Self {
             config: strategy_config,
