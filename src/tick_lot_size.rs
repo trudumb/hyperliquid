@@ -143,6 +143,22 @@ impl TickLotValidator {
 
         limit_decimal_places(size, self.sz_decimals, round_up)
     }
+
+    /// Helper to get the minimum price step based on decimal rules.
+    ///
+    /// This returns the smallest possible price increment for this asset,
+    /// which is 10^(-max_price_decimals).
+    pub fn min_price_step(&self) -> f64 {
+        10f64.powi(-(self.max_price_decimals() as i32))
+    }
+
+    /// Helper to get the minimum size step (lot size) based on szDecimals.
+    ///
+    /// This returns the smallest possible size increment for this asset,
+    /// which is 10^(-sz_decimals).
+    pub fn min_size_step(&self) -> f64 {
+        10f64.powi(-(self.sz_decimals as i32))
+    }
 }
 
 /// Count the number of significant figures in a number

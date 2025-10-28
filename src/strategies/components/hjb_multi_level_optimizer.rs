@@ -50,6 +50,7 @@
 // let (bids, asks) = optimizer.calculate_target_quotes(&inputs, &state, &fill_model);
 // ```
 
+use log::{debug, warn};
 use serde_json::Value;
 
 use crate::strategy::CurrentState;
@@ -239,16 +240,26 @@ impl QuoteOptimizer for HjbMultiLevelOptimizer {
 }
 
 impl HjbMultiLevelOptimizer {
-    /// Calculate target quotes with additional metadata (taker rates, liquidation flag).
+    /// Calculate target quotes with robust spread-crossing prevention.
     ///
     /// This extended method returns all the information from the multi-level optimizer,
     /// not just the quotes. Use this when you need taker rates or liquidation signals.
+    ///
+    /// # Robustness Features
+    /// - Invalid mid-price handling (returns empty quotes if mid <= 0)
+    /// - BBO cross-spread prevention with tolerance
+    /// - Minimum size step validation
+    /// - Price validity checks
+    /// - Minimum notional value enforcement
+    /// - Comprehensive logging for debugging
     pub fn calculate_target_quotes_with_metadata(
         &self,
         inputs: &OptimizerInputs,
         state: &CurrentState,
         fill_model: &HawkesFillModel,
     ) -> OptimizerOutput {
+        // --- Steps 1-5: Calculate Robust Params, Base Spread, Skew, Opt State ---
+
         // 1. Compute robust parameters using the robust control component
         let robust_params = self.robust_control.compute_robust_parameters(
             inputs.volatility_bps,
@@ -296,55 +307,149 @@ impl HjbMultiLevelOptimizer {
             &self.tuning_params,
         );
 
-        // 7. Convert offsets to prices and apply inventory skew
+        // --- Step 7: Convert offsets to prices, apply skew robustly, check crossing ---
         let mut target_bids = Vec::new();
         let mut target_asks = Vec::new();
 
-        for (offset_bps, size_raw) in multi_level_control.bid_levels {
-            if size_raw < EPSILON {
-                continue;
-            }
-
-            let size = self.tick_lot_validator.round_size(size_raw, false);
-            if size < EPSILON {
-                continue;
-            }
-
-            // Apply inventory skew: skew is in bps, shift the mid price
-            let skewed_mid = state.l2_mid_price * (1.0 + skew_result.skew_bps / 10000.0);
-            let price_raw = skewed_mid * (1.0 - offset_bps / 10000.0);
-            let price = self.tick_lot_validator.round_price(price_raw, false);
-
-            // Ensure minimum notional value ($10)
-            if price > 0.0 && (size * price) >= 10.0 {
-                target_bids.push((price, size));
-            }
+        let true_mid = state.l2_mid_price;
+        if true_mid <= 0.0 {
+            warn!("Invalid true_mid price ({:.5}) during quote calculation. Skipping.", true_mid);
+            // Return empty quotes immediately if mid-price is invalid
+            return OptimizerOutput {
+                target_bids,
+                target_asks,
+                taker_buy_rate: 0.0,
+                taker_sell_rate: 0.0,
+                liquidate: false,
+            };
         }
 
-        for (offset_bps, size_raw) in multi_level_control.ask_levels {
-            if size_raw < EPSILON {
+        let best_bid_opt = state.order_book.as_ref().and_then(|b| b.best_bid());
+        let best_ask_opt = state.order_book.as_ref().and_then(|b| b.best_ask());
+        let min_price_increment = self.tick_lot_validator.min_price_step();
+        let min_size_increment = self.tick_lot_validator.min_size_step();
+        // Use a small fraction of the minimum price increment as tolerance
+        let cross_tolerance = min_price_increment * 0.1;
+
+        debug!(
+            "Quote Calc: Mid={:.5}, Skew={:.2}bps, BBO=[{:?}, {:?}]",
+            true_mid, skew_result.skew_bps, best_bid_opt, best_ask_opt
+        );
+
+        // --- Process Bid Levels ---
+        for (level_index, (offset_bps, size_raw)) in multi_level_control.bid_levels.iter().enumerate() {
+            if *size_raw < EPSILON {
                 continue;
             }
 
-            let size = self.tick_lot_validator.round_size(size_raw, false);
-            if size < EPSILON {
+            let size = self.tick_lot_validator.round_size(*size_raw, false); // Round size down
+            if size < min_size_increment {
+                debug!("Level {} bid size {:.8} rounded below min step {:.8}. Skipping.",
+                       level_index + 1, *size_raw, min_size_increment);
                 continue;
             }
 
-            // Apply inventory skew: skew is in bps, shift the mid price
-            let skewed_mid = state.l2_mid_price * (1.0 + skew_result.skew_bps / 10000.0);
-            let price_raw = skewed_mid * (1.0 + offset_bps / 10000.0);
-            let price = self.tick_lot_validator.round_price(price_raw, true);
+            // **1. Calculate price from true mid and offset**
+            let price_before_skew = true_mid * (1.0 - offset_bps / 10000.0);
 
-            // Ensure minimum notional value ($10)
-            if price > 0.0 && (size * price) >= 10.0 {
-                target_asks.push((price, size));
+            // **2. Apply skew multiplicatively**
+            let price_with_skew = price_before_skew * (1.0 + skew_result.skew_bps / 10000.0);
+
+            // **3. Round final price (bids DOWN)**
+            let final_bid_price = self.tick_lot_validator.round_price(price_with_skew, false);
+
+            // **4. Robust Cross-Spread Check**
+            if let Some(best_ask) = best_ask_opt {
+                // Check if the final bid is strictly GREATER than the best ask (allowing matching within tolerance)
+                if final_bid_price > best_ask + cross_tolerance {
+                    warn!(
+                        "L{} Bid {:.5} would CROSS Ask {:.5}! Skipping. (Offset={:.2}bps, Skew={:.2}bps, Mid={:.5})",
+                        level_index + 1, final_bid_price, best_ask, offset_bps, skew_result.skew_bps, true_mid
+                    );
+                    continue; // Skip this level
+                }
+            } else if final_bid_price > true_mid * (1.0 + min_profitable_half_spread / 10000.0) {
+                // Fallback: If no ask BBO, prevent bids significantly above mid
+                warn!("L{} Bid {:.5} > Mid {:.5} without Ask BBO. Skipping.",
+                      level_index + 1, final_bid_price, true_mid);
+                continue;
             }
+
+            // Price validity and Notional check
+            if final_bid_price <= 0.0 {
+                warn!("L{} Bid price calculated <= 0 ({:.5}). Skipping.", level_index + 1, final_bid_price);
+                continue;
+            }
+            if (size * final_bid_price) < 10.0 { // Minimum notional value (e.g., $10)
+                debug!("L{} Bid notional {:.2} < $10. Skipping.", level_index + 1, size * final_bid_price);
+                continue;
+            }
+
+            target_bids.push((final_bid_price, size));
         }
 
-        // 8. Sort bids descending, asks ascending
-        target_bids.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-        target_asks.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        // --- Process Ask Levels ---
+        for (level_index, (offset_bps, size_raw)) in multi_level_control.ask_levels.iter().enumerate() {
+            if *size_raw < EPSILON {
+                continue;
+            }
+
+            let size = self.tick_lot_validator.round_size(*size_raw, false); // Round size down
+            if size < min_size_increment {
+                debug!("Level {} ask size {:.8} rounded below min step {:.8}. Skipping.",
+                       level_index + 1, *size_raw, min_size_increment);
+                continue;
+            }
+
+            // **1. Calculate price from true mid and offset**
+            let price_before_skew = true_mid * (1.0 + offset_bps / 10000.0);
+
+            // **2. Apply skew multiplicatively**
+            let price_with_skew = price_before_skew * (1.0 + skew_result.skew_bps / 10000.0);
+
+            // **3. Round final price (asks UP)**
+            let final_ask_price = self.tick_lot_validator.round_price(price_with_skew, true);
+
+            // **4. Robust Cross-Spread Check**
+            if let Some(best_bid) = best_bid_opt {
+                // Check if the final ask is strictly LESS than the best bid (allowing matching within tolerance)
+                if final_ask_price < best_bid - cross_tolerance {
+                    warn!(
+                        "L{} Ask {:.5} would CROSS Bid {:.5}! Skipping. (Offset={:.2}bps, Skew={:.2}bps, Mid={:.5})",
+                        level_index + 1, final_ask_price, best_bid, offset_bps, skew_result.skew_bps, true_mid
+                    );
+                    continue; // Skip this level
+                }
+            } else if final_ask_price < true_mid * (1.0 - min_profitable_half_spread / 10000.0) {
+                // Fallback: If no bid BBO, prevent asks significantly below mid
+                warn!("L{} Ask {:.5} < Mid {:.5} without Bid BBO. Skipping.",
+                      level_index + 1, final_ask_price, true_mid);
+                continue;
+            }
+
+            // Price validity and Notional check
+            if final_ask_price <= 0.0 {
+                warn!("L{} Ask price calculated <= 0 ({:.5}). Skipping.", level_index + 1, final_ask_price);
+                continue;
+            }
+            if (size * final_ask_price) < 10.0 { // Minimum notional value (e.g., $10)
+                debug!("L{} Ask notional {:.2} < $10. Skipping.", level_index + 1, size * final_ask_price);
+                continue;
+            }
+
+            target_asks.push((final_ask_price, size));
+        }
+
+        // --- Step 8: Sort bids descending, asks ascending ---
+        target_bids.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        target_asks.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        // --- Step 9: Return result ---
+        debug!(
+            "Final Quotes: Bids({}), Asks({}) | Taker Rates: Buy={:.4}, Sell={:.4}",
+            target_bids.len(), target_asks.len(),
+            multi_level_control.taker_buy_rate, multi_level_control.taker_sell_rate
+        );
 
         OptimizerOutput {
             target_bids,

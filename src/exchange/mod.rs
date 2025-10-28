@@ -24,4 +24,5 @@ pub use order_pool::{OrderPool, OrderPoolStats};
 #[allow(unreachable_pub)]
 pub use parallel_order_executor::{
     BatchExecutionResult, ExecutorConfig, ExecutorStats, ParallelOrderExecutor,
+    StrategyAction as ExecutorAction,  // Export with alias to avoid conflicts
 };
