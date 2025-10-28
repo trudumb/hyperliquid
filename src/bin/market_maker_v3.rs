@@ -86,7 +86,7 @@ use hyperliquid_rust_sdk::{
     AssetType, BaseUrl, ClientCancelRequest, ClientOrderRequest,
     CurrentState, ExchangeClient, InfoClient, MarketUpdate, Message,
     OrderBook, RestingOrder, Strategy, StrategyAction, Subscription, TickLotValidator,
-    TradeInfo, UserData, UserFills, UserUpdate,
+    TradeInfo, UserData, UserUpdate,
 };
 use hyperliquid_rust_sdk::strategies::hjb_strategy::HjbStrategy;
 
@@ -156,6 +156,9 @@ struct BotRunner {
 
     /// Shutdown flag (prevents processing new events during shutdown)
     is_shutting_down: Arc<AtomicBool>,
+
+    /// Flag to track if initial snapshot has been received
+    snapshot_received: bool,
 }
 
 impl BotRunner {
@@ -223,6 +226,7 @@ impl BotRunner {
             pending_orders: HashMap::new(),
             total_messages: 0,
             is_shutting_down: Arc::new(AtomicBool::new(false)),
+            snapshot_received: false,
         })
     }
 
@@ -372,10 +376,21 @@ impl BotRunner {
             Message::UserFills(user_fills) => {
                 // This stream is dedicated to fills, including the initial snapshot.
                 let fills_data = &user_fills.data;
+                let is_snapshot = fills_data.is_snapshot.unwrap_or(false);
+
+                if is_snapshot {
+                    // Skip the initial snapshot - we only want real-time fills
+                    if !self.snapshot_received {
+                        info!("📸 Skipping initial snapshot of {} historical fills", fills_data.fills.len());
+                        self.snapshot_received = true;
+                    }
+                    // Ignore all snapshot data
+                    return;
+                }
+
+                // Only process real-time fill updates
                 if !fills_data.fills.is_empty() {
-                    // Log whether it's a snapshot or a stream update
-                    let update_type = if fills_data.is_snapshot.unwrap_or(false) { "Snapshot" } else { "Stream" };
-                    info!("Received {} UserFills ({}): {} fills.", update_type, fills_data.user, fills_data.fills.len());
+                    info!("📊 Received {} real-time fills", fills_data.fills.len());
 
                     let mut processed_fills = Vec::new();
 
