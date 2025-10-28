@@ -6,7 +6,8 @@ use uuid::Uuid;
 
 use crate::{
     errors::Error,
-    helpers::{float_to_string_for_hashing, uuid_to_hex_string},
+    helpers::{float_to_string_for_hashing, float_to_string_with_decimals, uuid_to_hex_string},
+    meta::AssetMeta,
     prelude::*,
 };
 
@@ -100,7 +101,11 @@ pub struct ClientOrderRequest {
 }
 
 impl ClientOrderRequest {
-    pub(crate) fn convert(self, coin_to_asset: &HashMap<String, u32>) -> Result<OrderRequest> {
+    pub(crate) fn convert(
+        self,
+        coin_to_asset: &HashMap<String, u32>,
+        asset_metas: &[AssetMeta],
+    ) -> Result<OrderRequest> {
         let order_type = match self.order_type {
             ClientOrder::Limit(limit) => Order::Limit(Limit { tif: limit.tif }),
             ClientOrder::Trigger(trigger) => Order::Trigger(Trigger {
@@ -113,12 +118,35 @@ impl ClientOrderRequest {
 
         let cloid = self.cloid.map(uuid_to_hex_string);
 
+        // Get asset metadata for decimal formatting
+        // For spot assets (>= 10000), we can't look them up in asset_metas, so use default formatting
+        // For perp assets, look up szDecimals to format correctly
+        let (sz_str, px_str) = if asset < 10000 {
+            let asset_meta = asset_metas.get(asset as usize)
+                .ok_or(Error::AssetNotFound)?;
+            let sz_decimals = asset_meta.sz_decimals;
+            // For perps: MAX_DECIMALS_PERP = 6
+            const MAX_DECIMALS_PERP: u32 = 6;
+            let price_decimals = MAX_DECIMALS_PERP.saturating_sub(sz_decimals);
+
+            (
+                float_to_string_with_decimals(self.sz, sz_decimals),
+                float_to_string_with_decimals(self.limit_px, price_decimals),
+            )
+        } else {
+            // Spot assets - use default formatting
+            (
+                float_to_string_for_hashing(self.sz),
+                float_to_string_for_hashing(self.limit_px),
+            )
+        };
+
         Ok(OrderRequest {
             asset,
             is_buy: self.is_buy,
             reduce_only: self.reduce_only,
-            limit_px: float_to_string_for_hashing(self.limit_px),
-            sz: float_to_string_for_hashing(self.sz),
+            limit_px: px_str,
+            sz: sz_str,
             order_type,
             cloid,
         })

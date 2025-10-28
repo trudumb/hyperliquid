@@ -545,7 +545,7 @@ impl ExchangeClient {
         let mut transformed_orders = Vec::new();
 
         for order in orders {
-            transformed_orders.push(order.convert(&self.coin_to_asset)?);
+            transformed_orders.push(order.convert(&self.coin_to_asset, &self.meta.universe)?);
         }
 
         let action = Actions::Order(BulkOrder {
@@ -575,7 +575,7 @@ impl ExchangeClient {
         let mut transformed_orders = Vec::new();
 
         for order in orders {
-            transformed_orders.push(order.convert(&self.coin_to_asset)?);
+            transformed_orders.push(order.convert(&self.coin_to_asset, &self.meta.universe)?);
         }
 
         let action = Actions::Order(BulkOrder {
@@ -651,7 +651,7 @@ impl ExchangeClient {
         for modify in modifies.into_iter() {
             transformed_modifies.push(ModifyRequest {
                 oid: modify.oid,
-                order: modify.order.convert(&self.coin_to_asset)?,
+                order: modify.order.convert(&self.coin_to_asset, &self.meta.universe)?,
             });
         }
 
