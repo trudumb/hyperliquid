@@ -98,6 +98,8 @@ use std::sync::Arc;
 use tokio::signal;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+// RUST_LOG=info cargo run --release --bin market_maker_v3
+
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -147,9 +149,6 @@ struct BotRunner {
 
     /// Pending order placements (awaiting confirmation)
     pending_orders: HashMap<uuid::Uuid, ClientOrderRequest>,
-
-    /// Session start equity (for performance tracking)
-    session_start_equity: f64,
 
     /// Total messages received (for throughput monitoring)
     total_messages: u64,
@@ -218,7 +217,6 @@ impl BotRunner {
             current_state,
             cloid_to_oid: HashMap::new(),
             pending_orders: HashMap::new(),
-            session_start_equity: account_equity,
             total_messages: 0,
         })
     }
