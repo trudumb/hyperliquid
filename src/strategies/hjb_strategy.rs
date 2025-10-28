@@ -36,7 +36,7 @@
 
 use std::sync::Arc;
 use parking_lot::RwLock;
-use log::{debug, info};
+use log::{debug, info, warn};
 
 use serde_json::Value;
 
@@ -469,6 +469,50 @@ impl Strategy for HjbStrategy {
                 oid: order.oid,
             }));
         }
+
+        // --- Add Position Closing Logic ---
+        if state.position.abs() > crate::EPSILON {
+            info!("Current position is {}, creating closing order.", state.position);
+
+            let is_buy_to_close = state.position < 0.0; // Buy if short, sell if long
+            let size_to_close = self.tick_lot_validator.round_size(state.position.abs(), false);
+
+            // Define a minimum order size threshold (from tick validator)
+            let min_order_size = 10f64.powi(-(self.tick_lot_validator.sz_decimals as i32));
+
+            if size_to_close >= min_order_size && state.l2_mid_price > 0.0 {
+                // Calculate an aggressive price for IOC limit order (simulating market order)
+                let slippage_factor = if is_buy_to_close { 1.1 } else { 0.9 }; // 10% slippage tolerance
+                let aggressive_px = self.tick_lot_validator.round_price(
+                    state.l2_mid_price * slippage_factor,
+                    is_buy_to_close // Round up for buys, down for sells relative to aggression
+                );
+
+                info!("Closing position: {} {} @ aggressive price {} (mid: {})",
+                    if is_buy_to_close { "BUY" } else { "SELL" },
+                    size_to_close,
+                    aggressive_px,
+                    state.l2_mid_price);
+
+                let closing_order = ClientOrderRequest {
+                    asset: self.config.asset.clone(),
+                    is_buy: is_buy_to_close,
+                    reduce_only: true, // IMPORTANT: Ensure it only closes position
+                    limit_px: aggressive_px,
+                    sz: size_to_close,
+                    cloid: None, // Or Some(uuid::Uuid::new_v4())
+                    order_type: ClientOrder::Limit(ClientLimit {
+                        tif: "Ioc".to_string(), // Immediate Or Cancel
+                    }),
+                };
+                actions.push(StrategyAction::Place(closing_order));
+            } else {
+                warn!("Position size {} is too small to close or mid_price is invalid.", size_to_close);
+            }
+        } else {
+            info!("No position to close.");
+        }
+        // --- End Position Closing Logic ---
 
         actions
     }

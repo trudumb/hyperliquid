@@ -95,6 +95,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::signal;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -152,6 +153,9 @@ struct BotRunner {
 
     /// Total messages received (for throughput monitoring)
     total_messages: u64,
+
+    /// Shutdown flag (prevents processing new events during shutdown)
+    is_shutting_down: Arc<AtomicBool>,
 }
 
 impl BotRunner {
@@ -218,6 +222,7 @@ impl BotRunner {
             cloid_to_oid: HashMap::new(),
             pending_orders: HashMap::new(),
             total_messages: 0,
+            is_shutting_down: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -284,13 +289,21 @@ impl BotRunner {
 
                 // Check for shutdown signal
                 _ = &mut shutdown_rx => {
-                    info!("🛑 Shutdown signal received");
+                    info!("🛑 Shutdown signal received by main loop");
+                    // Set the flag FIRST
+                    self.is_shutting_down.store(true, Ordering::Relaxed);
+                    // Then handle shutdown actions
                     self.handle_shutdown().await;
                     break;
                 }
 
                 // Handle WebSocket messages
                 message = receiver.recv_async() => {
+                    // Check flag BEFORE processing
+                    if self.is_shutting_down.load(Ordering::Relaxed) {
+                        warn!("Ignoring WS message during shutdown.");
+                        continue;
+                    }
                     match message {
                         Ok(message) => {
                             self.handle_message(message).await;
@@ -304,6 +317,11 @@ impl BotRunner {
 
                 // Handle periodic tick (for housekeeping, position checks, etc.)
                 _ = tick_timer.tick() => {
+                    // Check flag BEFORE processing
+                    if self.is_shutting_down.load(Ordering::Relaxed) {
+                        warn!("Ignoring timer tick during shutdown.");
+                        continue;
+                    }
                     self.handle_tick().await;
                 }
             }
@@ -789,25 +807,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set up shutdown signals
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
-    // Set up Ctrl+C handler with timeout safety net
+    // Set up Ctrl+C handler
     tokio::spawn(async move {
         signal::ctrl_c().await.expect("Failed to install Ctrl+C handler");
-        info!("🛑 Ctrl+C - shutting down...");
+        info!("🛑 Ctrl+C - initiating graceful shutdown...");
         let _ = shutdown_tx.send(());
 
-        // Spawn a timeout task that will force-exit if shutdown hangs
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = signal::ctrl_c() => {
-                    warn!("⚠️  Second Ctrl+C - forcing exit!");
-                    std::process::exit(0);
-                }
-                _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {
-                    error!("❌ Shutdown timeout - forcing exit!");
-                    std::process::exit(1);
-                }
-            }
-        });
+        // Optional: Add a handler for a *second* Ctrl+C if graceful shutdown hangs
+        signal::ctrl_c().await.expect("Failed to install second Ctrl+C handler");
+        warn!("⚠️ Second Ctrl+C - forcing exit!");
+        std::process::exit(1);
     });
 
     // Run bot runner
