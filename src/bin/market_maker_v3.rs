@@ -83,10 +83,13 @@ let strategy: Box<dyn Strategy> = match config.strategy_name.as_str() {
 
 use alloy::signers::local::PrivateKeySigner;
 use hyperliquid_rust_sdk::{
-    AssetType, BaseUrl, ClientCancelRequest, ClientOrderRequest,
+    AssetType, BaseUrl, ClientOrderRequest,
     CurrentState, ExchangeClient, InfoClient, MarketUpdate, Message,
-    OrderBook, RestingOrder, Strategy, StrategyAction, Subscription, TickLotValidator,
+    OrderBook, Strategy, StrategyAction, Subscription, TickLotValidator,
     TradeInfo, UserData, UserUpdate,
+    // New imports for optimized execution
+    ParallelOrderExecutor, ExecutorConfig,
+    ExchangeResponseStatus, ExchangeDataStatus, ExecutorAction,
 };
 use hyperliquid_rust_sdk::strategies::hjb_strategy::HjbStrategy;
 
@@ -130,8 +133,8 @@ struct BotRunner {
     /// Strategy instance (trait object for polymorphism)
     strategy: Box<dyn Strategy>,
 
-    /// Exchange client for order management
-    exchange_client: Arc<ExchangeClient>,
+    /// Optimized order executor for parallel execution (replaces exchange_client)
+    order_executor: Arc<ParallelOrderExecutor>,
 
     /// Info client for market data queries (Option to allow explicit drop on shutdown)
     info_client: Option<InfoClient>,
@@ -139,7 +142,8 @@ struct BotRunner {
     /// User wallet address
     user_address: alloy::primitives::Address,
 
-    /// Tick/lot validator for order validation
+    /// Tick/lot validator for order validation (kept for potential future use)
+    #[allow(dead_code)]
     tick_lot_validator: TickLotValidator,
 
     /// Current bot state (maintained by bot runner)
@@ -177,6 +181,24 @@ impl BotRunner {
             ExchangeClient::new(None, wallet.clone(), Some(BaseUrl::Mainnet), None, None)
                 .await?
         );
+
+        // --- START NEW: Create ParallelOrderExecutor ---
+        // Create executor config (tune as needed for optimal performance)
+        let executor_config = ExecutorConfig {
+            max_concurrent: 8,         // Allow up to 8 parallel requests
+            batch_window_us: 100,      // 100μs batching window
+            request_timeout_ms: 750,   // Slightly longer timeout for batched requests
+            batch_timeout_ms: 2500,    // 2.5s total batch timeout
+        };
+
+        // Create the ParallelOrderExecutor
+        let order_executor = Arc::new(ParallelOrderExecutor::with_config(
+            exchange_client.clone(),
+            executor_config
+        ));
+
+        info!("✅ ParallelOrderExecutor initialized with max_concurrent=8");
+        // --- END NEW ---
 
         // Initialize info client
         let info_client = InfoClient::new(None, Some(BaseUrl::Mainnet)).await?;
@@ -220,7 +242,7 @@ impl BotRunner {
         Ok(Self {
             asset,
             strategy,
-            exchange_client,
+            order_executor,  // Use order_executor instead of exchange_client
             info_client: Some(info_client),
             user_address,
             tick_lot_validator,
@@ -693,34 +715,66 @@ impl BotRunner {
         );
     }
 
-    /// Execute strategy actions
+    /// Execute strategy actions using ParallelOrderExecutor
     async fn execute_actions(&mut self, actions: Vec<StrategyAction>) {
-        for action in actions {
-            match action {
-                StrategyAction::Place(order) => {
-                    self.execute_place_order(order).await;
-                }
-                StrategyAction::Cancel(cancel) => {
-                    self.execute_cancel_order(cancel).await;
-                }
-                StrategyAction::BatchPlace(orders) => {
-                    for order in orders {
-                        self.execute_place_order(order).await;
+        // Convert strategy actions to executor actions and filter out NoOp
+        let executor_actions: Vec<ExecutorAction> = actions
+            .into_iter()
+            .filter_map(|action| match action {
+                StrategyAction::Place(order) => Some(ExecutorAction::Place(order)),
+                StrategyAction::Cancel(cancel) => Some(ExecutorAction::Cancel(cancel)),
+                StrategyAction::BatchPlace(orders) => Some(ExecutorAction::BatchPlace(orders)),
+                StrategyAction::BatchCancel(cancels) => Some(ExecutorAction::BatchCancel(cancels)),
+                StrategyAction::NoOp => None,  // Filter out NoOp
+            })
+            .collect();
+
+        if executor_actions.is_empty() {
+            return; // Nothing to execute
+        }
+
+        // Execute in a spawned task to avoid blocking the main event loop
+        let executor = self.order_executor.clone();
+        let asset_name = self.asset.clone();
+
+        tokio::spawn(async move {
+            let result = executor.execute_actions_parallel(executor_actions).await;
+
+            // Process results (log errors, potentially update pending state)
+            if result.failed > 0 {
+                error!("[{}] {} failed actions out of {} submitted.",
+                       asset_name, result.failed, result.failed + result.successful);
+
+                for response_res in &result.responses {
+                    if let Err(e) = response_res {
+                        error!("[{}] Execution Error: {}", asset_name, e);
+                    } else if let Ok(ExchangeResponseStatus::Err(msg)) = response_res {
+                        error!("[{}] Exchange returned error: {}", asset_name, msg);
+                    } else if let Ok(ExchangeResponseStatus::Ok(resp)) = response_res {
+                        if let Some(ref data) = resp.data {
+                            for status in &data.statuses {
+                                if let ExchangeDataStatus::Error(err_msg) = status {
+                                    error!("[{}] Specific action failed: {}", asset_name, err_msg);
+                                }
+                            }
+                        }
                     }
-                }
-                StrategyAction::BatchCancel(cancels) => {
-                    for cancel in cancels {
-                        self.execute_cancel_order(cancel).await;
-                    }
-                }
-                StrategyAction::NoOp => {
-                    // Do nothing
                 }
             }
-        }
+
+            if result.successful > 0 {
+                debug!("[{}] {} actions executed successfully in {} ms.",
+                       asset_name, result.successful, result.execution_time_ms);
+            }
+
+            // NOTE: Successful placements/cancellations are confirmed via WebSocket UserEvents,
+            // so we don't need to update `current_state.open_bids/asks` here directly.
+            // The main loop's `handle_user_events` will reconcile based on WS messages.
+        });
     }
 
-    /// Calculate the order book level for a given price
+    /// Calculate the order book level for a given price (kept for potential future use)
+    #[allow(dead_code)]
     fn calculate_order_level(&self, price: f64, is_buy: bool) -> usize {
         if let Some(ref book) = self.current_state.order_book {
             let levels = if is_buy { &book.bids } else { &book.asks };
@@ -746,110 +800,8 @@ impl BotRunner {
         0
     }
 
-    /// Execute a single order placement
-    async fn execute_place_order(&mut self, order: ClientOrderRequest) {
-        // Validate order
-        let validated_px = self.tick_lot_validator.round_price(order.limit_px, order.is_buy);
-        let validated_sz = self.tick_lot_validator.round_size(order.sz, false);
-
-        if validated_sz < 0.001 {
-            warn!("Order size too small after rounding: {}", order.sz);
-            return;
-        }
-
-        let mut validated_order = order.clone();
-        validated_order.limit_px = validated_px;
-        validated_order.sz = validated_sz;
-
-        // Track pending order
-        if let Some(cloid) = validated_order.cloid {
-            self.pending_orders.insert(cloid, validated_order.clone());
-        }
-
-        // Place order via exchange client
-        match self.exchange_client.order(validated_order.clone(), None).await {
-            Ok(response) => {
-                use hyperliquid_rust_sdk::{ExchangeResponseStatus, ExchangeDataStatus};
-                match response {
-                    ExchangeResponseStatus::Ok(exchange_response) => {
-                        if let Some(data) = exchange_response.data {
-                            for status in &data.statuses {
-                                match status {
-                                    ExchangeDataStatus::Resting(resting) => {
-                                        // Order placed successfully
-                                        info!("✅ Order placed: {} {} @ {} (oid: {})",
-                                              if validated_order.is_buy { "BUY" } else { "SELL" },
-                                              validated_order.sz,
-                                              validated_order.limit_px,
-                                              resting.oid
-                                        );
-
-                                        // Track cloid -> oid mapping
-                                        if let Some(cloid) = validated_order.cloid {
-                                            self.cloid_to_oid.insert(cloid, resting.oid);
-                                        }
-
-                                        // Update open orders in current state
-                                        let level = self.calculate_order_level(validated_order.limit_px, validated_order.is_buy);
-                                        let resting_order = RestingOrder {
-                                            oid: resting.oid,
-                                            size: validated_order.sz,
-                                            price: validated_order.limit_px,
-                                            level,
-                                            pending_cancel: false,
-                                        };
-
-                                        if validated_order.is_buy {
-                                            self.current_state.open_bids.push(resting_order);
-                                        } else {
-                                            self.current_state.open_asks.push(resting_order);
-                                        }
-                                    }
-                                    ExchangeDataStatus::Filled(filled) => {
-                                        // Order was immediately filled
-                                        info!("✅ Order immediately filled: {} {} @ avg {} (oid: {})",
-                                              if validated_order.is_buy { "BUY" } else { "SELL" },
-                                              filled.total_sz,
-                                              filled.avg_px,
-                                              filled.oid
-                                        );
-                                    }
-                                    ExchangeDataStatus::Error(err_msg) => {
-                                        error!("❌ Order placement failed: {}", err_msg);
-                                    }
-                                    _ => {
-                                        // Success, WaitingForFill, WaitingForTrigger
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    ExchangeResponseStatus::Err(err_msg) => {
-                        error!("❌ Order placement failed: {}", err_msg);
-                    }
-                }
-            }
-            Err(e) => {
-                error!("❌ Order placement error: {}", e);
-            }
-        }
-    }
-
-    /// Execute a single order cancellation
-    async fn execute_cancel_order(&mut self, cancel: ClientCancelRequest) {
-        match self.exchange_client.cancel(cancel.clone(), None).await {
-            Ok(_) => {
-                info!("✅ Order cancelled: oid {}", cancel.oid);
-
-                // Remove from open orders
-                self.current_state.open_bids.retain(|o| o.oid != cancel.oid);
-                self.current_state.open_asks.retain(|o| o.oid != cancel.oid);
-            }
-            Err(e) => {
-                error!("❌ Order cancellation error: {}", e);
-            }
-        }
-    }
+    // NOTE: execute_place_order and execute_cancel_order methods removed
+    // All order execution now handled by ParallelOrderExecutor via execute_actions()
 
     /// Handle shutdown
     async fn handle_shutdown(&mut self) {
@@ -857,9 +809,32 @@ impl BotRunner {
 
         // Call strategy shutdown hook
         let actions = self.strategy.on_shutdown(&self.current_state);
-        self.execute_actions(actions).await;
 
-        info!("✅ Bot runner shutdown complete");
+        // Execute final actions using the executor (await directly, don't spawn)
+        if !actions.is_empty() {
+            info!("Executing {} shutdown actions...", actions.len());
+
+            // Convert strategy actions to executor actions and filter out NoOp
+            let executor_actions: Vec<ExecutorAction> = actions
+                .into_iter()
+                .filter_map(|action| match action {
+                    StrategyAction::Place(order) => Some(ExecutorAction::Place(order)),
+                    StrategyAction::Cancel(cancel) => Some(ExecutorAction::Cancel(cancel)),
+                    StrategyAction::BatchPlace(orders) => Some(ExecutorAction::BatchPlace(orders)),
+                    StrategyAction::BatchCancel(cancels) => Some(ExecutorAction::BatchCancel(cancels)),
+                    StrategyAction::NoOp => None,
+                })
+                .collect();
+
+            if !executor_actions.is_empty() {
+                let result = self.order_executor.execute_actions_parallel(executor_actions).await;
+                info!("Shutdown actions complete: {} successful, {} failed.", result.successful, result.failed);
+            }
+        } else {
+            info!("No shutdown actions required by strategy.");
+        }
+
+        info!("✅ Bot runner shutdown procedures complete");
     }
 
     /// Handle periodic tick (called every second)
