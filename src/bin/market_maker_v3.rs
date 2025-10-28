@@ -869,13 +869,21 @@ impl BotRunner {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize logging
+    // Initialize logging with Mountain Time timezone
+    // Note: Mountain Time is UTC-7 (MST) in winter, UTC-6 (MDT) in summer
+    // Currently set to MST (-7). Adjust to -6 for MDT if needed.
     let file_appender = tracing_appender::rolling::never("./", "market_maker_v3.log");
     let (non_blocking_writer, _guard) = tracing_appender::non_blocking(file_appender);
 
     let file_layer = fmt::layer()
         .json()
-        .with_writer(non_blocking_writer);
+        .with_writer(non_blocking_writer)
+        .with_timer(fmt::time::OffsetTime::new(
+            time::UtcOffset::from_hms(-7, 0, 0).unwrap(), // MST (Mountain Standard Time)
+            time::format_description::parse(
+                "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:6]-07:00"
+            ).unwrap()
+        ));
 
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"));

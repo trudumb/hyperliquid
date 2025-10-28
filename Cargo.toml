@@ -17,7 +17,7 @@ alloy = { version = "1.0", default-features = false, features = [
   "sol-types",
   "signer-local",
 ] }
-chrono = "0.4.26"
+chrono = { version = "0.4.26", features = ["serde"] }
 env_logger = "0.11.8"
 futures = "0.3.28"  # For parallel execution utilities
 futures-util = "0.3.28"
@@ -37,9 +37,10 @@ rand_distr = "0.4"
 statrs = "0.17"
 approx = "0.5"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
 tracing-log = "0.2"
 tracing-appender = "0.2"
+time = { version = "0.3", features = ["formatting", "macros"] }
 parking_lot = "0.12"  # Faster RwLock implementation
 bytes = "1.0"  # Zero-copy buffer management for HFT optimizations
 crossbeam = "0.8"  # Lock-free data structures for HFT
