@@ -618,20 +618,19 @@ impl HjbStrategy {
         }
 
         // --- MODEL INPUTS PREPARATION ---
-        // --- MODEL INPUTS PREPARATION ---
-        // Get cached volatility uncertainty
+        // Get volatility AND uncertainty from the Particle Filter cache/state
         let cached_vol = self.cached_volatility.read();
-        let (_mu_std, _, _) = cached_vol.param_std_devs;
-        let sigma_std = cached_vol.volatility_std_dev_bps;
+        let volatility_bps_pf = cached_vol.volatility_bps; // Get PF point estimate
+        let vol_uncertainty_bps_pf = cached_vol.volatility_std_dev_bps; // Get PF uncertainty
         drop(cached_vol);
 
-        // Prepare optimizer inputs
+        // Prepare optimizer inputs USING PARTICLE FILTER ESTIMATES
         let inputs = OptimizerInputs {
             current_time_sec: current_time,
-            volatility_bps: self.state_vector.volatility_ema_bps,
-            vol_uncertainty_bps: sigma_std,
-            adverse_selection_bps: self.state_vector.adverse_selection_estimate,
-            lob_imbalance: self.state_vector.lob_imbalance,
+            volatility_bps: volatility_bps_pf, // USE PF ESTIMATE HERE
+            vol_uncertainty_bps: vol_uncertainty_bps_pf, // USE PF UNCERTAINTY HERE
+            adverse_selection_bps: self.state_vector.adverse_selection_estimate, // Keep AS from state_vector
+            lob_imbalance: self.state_vector.lob_imbalance, // Keep LOB from state_vector
         };
 
         // --- COMPONENT CALL ---
