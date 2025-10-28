@@ -29,17 +29,26 @@ pub(crate) fn next_nonce() -> u64 {
 pub(crate) const WIRE_DECIMALS: u8 = 8;
 
 pub(crate) fn float_to_string_for_hashing(x: f64) -> String {
-    let mut x = format!("{:.*}", WIRE_DECIMALS.into(), x);
-    while x.ends_with('0') {
-        x.pop();
+    float_to_string_with_decimals(x, WIRE_DECIMALS as u32)
+}
+
+/// Format a float with a specific maximum number of decimal places
+/// This respects asset-specific decimal requirements (szDecimals for sizes, MAX_DECIMALS-szDecimals for prices)
+pub(crate) fn float_to_string_with_decimals(x: f64, max_decimals: u32) -> String {
+    let mut s = format!("{:.*}", max_decimals as usize, x);
+    // Trim trailing zeros
+    while s.ends_with('0') && s.contains('.') {
+        s.pop();
     }
-    if x.ends_with('.') {
-        x.pop();
+    // Trim trailing decimal point
+    if s.ends_with('.') {
+        s.pop();
     }
-    if x == "-0" {
+    // Handle negative zero
+    if s == "-0" {
         "0".to_string()
     } else {
-        x
+        s
     }
 }
 
@@ -134,5 +143,29 @@ mod tests {
             float_to_string_for_hashing(987654321.),
             "987654321".to_string()
         );
+    }
+
+    #[test]
+    fn float_to_string_with_decimals_test() {
+        // Test size formatting with szDecimals=2 (HYPE example)
+        assert_eq!(float_to_string_with_decimals(0.5, 2), "0.5".to_string());
+        assert_eq!(float_to_string_with_decimals(0.33, 2), "0.33".to_string());
+        assert_eq!(float_to_string_with_decimals(0.333, 2), "0.33".to_string()); // Should truncate to 2 decimals
+        assert_eq!(float_to_string_with_decimals(1.0, 2), "1".to_string());
+        assert_eq!(float_to_string_with_decimals(10.5, 2), "10.5".to_string());
+
+        // Test price formatting with max_decimals=4 (for HYPE: 6-2=4)
+        assert_eq!(float_to_string_with_decimals(12.3456, 4), "12.3456".to_string());
+        assert_eq!(float_to_string_with_decimals(48.1234, 4), "48.1234".to_string());
+        assert_eq!(float_to_string_with_decimals(48.12344, 4), "48.1234".to_string()); // Should round to 4 decimals
+
+        // Test edge cases
+        assert_eq!(float_to_string_with_decimals(0.0, 2), "0".to_string());
+        assert_eq!(float_to_string_with_decimals(-0.0, 2), "0".to_string());
+        assert_eq!(float_to_string_with_decimals(100.0, 2), "100".to_string());
+
+        // Test trailing zeros are removed
+        assert_eq!(float_to_string_with_decimals(1.50, 2), "1.5".to_string());
+        assert_eq!(float_to_string_with_decimals(1.00, 2), "1".to_string());
     }
 }
