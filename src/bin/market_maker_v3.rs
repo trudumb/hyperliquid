@@ -21,7 +21,7 @@ use hyperliquid_rust_sdk::{
     Subscription, TickLotValidator, TradeInfo, UserData, ExecutorAction,
     ExecutorConfig, ExchangeResponseStatus, ExchangeDataStatus,
 };
-use hyperliquid_rust_sdk::strategies::hjb_strategy::HjbStrategy;
+use hyperliquid_rust_sdk::strategies::hjb_strategy::{HjbStrategy, MarginCalculator};
 // Import our new IPC message types
 use hyperliquid_rust_sdk::ipc::{
     AssetState, AuthoritativeStateUpdate, ExecuteActionsRequest, ExecuteActionsResponse,
@@ -93,6 +93,14 @@ struct StateManagerActor {
     state_tx: broadcast::Sender<AuthoritativeStateUpdate>,
     /// Tracks processed fill IDs to prevent duplicates
     processed_fill_ids: HashSet<u64>,
+    /// Margin calculator instance
+    margin_calculator: MarginCalculator,
+    /// Configurable safety buffer (e.g., 0.1 for 10%)
+    safety_buffer: f64,
+    /// Leverage (assuming consistent across strategies for now)
+    leverage: usize,
+    /// Max position size (from config)
+    max_position_size: f64,
 }
 
 impl StateManagerActor {
@@ -103,11 +111,13 @@ impl StateManagerActor {
     /// * `assets` - List of assets to track (e.g., ["BTC", "ETH", "HYPE"])
     /// * `action_rx` - Channel to receive action requests from runners
     /// * `state_tx` - Channel to broadcast state updates to runners
+    /// * `app_config` - Application configuration containing strategy parameters
     async fn new(
         wallet: PrivateKeySigner,
         assets: Vec<String>,
         action_rx: mpsc::Receiver<ExecuteActionsRequest>,
         state_tx: broadcast::Sender<AuthoritativeStateUpdate>,
+        app_config: &AppConfig,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         info!("Initializing State Manager for {} assets...", assets.len());
         let exchange_client = Arc::new(
@@ -126,6 +136,21 @@ impl StateManagerActor {
 
         let info_client = InfoClient::with_reconnect(None, Some(BaseUrl::Mainnet)).await?;
         let user_address = wallet.address();
+
+        // --- Get Leverage, Safety Buffer, and Max Position Size from Config ---
+        // Read from the first strategy config (assuming consistency)
+        let (leverage, safety_buffer, max_position_size) = if let Some(first_strategy_cfg) = app_config.strategies.first() {
+            let strat_params = &first_strategy_cfg.strategy_params;
+            let leverage = strat_params.get("leverage").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
+            let buffer = strat_params.get("margin_safety_buffer").and_then(|v| v.as_f64()).unwrap_or(0.2); // Default 20%
+            let max_pos = strat_params.get("max_absolute_position_size").and_then(|v| v.as_f64()).unwrap_or(10.0);
+            info!("[State Manager] Using Leverage={}x, SafetyBuffer={:.1}%, MaxPosition={} from first strategy config",
+                  leverage, buffer * 100.0, max_pos);
+            (leverage, buffer, max_pos)
+        } else {
+            warn!("[State Manager] No strategies in config, using defaults: Leverage=3x, SafetyBuffer=20%, MaxPosition=10.0");
+            (3, 0.2, 10.0)
+        };
 
         // --- Fetch Initial Account State ---
         info!("Fetching initial account state...");
@@ -201,6 +226,11 @@ impl StateManagerActor {
             action_rx,
             state_tx,
             processed_fill_ids: HashSet::new(),
+            // Initialize MarginCalculator
+            margin_calculator: MarginCalculator::new(leverage, safety_buffer),
+            safety_buffer,
+            leverage,
+            max_position_size,
         })
     }
 
@@ -486,9 +516,27 @@ impl StateManagerActor {
         // ---
         // 1. Final Margin & Position Check (Atomicity)
         // ---
-        // TODO: Implement proper validation against asset-specific position limits
-        // and global margin constraints
-        // For now, we accept all actions from runners (they do their own validation)
+        let asset_states_read = self.asset_states.read().await;
+        let global_state_read = self.global_account_state.read().await;
+        let asset_state = asset_states_read.get(&asset);
+
+        let (valid, msg) = self.validate_actions(&global_state_read, asset_state, &request.actions, &asset);
+
+        if !valid {
+            warn!(
+                "[State Manager] Rejected actions from [{}]: {}",
+                asset, msg
+            );
+            let _ = request.resp.send(ExecuteActionsResponse {
+                success: false,
+                message: msg,
+            });
+            return;
+        }
+
+        // Release read locks before acquiring write locks
+        drop(asset_states_read);
+        drop(global_state_read);
 
         // ---
         // 2. Update Optimistic State (Pending)
@@ -594,6 +642,83 @@ impl StateManagerActor {
         self.broadcast_state().await;
     }
 
+    /// Validates actions against authoritative state to ensure position and margin limits.
+    ///
+    /// Performs atomic validation of:
+    /// - Position size limits (max_position_size)
+    /// - Margin requirements (with safety buffer)
+    ///
+    /// Returns (is_valid, error_message)
+    fn validate_actions(
+        &self,
+        global_state: &GlobalAccountState,
+        asset_state: Option<&AssetState>,
+        actions: &[StrategyAction],
+        asset_name: &str,
+    ) -> (bool, String) {
+        debug!(
+            "[State Manager] Validating actions for {}: Current Margin Used: {:.2}, Equity: {:.2}",
+            asset_name, global_state.margin_used, global_state.account_equity
+        );
+
+        let current_position = asset_state.map_or(0.0, |s| s.position);
+
+        debug!(
+            "[State Manager] Validation Check [{}]: Current Position: {:.4}, Max Position: {:.4}",
+            asset_name, current_position, self.max_position_size
+        );
+
+        let mut net_size_change = 0.0;
+        let mut estimated_margin_increase = 0.0;
+
+        for action in actions {
+            if let StrategyAction::Place(order) = action {
+                // Only consider non-reduceOnly orders for increasing position/margin
+                if !order.reduce_only {
+                    let order_size = order.sz;
+                    let order_price = order.limit_px; // Use limit price for estimation
+
+                    let position_delta = if order.is_buy { order_size } else { -order_size };
+                    let potential_new_position = current_position + position_delta;
+
+                    // Estimate margin increase ONLY if the order *increases* the absolute position size
+                    if potential_new_position.abs() > current_position.abs() {
+                        let size_increase = potential_new_position.abs() - current_position.abs();
+                        estimated_margin_increase += self.margin_calculator.initial_margin_required(size_increase, order_price);
+                    }
+                    net_size_change += position_delta;
+                }
+            }
+        }
+
+        // --- Position Check ---
+        let final_potential_position = current_position + net_size_change;
+        if final_potential_position.abs() > self.max_position_size + 1e-9 { // Add tolerance for float errors
+            let msg = format!(
+                "Exceeds position limit (Current: {:.4}, Change: {:.4}, Potential: {:.4}, Max: {:.4})",
+                current_position, net_size_change, final_potential_position, self.max_position_size
+            );
+            return (false, msg);
+        }
+
+        // --- Margin Check ---
+        let potential_margin_used = global_state.margin_used + estimated_margin_increase;
+        let max_allowed_margin = global_state.account_equity * (1.0 - self.safety_buffer);
+
+        if potential_margin_used > max_allowed_margin + 1e-9 { // Add tolerance
+            let msg = format!(
+                "Insufficient margin (Current Used: {:.2}, Est. Increase: {:.2}, Potential Used: {:.2}, Max Allowed: {:.2}, Equity: {:.2})",
+                global_state.margin_used, estimated_margin_increase, potential_margin_used, max_allowed_margin, global_state.account_equity
+            );
+            return (false, msg);
+        }
+
+        debug!(
+            "[State Manager] Validation PASSED for {}: Pos Change={:.4}, Est Margin Increase={:.2}",
+            asset_name, net_size_change, estimated_margin_increase
+        );
+        (true, String::new())
+    }
 
     /// Broadcasts the current authoritative state to all runners.
     /// Sends one update per asset so runners can filter by their asset.
@@ -1096,7 +1221,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- 4. Start the State Manager Actor (on LocalSet) ---
     let mut state_manager =
-        StateManagerActor::new(wallet.clone(), assets, action_rx, state_tx.clone()).await?;
+        StateManagerActor::new(wallet.clone(), assets, action_rx, state_tx.clone(), &app_config).await?;
 
     let state_manager_handle = local_set.spawn_local(async move {
         if let Err(e) = state_manager.run().await {
