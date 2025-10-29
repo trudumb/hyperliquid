@@ -822,6 +822,11 @@ impl StrategyRunnerActor {
             Message::AllMids(all_mids) => {
                 if let Some(mid_str) = all_mids.data.mids.get(&self.asset) {
                     if let Ok(mid_price) = mid_str.parse::<f64>() {
+                        // Update local state cache with mid price
+                        let mut state = self.local_state_cache.write().await;
+                        state.l2_mid_price = mid_price;
+                        drop(state);
+
                         market_update =
                             Some(MarketUpdate::from_mid_price(self.asset.clone(), mid_price));
                     }
@@ -843,10 +848,15 @@ impl StrategyRunnerActor {
 
     /// Processes an authoritative state update from the State Manager.
     async fn handle_state_update(&mut self, update: AuthoritativeStateUpdate) {
+        let is_initial_state = {
+            let state = self.local_state_cache.read().await;
+            state.account_equity == 0.0 && update.account_equity > 0.0
+        };
+
         let mut state = self.local_state_cache.write().await;
 
         // Log first meaningful state update (when we get non-zero equity)
-        if state.account_equity == 0.0 && update.account_equity > 0.0 {
+        if is_initial_state {
             info!(
                 "[Runner {}] Received initial state: equity=${:.2}, margin_used=${:.2}, pos={}",
                 self.asset, update.account_equity, update.margin_used, update.position
@@ -883,6 +893,24 @@ impl StrategyRunnerActor {
         // Ensure sorted
         state.open_bids.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
         state.open_asks.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
+
+        // If this is the initial state update and we have a valid mid price,
+        // trigger the strategy to place initial orders
+        if is_initial_state && state.l2_mid_price > 0.0 {
+            info!(
+                "[Runner {}] Triggering initial order placement (mid: ${:.3})",
+                self.asset, state.l2_mid_price
+            );
+            drop(state); // Release write lock before calling strategy
+
+            let state_read = self.local_state_cache.read().await;
+            let actions = self.strategy.on_tick(&state_read);
+            drop(state_read);
+
+            if !actions.is_empty() && !matches!(actions[0], StrategyAction::NoOp) {
+                self.send_actions(actions).await;
+            }
+        }
     }
 
     /// Handles the periodic 1-second tick.

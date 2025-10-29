@@ -599,13 +599,34 @@ impl Strategy for HjbStrategy {
         vec![StrategyAction::NoOp]
     }
 
-    fn on_tick(&mut self, _state: &CurrentState) -> Vec<StrategyAction> {
-        // Periodic cleanup and updates
-        // Could implement:
-        // - Stale order cleanup
-        // - Periodic state logging
-        // - Performance monitoring
+    fn on_tick(&mut self, state: &CurrentState) -> Vec<StrategyAction> {
+        // Check if trading is enabled
+        if !self.trading_enabled {
+            return vec![StrategyAction::NoOp];
+        }
 
+        // Only place orders if we have a valid mid price
+        if state.l2_mid_price <= 0.0 {
+            return vec![StrategyAction::NoOp];
+        }
+
+        // Sync state vector from current state
+        self.sync_state_vector(state);
+
+        // If we have no open orders and a valid mid price, generate initial quotes
+        let has_orders = !state.open_bids.is_empty() || !state.open_asks.is_empty();
+
+        if !has_orders {
+            info!("[HJB STRATEGY] Placing initial orders on tick (mid: ${:.3})", state.l2_mid_price);
+
+            // Calculate optimal quotes
+            let (target_bids, target_asks) = self.calculate_multi_level_targets(state);
+
+            // Generate orders for all target levels
+            return self.reconcile_orders(state, target_bids, target_asks);
+        }
+
+        // Periodic cleanup and updates for existing orders
         vec![StrategyAction::NoOp]
     }
 
