@@ -190,6 +190,15 @@ impl StateManagerActor {
         self.subscribe_user_data(user_ws_tx).await?;
         info!("[State Manager] Subscribed to user data feeds.");
 
+        // Give runners a moment to start their event loops and subscribe
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Broadcast the initial account state to all runners
+        // This ensures runners have correct account_equity and margin_used before trading
+        info!("[State Manager] Broadcasting initial account state to all runners...");
+        self.broadcast_state().await;
+        info!("[State Manager] Initial state broadcast complete.");
+
         // Spawn a task to periodically fetch full account state via REST for reconciliation
         // Note: We create a new InfoClient for this background task instead of cloning
         let state_clone = self.authoritative_state.clone();
@@ -834,8 +843,18 @@ impl StrategyRunnerActor {
 
     /// Processes an authoritative state update from the State Manager.
     async fn handle_state_update(&mut self, update: AuthoritativeStateUpdate) {
-        debug!("[Runner {}] Received state update: pos={}", self.asset, update.position);
         let mut state = self.local_state_cache.write().await;
+
+        // Log first meaningful state update (when we get non-zero equity)
+        if state.account_equity == 0.0 && update.account_equity > 0.0 {
+            info!(
+                "[Runner {}] Received initial state: equity=${:.2}, margin_used=${:.2}, pos={}",
+                self.asset, update.account_equity, update.margin_used, update.position
+            );
+        } else {
+            debug!("[Runner {}] State update: pos={}, equity=${:.2}",
+                self.asset, update.position, update.account_equity);
+        }
 
         // ---
         // **IMPORTANT**: This logic assumes the State Manager's `CurrentState`
