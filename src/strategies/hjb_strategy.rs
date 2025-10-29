@@ -44,7 +44,7 @@ use crate::strategy::{CurrentState, MarketUpdate, Strategy, StrategyAction, User
 use crate::{
     AssetType, ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest,
     HawkesFillModel, L2BookData, MultiLevelConfig,
-    OrderBook, ParameterUncertainty, ParticleFilterState,
+    OrderBook, OrderState, ParameterUncertainty, ParticleFilterState,
     TickLotValidator, Trade, TradeInfo,
 };
 use crate::strategies::components::{RobustConfig, InventorySkewConfig};
@@ -1006,6 +1006,15 @@ impl HjbStrategy {
 
         // Check existing bids
         for (i, order) in state.open_bids.iter().enumerate() {
+            // ✅ FIX: Skip orders that are already PendingCancel
+            if order.state == OrderState::PendingCancel {
+                debug!(
+                    "[HJB STRATEGY] Skipping bid OID {:?} - already PendingCancel",
+                    order.oid
+                );
+                continue;
+            }
+
             let matched = remaining_target_bids.iter().enumerate().position(|(_, (p, s))| {
                 (p - order.price).abs() <= price_tolerance &&
                 (s - order.size).abs() <= size_tolerance
@@ -1068,6 +1077,15 @@ impl HjbStrategy {
 
         // Check existing asks
         for (i, order) in state.open_asks.iter().enumerate() {
+            // ✅ FIX: Skip orders that are already PendingCancel
+            if order.state == OrderState::PendingCancel {
+                debug!(
+                    "[HJB STRATEGY] Skipping ask OID {:?} - already PendingCancel",
+                    order.oid
+                );
+                continue;
+            }
+
             let matched = remaining_target_asks.iter().enumerate().position(|(_, (p, s))| {
                 (p - order.price).abs() <= price_tolerance &&
                 (s - order.size).abs() <= size_tolerance
@@ -1372,7 +1390,12 @@ impl HjbStrategy {
 
         // Step 1: Cancel ALL existing orders on BOTH sides
         // This ensures we're not adding to the position accidentally
+        // ✅ FIX: Skip orders already in PendingCancel state
         for order in &state.open_bids {
+            if order.state == OrderState::PendingCancel {
+                debug!("Skipping bid OID {:?} - already PendingCancel", order.oid);
+                continue;
+            }
             if let Some(oid) = order.oid {
                 actions.push(StrategyAction::Cancel(ClientCancelRequest {
                     asset: self.config.asset.clone(),
@@ -1382,6 +1405,10 @@ impl HjbStrategy {
         }
 
         for order in &state.open_asks {
+            if order.state == OrderState::PendingCancel {
+                debug!("Skipping ask OID {:?} - already PendingCancel", order.oid);
+                continue;
+            }
             if let Some(oid) = order.oid {
                 actions.push(StrategyAction::Cancel(ClientCancelRequest {
                     asset: self.config.asset.clone(),

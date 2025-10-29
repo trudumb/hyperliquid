@@ -1125,12 +1125,23 @@ impl BotRunner {
                 continue;
             }
 
+            // ✅ FIX: Parse CLOID and check if this order is pending placement
+            let cloid: Option<uuid::Uuid> = rest_order.cloid.as_deref().and_then(|s| s.parse().ok());
+
+            // Skip if this CLOID is in pending_place_orders (order might be from us, just not confirmed yet)
+            if let Some(cloid_val) = cloid {
+                if self.order_state_mgr.is_pending(&cloid_val) {
+                    debug!("Skipping REST order OID {} with CLOID {} - already tracked as pending placement",
+                           oid, cloid_val);
+                    continue;
+                }
+            }
+
             // This is an external order - import it
             let price = rest_order.limit_px.parse::<f64>().unwrap_or(0.0);
             let size = rest_order.sz.parse::<f64>().unwrap_or(0.0);
             let is_buy = rest_order.side == "B";
             let level = self.calculate_order_level(price, is_buy);
-            let cloid: Option<uuid::Uuid> = rest_order.cloid.as_deref().and_then(|s| s.parse().ok());
 
             let external_order = RestingOrder {
                 oid: Some(oid),
