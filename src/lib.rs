@@ -5,6 +5,7 @@ mod errors;
 mod exchange;
 mod helpers;
 mod info;
+pub mod ipc;
 mod meta;
 pub mod order_state;
 pub mod rate_limiter;

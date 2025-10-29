@@ -400,7 +400,7 @@ impl Default for CurrentState {
 ///     }
 /// }
 /// ```
-pub trait Strategy: Send {
+pub trait Strategy: Send + Sync {
     /// Initialize the strategy with asset and JSON configuration.
     ///
     /// # Arguments
