@@ -1,5 +1,5 @@
 // ============================================================================
-// Order State Management
+// Order State Management - Robust State Synchronization
 // ============================================================================
 //
 // This module provides a reusable component for tracking order lifecycle states
@@ -15,6 +15,39 @@
 // - Bidirectional cloid<->oid mapping
 // - Automatic cache pruning to prevent memory leaks
 //
+// # State Synchronization Approach
+//
+// The core challenge in order management is keeping the bot's internal state
+// (CurrentState) perfectly synchronized with the actual state on the exchange,
+// despite network latency and asynchronous confirmations. This module addresses:
+//
+// 1. **Explicit Pending States**: Orders transition through well-defined states:
+//    - PendingPlace: Order sent, awaiting exchange confirmation
+//    - Active: Order confirmed and resting on the book
+//    - PendingCancel: Cancel request sent, awaiting confirmation
+//    - Filled/Cancelled/Rejected: Terminal states
+//
+// 2. **State Transition Guards**: Strategy and reconciliation logic check order
+//    states before attempting operations:
+//    - Don't cancel orders already in PendingCancel
+//    - Don't place new orders at levels with PendingPlacement orders
+//    - Match target orders against pending placements to avoid duplicates
+//
+// 3. **REST API Reconciliation**: Periodic REST API queries capture:
+//    - Manually-placed orders from other systems
+//    - Orders that survived a bot restart
+//    - State drift due to missed WebSocket messages
+//    The reconciliation logic avoids importing orders with CLOIDs that are
+//    already tracked as pending, preventing duplicate tracking.
+//
+// 4. **Recently Completed Cache**: Maintains a time-limited cache of filled/
+//    canceled orders to resolve fills that arrive after order removal. This
+//    prevents "unknown OID" errors when WebSocket messages arrive out of order.
+//
+// 5. **OID Tracking & Cache Management**: Maintains bidirectional CLOID<->OID
+//    mappings and ensures the cache is persistent enough to handle edge cases
+//    like rapid fill-cancel sequences or late-arriving fill notifications.
+//
 // # Usage Example
 //
 // ```rust
@@ -29,10 +62,19 @@
 // order_mgr.handle_order_update(order_update, &order_book);
 //
 // // On fill received
-// if let Some(level) = order_mgr.get_order_level(fill.oid) {
+// if let Some(level) = order_mgr.get_order_level(fill.oid, &active_orders) {
 //     println!("Fill on level {}", level);
 // }
 // ```
+//
+// # State Synchronization Best Practices
+//
+// - **Always check order state** before canceling (skip PendingCancel orders)
+// - **Use CLOID tracking** to correlate placement requests with confirmations
+// - **Rely on WebSocket confirmations** as the source of truth for state transitions
+// - **Use REST API as backup** for periodic sanity checks and external order discovery
+// - **Keep recently_completed_orders TTL** long enough (30s default) to handle
+//   out-of-order WebSocket messages
 
 use crate::{OrderState, OrderUpdate, RestingOrder, OrderBook};
 use log::{debug, error, info, warn};

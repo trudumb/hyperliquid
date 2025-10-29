@@ -44,7 +44,7 @@ use crate::strategy::{CurrentState, MarketUpdate, Strategy, StrategyAction, User
 use crate::{
     AssetType, ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest,
     HawkesFillModel, L2BookData, MultiLevelConfig,
-    OrderBook, ParameterUncertainty, ParticleFilterState,
+    OrderBook, OrderState, ParameterUncertainty, ParticleFilterState,
     TickLotValidator, Trade, TradeInfo,
 };
 use crate::strategies::components::{RobustConfig, InventorySkewConfig};
@@ -445,15 +445,21 @@ impl Strategy for HjbStrategy {
         let multi_level_config = strategy_config.multi_level_config.clone()
             .unwrap_or_else(|| MultiLevelConfig::default());
 
+        // ✅ TUNED: More conservative defaults to prevent spread crossing
         // Initialize fixed tuning parameters (sensible defaults, no online learning)
         let tuning_params = ConstrainedTuningParams {
-            skew_adjustment_factor: 0.5,
-            adverse_selection_adjustment_factor: 0.3,  // Lower since microprice AS is stable
+            // ✅ REDUCED: Was 0.5, now 0.3 for gentler inventory management
+            skew_adjustment_factor: 0.3,
+            // ✅ REDUCED: Was 0.3, now 0.2 for less AS sensitivity
+            adverse_selection_adjustment_factor: 0.2,  // Lower since microprice AS is stable
             adverse_selection_lambda: 0.1,
-            inventory_urgency_threshold: 0.7,
+            // ✅ INCREASED: Was 0.7, now 0.85 to delay liquidation mode
+            inventory_urgency_threshold: 0.85,
             liquidation_rate_multiplier: 10.0,
-            min_spread_base_ratio: 0.2,
-            adverse_selection_spread_scale: 50.0,  // Lower since microprice AS is stable
+            // ✅ INCREASED: Was 0.2, now 0.5 for stricter minimum spreads
+            min_spread_base_ratio: 0.5,
+            // ✅ REDUCED: Was 50.0, now 30.0 for less AS amplification
+            adverse_selection_spread_scale: 30.0,  // Lower since microprice AS is stable
             control_gap_threshold: 0.1,
         };
 
@@ -1006,6 +1012,15 @@ impl HjbStrategy {
 
         // Check existing bids
         for (i, order) in state.open_bids.iter().enumerate() {
+            // ✅ FIX: Skip orders that are already PendingCancel
+            if order.state == OrderState::PendingCancel {
+                debug!(
+                    "[HJB STRATEGY] Skipping bid OID {:?} - already PendingCancel",
+                    order.oid
+                );
+                continue;
+            }
+
             let matched = remaining_target_bids.iter().enumerate().position(|(_, (p, s))| {
                 (p - order.price).abs() <= price_tolerance &&
                 (s - order.size).abs() <= size_tolerance
@@ -1068,6 +1083,15 @@ impl HjbStrategy {
 
         // Check existing asks
         for (i, order) in state.open_asks.iter().enumerate() {
+            // ✅ FIX: Skip orders that are already PendingCancel
+            if order.state == OrderState::PendingCancel {
+                debug!(
+                    "[HJB STRATEGY] Skipping ask OID {:?} - already PendingCancel",
+                    order.oid
+                );
+                continue;
+            }
+
             let matched = remaining_target_asks.iter().enumerate().position(|(_, (p, s))| {
                 (p - order.price).abs() <= price_tolerance &&
                 (s - order.size).abs() <= size_tolerance
@@ -1372,7 +1396,12 @@ impl HjbStrategy {
 
         // Step 1: Cancel ALL existing orders on BOTH sides
         // This ensures we're not adding to the position accidentally
+        // ✅ FIX: Skip orders already in PendingCancel state
         for order in &state.open_bids {
+            if order.state == OrderState::PendingCancel {
+                debug!("Skipping bid OID {:?} - already PendingCancel", order.oid);
+                continue;
+            }
             if let Some(oid) = order.oid {
                 actions.push(StrategyAction::Cancel(ClientCancelRequest {
                     asset: self.config.asset.clone(),
@@ -1382,6 +1411,10 @@ impl HjbStrategy {
         }
 
         for order in &state.open_asks {
+            if order.state == OrderState::PendingCancel {
+                debug!("Skipping ask OID {:?} - already PendingCancel", order.oid);
+                continue;
+            }
             if let Some(oid) = order.oid {
                 actions.push(StrategyAction::Cancel(ClientCancelRequest {
                     asset: self.config.asset.clone(),
