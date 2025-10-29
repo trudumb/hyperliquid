@@ -37,7 +37,6 @@
 use std::sync::Arc;
 use parking_lot::RwLock;
 use log::{debug, info, warn};
-use rand::Rng;
 
 use serde_json::Value;
 
@@ -61,8 +60,8 @@ use crate::strategies::components::{
 // Import HJB implementation details from the sibling hjb_impl module
 // ----------------------------------------------------------------------------
 use super::hjb_impl::{
-    AdamOptimizerState, CachedVolatilityEstimate, HJBComponents,
-    OnlineAdverseSelectionModel, StateVector, TuningParams, ValueFunction,
+    CachedVolatilityEstimate, ConstrainedTuningParams, HJBComponents,
+    StateVector, ValueFunction,
 };
 
 // ============================================================================
@@ -130,9 +129,6 @@ pub struct HjbStrategyConfig {
 
     /// Order churn management configuration
     pub order_churn_config: Option<OrderChurnConfig>,
-
-    /// SPSA online learning configuration
-    pub spsa_config: SpsaConfig,
 }
 
 impl HjbStrategyConfig {
@@ -176,11 +172,6 @@ impl HjbStrategyConfig {
             serde_json::from_value(v.clone()).ok()
         });
 
-        // Load SPSA config
-        let spsa_config = params.get("spsa_config")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-
         Self {
             asset: asset.to_string(),
             asset_type: AssetType::Perp,  // Default to Perp (can be configured via separate field if needed)
@@ -212,7 +203,6 @@ impl HjbStrategyConfig {
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.2),
             order_churn_config,
-            spsa_config,
         }
     }
 }
@@ -319,147 +309,6 @@ impl MarginCalculator {
 }
 
 // ============================================================================
-// SPSA Online Learning - State Management
-// ============================================================================
-
-/// State for the asynchronous SPSA learning cycle
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum LearningState {
-    /// Not currently learning, trading on baseline parameters.
-    Idle,
-    /// Trading on positively perturbed parameters to gather loss.
-    WaitingOnPerturbPlus { start_time: f64 },
-    /// Trading on negatively perturbed parameters to gather loss.
-    WaitingOnPerturbMinus { start_time: f64 },
-}
-
-/// Configuration for the SPSA (Simultaneous Perturbation Stochastic Approximation) optimizer.
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct SpsaConfig {
-    /// Learning rate gain (Adam optimizer's rate is separate).
-    pub a: f64,
-    /// Perturbation size gain.
-    pub c: f64,
-    /// Gain decay exponent.
-    pub alpha: f64,
-    /// Perturbation decay exponent.
-    pub gamma: f64,
-    /// Stability constant for 'a'.
-    pub capital_a: f64,
-    /// How long (in seconds) to run each perturbation to gather loss.
-    pub eval_duration_sec: f64,
-    /// How long (in seconds) to wait between starting learning cycles.
-    pub cycle_interval_sec: f64,
-}
-
-impl Default for SpsaConfig {
-    fn default() -> Self {
-        Self {
-            a: 0.1,         // Start with a modest learning rate
-            c: 0.01,        // Start with 1% perturbation
-            alpha: 0.602,   // Standard SPSA values
-            gamma: 0.101,   // Standard SPSA values
-            capital_a: 100.0, // Stabilizer
-            eval_duration_sec: 15.0, // Gather 15s of data per step
-            cycle_interval_sec: 60.0, // Run a full cycle every minute
-        }
-    }
-}
-
-/// SPSA internal state for gradient estimation
-#[derive(Debug, Clone)]
-struct SpsaState {
-    /// The current optimization step number.
-    k: u64,
-    /// SPSA gain parameters.
-    config: SpsaConfig,
-    /// The last random perturbation vector (delta).
-    last_delta: Vec<f64>,
-    /// The gain `c_k` for the current step.
-    last_c_k: f64,
-}
-
-impl SpsaState {
-    fn new(config: SpsaConfig) -> Self {
-        Self {
-            k: 0,
-            config,
-            last_delta: vec![0.0; 8],
-            last_c_k: 0.0,
-        }
-    }
-
-    /// Generate the next perturbation step
-    fn generate_step(&mut self) -> (Vec<f64>, f64) {
-        self.k += 1;
-        let k_f = self.k as f64;
-
-        // SPSA gain sequences
-        let _a_k = self.config.a / (k_f + 1.0 + self.config.capital_a).powf(self.config.alpha);
-        let c_k = self.config.c / (k_f + 1.0).powf(self.config.gamma);
-
-        // Generate a random perturbation vector (delta)
-        // Uses a Bernoulli distribution (+/- 1), which is robust.
-        let mut rng = rand::thread_rng();
-        let delta_vec: Vec<f64> = (0..8).map(|_| {
-            if rng.gen_bool(0.5) { 1.0 } else { -1.0 }
-        }).collect();
-
-        self.last_delta = delta_vec.clone();
-        self.last_c_k = c_k;
-
-        (delta_vec, c_k)
-    }
-}
-
-/// Tracks P&L and inventory risk for loss computation
-#[derive(Debug, Clone)]
-struct LossTracker {
-    /// Sum of all PnL changes during the window.
-    realized_pnl: f64,
-    /// Sum of (phi * inventory^2 * dt) over the window.
-    integrated_inventory_risk: f64,
-    /// The time the window started.
-    start_time: f64,
-    /// Last time inventory risk was updated.
-    last_update_time: f64,
-}
-
-impl LossTracker {
-    fn new(start_time: f64) -> Self {
-        Self {
-            realized_pnl: 0.0,
-            integrated_inventory_risk: 0.0,
-            start_time,
-            last_update_time: start_time,
-        }
-    }
-
-    /// Update risk based on holding inventory over time.
-    /// Call this from on_tick().
-    fn update_inventory_risk(&mut self, current_inventory: f64, phi: f64, current_time: f64) {
-        let dt = (current_time - self.last_update_time).max(0.0);
-        if dt > 0.0 {
-            // Quadratic penalty on inventory, integrated over time
-            let risk_cost = phi * current_inventory.powi(2) * dt;
-            self.integrated_inventory_risk += risk_cost;
-            self.last_update_time = current_time;
-        }
-    }
-
-    /// Record PnL from a fill. Call this from handle_fills().
-    fn record_fill_pnl(&mut self, pnl: f64) {
-        self.realized_pnl += pnl;
-    }
-
-    /// Calculate the final loss for the window.
-    /// Our objective is to MAXIMIZE (PnL - Risk), so we MINIMIZE (Risk - PnL).
-    fn compute_loss(&self) -> f64 {
-        self.integrated_inventory_risk - self.realized_pnl
-    }
-}
-
-// ============================================================================
 // Cached Optimizer Result
 // ============================================================================
 
@@ -507,10 +356,7 @@ pub struct HjbStrategy {
     /// Particle filter for stochastic volatility estimation
     particle_filter: Arc<RwLock<ParticleFilterState>>,
 
-    /// Online adverse selection learning model (SGD-based)
-    online_adverse_selection_model: Arc<RwLock<OnlineAdverseSelectionModel>>,
-
-    /// Microprice-based adverse selection model (more stable)
+    /// Microprice-based adverse selection model (stable and production-ready)
     microprice_as_model: MicropriceAsModel,
 
     /// Cached volatility estimate (updated periodically by background task)
@@ -522,14 +368,11 @@ pub struct HjbStrategy {
     /// Current parameter uncertainty estimates
     current_uncertainty: ParameterUncertainty,
 
-    /// Tuning parameters (for self-tuning Adam optimizer)
-    tuning_params: Arc<RwLock<TuningParams>>,
+    /// Fixed tuning parameters (no online learning/tuning)
+    tuning_params: ConstrainedTuningParams,
 
-    /// Adam optimizer state (for automatic parameter tuning)
-    adam_optimizer: Arc<RwLock<AdamOptimizerState>>,
-
-    /// Trading enabled flag (controlled by Adam optimizer)
-    trading_enabled: Arc<RwLock<bool>>,
+    /// Trading enabled flag
+    trading_enabled: bool,
 
     /// Latest taker buy/sell rates (from multi-level optimizer)
     latest_taker_buy_rate: f64,
@@ -556,28 +399,6 @@ pub struct HjbStrategy {
 
     /// Intelligent order churn manager
     order_churn_manager: OrderChurnManager,
-
-    // --- SPSA Online Learning Fields ---
-    /// SPSA internal state (step counter, perturbation history)
-    spsa_state: SpsaState,
-
-    /// The current state of the learning cycle (Idle, PerturbPlus, etc.)
-    learning_state: LearningState,
-
-    /// The baseline (un-perturbed) parameters we are optimizing.
-    baseline_params: Arc<RwLock<TuningParams>>,
-
-    /// Loss accumulated during the positive perturbation.
-    loss_plus: f64,
-
-    /// Loss accumulated during the negative perturbation.
-    loss_minus: f64,
-
-    /// Accumulates loss during an evaluation window.
-    loss_tracker: LossTracker,
-
-    /// The time the last learning cycle was started.
-    last_cycle_start_time: f64,
 }
 
 impl Strategy for HjbStrategy {
@@ -624,15 +445,26 @@ impl Strategy for HjbStrategy {
         let multi_level_config = strategy_config.multi_level_config.clone()
             .unwrap_or_else(|| MultiLevelConfig::default());
 
-        // Initialize the component-based quote optimizer (before moving multi_level_config)
-        let default_tuning_params = TuningParams::default().get_constrained();
+        // Initialize fixed tuning parameters (sensible defaults, no online learning)
+        let tuning_params = ConstrainedTuningParams {
+            skew_adjustment_factor: 0.5,
+            adverse_selection_adjustment_factor: 0.3,  // Lower since microprice AS is stable
+            adverse_selection_lambda: 0.1,
+            inventory_urgency_threshold: 0.7,
+            liquidation_rate_multiplier: 10.0,
+            min_spread_base_ratio: 0.2,
+            adverse_selection_spread_scale: 50.0,  // Lower since microprice AS is stable
+            control_gap_threshold: 0.1,
+        };
+
+        // Initialize the component-based quote optimizer
         let quote_optimizer = HjbMultiLevelOptimizer::new(
             multi_level_config.clone(),
             robust_config.clone(),
             inventory_skew_config,
             strategy_config.asset.clone(),
             strategy_config.max_absolute_position_size,
-            default_tuning_params,
+            tuning_params.clone(),
         );
 
         // Initialize particle filter for stochastic volatility
@@ -647,27 +479,14 @@ impl Strategy for HjbStrategy {
             12345 // seed
         )));
 
-        // Initialize online adverse selection model
-        let online_adverse_selection_model = Arc::new(RwLock::new(
-            OnlineAdverseSelectionModel::default()
-        ));
-
         // Initialize cached volatility
         let cached_volatility = Arc::new(RwLock::new(CachedVolatilityEstimate::default()));
 
         // Initialize parameter uncertainty
         let current_uncertainty = ParameterUncertainty::default();
 
-        // Initialize tuning parameters
-        let tuning_params = Arc::new(RwLock::new(TuningParams::default()));
-
-        // Initialize Adam optimizer
-        let adam_optimizer = Arc::new(RwLock::new(AdamOptimizerState::default()));
-
-        // Trading enabled by default for v3 (can be disabled via config)
-        // In v2, this was controlled by the Adam optimizer, but for v3 we simplify
-        let trading_enabled_default = strategy_config.enable_online_learning; // Enable if online learning is on
-        let trading_enabled = Arc::new(RwLock::new(trading_enabled_default));
+        // Trading enabled by default
+        let trading_enabled = true;
 
         // Initialize margin calculator
         let margin_calculator = MarginCalculator::new(
@@ -680,14 +499,10 @@ impl Strategy for HjbStrategy {
             .unwrap_or_else(|| OrderChurnConfig::default());
         let order_churn_manager = OrderChurnManager::new(order_churn_config);
 
-        // Initialize SPSA online learning state
-        let spsa_state = SpsaState::new(strategy_config.spsa_config.clone());
-        let current_time = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
-        let baseline_params = tuning_params.clone(); // Baseline starts as the live set
-
         info!("✅ Initialized HJB Strategy for {} | Trading: {} | Max Position: {} | Leverage: {}x | Margin Buffer: {:.1}%",
-              asset, trading_enabled_default, strategy_config.max_absolute_position_size,
+              asset, trading_enabled, strategy_config.max_absolute_position_size,
               strategy_config.leverage, strategy_config.margin_safety_buffer * 100.0);
+        info!("📊 Using MicropriceAsModel for stable adverse selection estimation (no SGD/SPSA tuning)");
 
         Self {
             config: strategy_config,
@@ -698,13 +513,11 @@ impl Strategy for HjbStrategy {
             quote_optimizer,
             hawkes_model,
             particle_filter,
-            online_adverse_selection_model,
             microprice_as_model: MicropriceAsModel::with_params(0.15, 8.0),  // Smoother, capped at 8bps
             cached_volatility,
             robust_config,
             current_uncertainty,
             tuning_params,
-            adam_optimizer,
             trading_enabled,
             latest_taker_buy_rate: 0.0,
             latest_taker_sell_rate: 0.0,
@@ -718,13 +531,6 @@ impl Strategy for HjbStrategy {
             total_optimization_time_us: 0,
             margin_calculator,
             order_churn_manager,
-            spsa_state,
-            learning_state: LearningState::Idle,
-            baseline_params,
-            loss_plus: 0.0,
-            loss_minus: 0.0,
-            loss_tracker: LossTracker::new(current_time),
-            last_cycle_start_time: 0.0,
         }
     }
 
@@ -734,7 +540,7 @@ impl Strategy for HjbStrategy {
         update: &MarketUpdate,
     ) -> Vec<StrategyAction> {
         // Check if trading is enabled
-        if !*self.trading_enabled.read() {
+        if !self.trading_enabled {
             return vec![StrategyAction::NoOp];
         }
 
@@ -788,10 +594,6 @@ impl Strategy for HjbStrategy {
     }
 
     fn on_tick(&mut self, _state: &CurrentState) -> Vec<StrategyAction> {
-        // Drive the SPSA learning cycle state machine
-        let current_time = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
-        self.run_learning_cycle(current_time);
-
         // Periodic cleanup and updates
         // Could implement:
         // - Stale order cleanup
@@ -913,9 +715,8 @@ impl HjbStrategy {
 
     /// Handle trade flow updates
     fn handle_trades_update(&mut self, _state: &CurrentState, trades: &[Trade]) {
-        let constrained_params = self.tuning_params.read().get_constrained();
         let trades_vec = trades.to_vec();
-        self.state_vector.update_trade_flow_ema(&trades_vec, &constrained_params);
+        self.state_vector.update_trade_flow_ema(&trades_vec, &self.tuning_params);
 
         // Update microprice model with trade flow (no order book here, just trades)
         self.microprice_as_model.update(None, trades);
@@ -927,11 +728,6 @@ impl HjbStrategy {
         let mut pf = self.particle_filter.write();
         pf.update(mid_price);
         drop(pf);
-
-        // Update online adverse selection model
-        let mut model = self.online_adverse_selection_model.write();
-        model.update(mid_price);
-        drop(model);
 
         // Update uncertainty estimates from particle filter
         self.update_uncertainty_estimates();
@@ -972,20 +768,6 @@ impl HjbStrategy {
                 estimated_placement_time_ms,
                 current_time_ms,
             );
-
-            // Record PnL for SPSA loss tracker
-            // Calculate realized PnL vs. mid-price *at time of fill*
-            if let (Ok(fill_price), Ok(fill_size)) = (fill.px.parse::<f64>(), fill.sz.parse::<f64>()) {
-                let pnl = if is_bid_fill {
-                    // We bought. PnL is (mid_price - fill_price) * size
-                    (_state.l2_mid_price - fill_price) * fill_size
-                } else {
-                    // We sold. PnL is (fill_price - mid_price) * size
-                    (fill_price - _state.l2_mid_price) * fill_size
-                };
-                self.loss_tracker.record_fill_pnl(pnl);
-                debug!("SPSA loss tracker: PnL={:.4}", pnl);
-            }
 
             debug!("Hawkes model updated: level={}, is_bid={}, time={:.2}", level, is_bid_fill, current_time);
             debug!("Churn manager fill recorded: level={}, is_bid={}", level, is_bid_fill);
@@ -1048,9 +830,8 @@ impl HjbStrategy {
         };
 
         // --- COMPONENT CALL ---
-        // Update the component's tuning params from the shared state
-        let current_tuning_params = self.tuning_params.read().get_constrained();
-        self.quote_optimizer.set_tuning_params(current_tuning_params);
+        // Update the component's tuning params (fixed, no online learning)
+        self.quote_optimizer.set_tuning_params(self.tuning_params.clone());
 
         // Call the component with metadata
         let hawkes_lock = self.hawkes_model.read();
@@ -1844,225 +1625,4 @@ impl HjbStrategy {
         }
     }
 
-    /// Run the SPSA learning cycle state machine.
-    ///
-    /// This is the main engine for asynchronous gradient estimation and parameter tuning.
-    /// Called from on_tick() to drive the state machine.
-    fn run_learning_cycle(&mut self, current_time: f64) {
-        if !self.config.enable_online_learning {
-            return;
-        }
-
-        let eval_duration = self.spsa_state.config.eval_duration_sec;
-        let cycle_interval = self.spsa_state.config.cycle_interval_sec;
-
-        // Update the inventory risk for the current time slice
-        self.loss_tracker.update_inventory_risk(
-            self.state_vector.inventory,
-            self.hjb_components.phi,
-            current_time
-        );
-
-        // --- SPSA State Machine ---
-        match self.learning_state {
-            LearningState::Idle => {
-                // Check if it's time to start a new learning cycle
-                if current_time - self.last_cycle_start_time > cycle_interval {
-                    info!("[SPSA LEARN] Starting new cycle (k={})", self.spsa_state.k + 1);
-                    self.last_cycle_start_time = current_time;
-
-                    // 1. Generate perturbation
-                    let (delta, c_k) = self.spsa_state.generate_step();
-                    let baseline_vec = self.baseline_params.read().to_vec();
-
-                    // 2. Apply positive perturbation
-                    let perturb_plus_vec: Vec<f64> = baseline_vec.iter().zip(delta.iter())
-                        .map(|(param, d)| param + c_k * d)
-                        .collect();
-
-                    self.tuning_params.write().update_from_vec(perturb_plus_vec);
-
-                    // 3. Reset loss tracker and change state
-                    self.loss_tracker = LossTracker::new(current_time);
-                    self.learning_state = LearningState::WaitingOnPerturbPlus { start_time: current_time };
-                    debug!("[SPSA LEARN] Applied positive perturbation. c_k={:.6}", c_k);
-                }
-            }
-
-            LearningState::WaitingOnPerturbPlus { start_time } => {
-                // Check if we've gathered enough data
-                if current_time - start_time > eval_duration {
-                    // 1. Store the loss from the positive perturbation
-                    self.loss_plus = self.loss_tracker.compute_loss();
-
-                    // 2. Apply negative perturbation
-                    let baseline_vec = self.baseline_params.read().to_vec();
-                    let delta_vec = &self.spsa_state.last_delta;
-                    let c_k = self.spsa_state.last_c_k;
-
-                    let perturb_minus_vec: Vec<f64> = baseline_vec.iter().zip(delta_vec.iter())
-                        .map(|(param, d)| param - c_k * d)
-                        .collect();
-
-                    self.tuning_params.write().update_from_vec(perturb_minus_vec);
-
-                    // 3. Reset loss tracker and change state
-                    self.loss_tracker = LossTracker::new(current_time);
-                    self.learning_state = LearningState::WaitingOnPerturbMinus { start_time: current_time };
-                    debug!("[SPSA LEARN] Applied negative perturbation. loss_plus={:.4}", self.loss_plus);
-                }
-            }
-
-            LearningState::WaitingOnPerturbMinus { start_time } => {
-                // Check if we've gathered enough data
-                if current_time - start_time > eval_duration {
-                    // 1. Store the loss from the negative perturbation
-                    self.loss_minus = self.loss_tracker.compute_loss();
-                    debug!("[SPSA LEARN] Got negative loss. loss_minus={:.4}", self.loss_minus);
-
-                    // --- This is the "Aha!" moment ---
-                    // 2. Calculate the SPSA gradient estimate
-                    let c_k = self.spsa_state.last_c_k;
-                    let delta_vec = &self.spsa_state.last_delta;
-                    let loss_diff = self.loss_plus - self.loss_minus;
-
-                    // g_k = (loss_plus - loss_minus) / (2 * c_k * delta)
-                    let gradient_estimate: Vec<f64> = delta_vec.iter().map(|&d| {
-                        if d.abs() < 1e-9 { 0.0 } // Avoid division by zero
-                        else { loss_diff / (2.0 * c_k * d) }
-                    }).collect();
-
-                    let grad_norm = gradient_estimate.iter().map(|g| g.powi(2)).sum::<f64>().sqrt();
-                    info!("[SPSA LEARN] Gradient estimated. Loss diff: {:.4}, Grad norm: {:.4}",
-                          loss_diff, grad_norm);
-
-                    // 3. Feed the gradient to the Adam optimizer
-                    let updates = self.adam_optimizer.write().compute_update(&gradient_estimate);
-
-                    // 4. Apply the updates from Adam to our *baseline* parameters
-                    let mut baseline = self.baseline_params.write();
-                    let mut baseline_vec = baseline.to_vec();
-
-                    for (param, update) in baseline_vec.iter_mut().zip(updates.iter()) {
-                        *param -= update; // Gradient *descent*
-                    }
-
-                    baseline.update_from_vec(baseline_vec);
-
-                    // 5. Restore live params to the new, optimized baseline
-                    self.tuning_params.write().clone_from(&*baseline);
-                    drop(baseline); // Release RwLock
-
-                    // 6. Reset loss tracker and return to Idle
-                    self.loss_tracker = LossTracker::new(current_time);
-                    self.learning_state = LearningState::Idle;
-
-                    info!("[SPSA LEARN] Cycle complete. Parameters updated.");
-                }
-            }
-        }
-    }
-
-    // ========================================================================
-    // OLD PLACEHOLDER LEARNING FUNCTIONS - REPLACED BY SPSA
-    // ========================================================================
-    //
-    // The following functions have been replaced by the SPSA-based learning
-    // system implemented in run_learning_cycle(). They are kept here for
-    // reference but should not be used in production.
-    //
-    // Key problems with the old approach:
-    // 1. Synchronous gradient computation doesn't work for live trading
-    // 2. Finite differences require 2*N function evaluations (16 for 8 params)
-    // 3. Placeholder gradient computation (vec![0.001; 8]) was not useful
-    //
-    // SPSA advantages:
-    // 1. Asynchronous: gathers loss over time windows
-    // 2. Efficient: only 2 evaluations per cycle regardless of param count
-    // 3. Production-ready: proper gradient estimation from real P&L
-    //
-    // ========================================================================
-
-    /*
-    /// OLD: Perform online learning using the Adam optimizer.
-    #[allow(dead_code)]
-    fn perform_online_learning(&mut self, state: &CurrentState) -> f64 {
-        if !self.config.enable_online_learning {
-            return 0.0;
-        }
-
-        // Compute loss based on current performance
-        let inventory_loss = self.hjb_components.phi * state.position.powi(2);
-        let adverse_selection_loss = self.state_vector.adverse_selection_estimate.abs();
-        let spread_loss = state.market_spread_bps.max(0.0);
-
-        let total_loss = inventory_loss + adverse_selection_loss * 0.1 + spread_loss * 0.01;
-
-        // Compute gradients (simplified finite difference approximation)
-        // In a full implementation, this would use automatic differentiation
-        let tuning_params = self.tuning_params.read().clone();
-        let gradient_vector = self.compute_finite_difference_gradients(&tuning_params, total_loss);
-
-        // Update parameters using Adam optimizer
-        let mut adam = self.adam_optimizer.write();
-        let updates = adam.compute_update(&gradient_vector);
-        drop(adam);
-
-        // Apply updates to tuning parameters
-        self.apply_parameter_updates(&updates);
-
-        debug!(
-            "[ONLINE LEARNING] Loss: {:.4}, Gradient norm: {:.4}",
-            total_loss,
-            gradient_vector.iter().map(|g| g.powi(2)).sum::<f64>().sqrt()
-        );
-
-        total_loss
-    }
-
-    /// OLD: Compute finite difference gradients for online learning.
-    fn compute_finite_difference_gradients(
-        &self,
-        _tuning_params: &crate::TuningParams,
-        _current_loss: f64,
-    ) -> Vec<f64> {
-        // Placeholder: return small random gradients for now
-        // In production, implement proper gradient computation
-        vec![0.001; 8]
-    }
-
-    /// OLD: Apply parameter updates from the Adam optimizer.
-    fn apply_parameter_updates(&mut self, updates: &[f64]) {
-        let mut tuning_params = self.tuning_params.write();
-
-        // Update phi parameters (in unconstrained space)
-        let mut params_vec = vec![
-            tuning_params.skew_adjustment_factor_phi,
-            tuning_params.adverse_selection_adjustment_factor_phi,
-            tuning_params.adverse_selection_lambda_phi,
-            tuning_params.inventory_urgency_threshold_phi,
-            tuning_params.liquidation_rate_multiplier_phi,
-            tuning_params.min_spread_base_ratio_phi,
-            tuning_params.adverse_selection_spread_scale_phi,
-            tuning_params.control_gap_threshold_phi,
-        ];
-
-        // Apply updates
-        for (i, update) in updates.iter().enumerate() {
-            if i < params_vec.len() {
-                params_vec[i] -= update; // Gradient descent: θ := θ - α * ∇L
-            }
-        }
-
-        // Write back
-        tuning_params.skew_adjustment_factor_phi = params_vec[0];
-        tuning_params.adverse_selection_adjustment_factor_phi = params_vec[1];
-        tuning_params.adverse_selection_lambda_phi = params_vec[2];
-        tuning_params.inventory_urgency_threshold_phi = params_vec[3];
-        tuning_params.liquidation_rate_multiplier_phi = params_vec[4];
-        tuning_params.min_spread_base_ratio_phi = params_vec[5];
-        tuning_params.adverse_selection_spread_scale_phi = params_vec[6];
-        tuning_params.control_gap_threshold_phi = params_vec[7];
-    }
-    */
 }
