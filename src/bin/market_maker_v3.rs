@@ -496,13 +496,16 @@ impl StateManagerActor {
     /// Handles an action request from a Strategy Runner.
     async fn handle_action_request(&self, request: ExecuteActionsRequest) {
         let asset = request.asset.clone();
+        let action_count = request.actions.len();
+
+        info!("[State Manager] Received {} action(s) from [{}]", action_count, asset);
 
         // Validate that we're tracking this asset
         {
             let asset_states = self.asset_states.read().await;
             if !asset_states.contains_key(&asset) {
                 warn!(
-                    "[State Manager] Rejected actions from [{}]: Unknown asset",
+                    "[State Manager] ❌ Rejected actions from [{}]: Unknown asset",
                     asset
                 );
                 let _ = request.resp.send(ExecuteActionsResponse {
@@ -520,11 +523,14 @@ impl StateManagerActor {
         let global_state_read = self.global_account_state.read().await;
         let asset_state = asset_states_read.get(&asset);
 
+        info!("[State Manager] Validating {} actions for [{}]: Equity=${:.2}, Margin Used=${:.2}",
+            action_count, asset, global_state_read.account_equity, global_state_read.margin_used);
+
         let (valid, msg) = self.validate_actions(&global_state_read, asset_state, &request.actions, &asset);
 
         if !valid {
             warn!(
-                "[State Manager] Rejected actions from [{}]: {}",
+                "[State Manager] ❌ VALIDATION FAILED for [{}]: {}",
                 asset, msg
             );
             let _ = request.resp.send(ExecuteActionsResponse {
@@ -533,6 +539,8 @@ impl StateManagerActor {
             });
             return;
         }
+
+        info!("[State Manager] ✅ Validation PASSED for [{}], proceeding with execution", asset);
 
         // Release read locks before acquiring write locks
         drop(asset_states_read);
@@ -602,14 +610,18 @@ impl StateManagerActor {
         // 3. Execute Actions
         // ---
         if !executor_actions.is_empty() {
+            info!("[State Manager] Spawning executor task for {} action(s)", executor_actions.len());
             let executor = self.order_executor.clone();
+            let asset_clone = asset.clone();
             tokio::spawn(async move {
+                info!("[Executor] Executing {} actions for [{}]...", executor_actions.len(), asset_clone);
                 let result = executor.execute_actions_parallel(executor_actions).await;
                 if result.failed > 0 {
                     error!(
-                        "[State Manager] {}/{} actions failed to execute.",
+                        "[Executor] ❌ {}/{} actions FAILED for [{}]",
                         result.failed,
-                        result.failed + result.successful
+                        result.failed + result.successful,
+                        asset_clone
                     );
                     for resp in result.responses {
                         if let Err(e) = resp {
@@ -626,8 +638,12 @@ impl StateManagerActor {
                             }
                         }
                     }
+                } else {
+                    info!("[Executor] ✅ All {} actions SUCCEEDED for [{}]", result.successful, asset_clone);
                 }
             });
+        } else {
+            warn!("[State Manager] No executor actions to process for [{}]", asset);
         }
 
         // ---
@@ -980,6 +996,7 @@ impl StrategyRunnerActor {
 
         match message {
             Message::L2Book(l2_book) => {
+                debug!("[Runner {}] Received L2Book update", self.asset);
                 if let Some(book) = OrderBook::from_l2_data(&l2_book.data) {
                     let mut state = self.local_state_cache.write().await;
                     if let Some(analysis) = book.analyze(5) {
@@ -987,19 +1004,26 @@ impl StrategyRunnerActor {
                         state.market_spread_bps = book.spread_bps().unwrap_or(0.0);
                     }
                     if let (Some(bid), Some(ask)) = (book.best_bid(), book.best_ask()) {
-                        state.l2_mid_price = (bid + ask) / 2.0;
+                        let new_mid = (bid + ask) / 2.0;
+                        debug!("[Runner {}] L2Book: bid=${:.3}, ask=${:.3}, mid=${:.3}, imbalance={:.3}",
+                            self.asset, bid, ask, new_mid, state.lob_imbalance);
+                        state.l2_mid_price = new_mid;
                     }
                     state.order_book = Some(book);
                     market_update = Some(MarketUpdate::from_l2_book(l2_book.data));
+                } else {
+                    warn!("[Runner {}] Failed to parse L2Book data", self.asset);
                 }
             }
             Message::Trades(trades) => {
+                debug!("[Runner {}] Received {} trade(s)", self.asset, trades.data.len());
                 market_update =
                     Some(MarketUpdate::from_trades(self.asset.clone(), trades.data));
             }
             Message::AllMids(all_mids) => {
                 if let Some(mid_str) = all_mids.data.mids.get(&self.asset) {
                     if let Ok(mid_price) = mid_str.parse::<f64>() {
+                        debug!("[Runner {}] Received AllMids: mid=${:.3}", self.asset, mid_price);
                         // Update local state cache with mid price
                         let mut state = self.local_state_cache.write().await;
                         state.l2_mid_price = mid_price;
@@ -1007,20 +1031,32 @@ impl StrategyRunnerActor {
 
                         market_update =
                             Some(MarketUpdate::from_mid_price(self.asset.clone(), mid_price));
+                    } else {
+                        warn!("[Runner {}] Failed to parse mid price from AllMids: {}", self.asset, mid_str);
                     }
+                } else {
+                    debug!("[Runner {}] AllMids does not contain price for this asset", self.asset);
                 }
             }
-            _ => {}
+            _ => {
+                debug!("[Runner {}] Received unhandled message type", self.asset);
+            }
         }
 
         // If we have a valid update, run the strategy
         if let Some(update) = market_update {
+            debug!("[Runner {}] Processing market update, running strategy...", self.asset);
             let state = self.local_state_cache.read().await;
             let actions = self.strategy.on_market_update(&state, &update);
 
             if !actions.is_empty() && !matches!(actions[0], StrategyAction::NoOp) {
+                info!("[Runner {}] Strategy generated {} action(s)", self.asset, actions.len());
                 self.send_actions(actions).await;
+            } else {
+                debug!("[Runner {}] Strategy returned NoOp or empty actions", self.asset);
             }
+        } else {
+            debug!("[Runner {}] No valid market update generated from message", self.asset);
         }
     }
 
@@ -1110,14 +1146,24 @@ impl StrategyRunnerActor {
                     state_write.position.abs() * (state_write.avg_entry_price - state_write.l2_mid_price);
             }
         }
+
+        let has_orders = !state_write.open_bids.is_empty() || !state_write.open_asks.is_empty();
+        let mid_price = state_write.l2_mid_price;
+        let position = state_write.position;
         drop(state_write);
+
+        debug!("[Runner {}] Tick: mid=${:.3}, pos={:.2}, has_orders={}",
+            self.asset, mid_price, position, has_orders);
 
         // Now call the strategy's tick function with the read-lock
         let state_read = self.local_state_cache.read().await;
         let actions = self.strategy.on_tick(&state_read);
 
         if !actions.is_empty() && !matches!(actions[0], StrategyAction::NoOp) {
+            info!("[Runner {}] Tick generated {} action(s)", self.asset, actions.len());
             self.send_actions(actions).await;
+        } else {
+            debug!("[Runner {}] Tick returned NoOp or empty actions", self.asset);
         }
     }
 
@@ -1133,6 +1179,12 @@ impl StrategyRunnerActor {
 
     /// Sends a list of actions to the State Manager for execution.
     async fn send_actions(&self, actions: Vec<StrategyAction>) {
+        let place_count = actions.iter().filter(|a| matches!(a, StrategyAction::Place(_) | StrategyAction::BatchPlace(_))).count();
+        let cancel_count = actions.iter().filter(|a| matches!(a, StrategyAction::Cancel(_) | StrategyAction::BatchCancel(_))).count();
+
+        info!("[Runner {}] Sending {} action(s) to State Manager: {} place, {} cancel",
+            self.asset, actions.len(), place_count, cancel_count);
+
         let (resp_tx, resp_rx) = oneshot::channel();
         let request = ExecuteActionsRequest {
             asset: self.asset.clone(),
@@ -1150,13 +1202,13 @@ impl StrategyRunnerActor {
             Ok(response) => {
                 if !response.success {
                     warn!(
-                        "[Runner {}] Actions REJECTED by State Manager: {}",
+                        "[Runner {}] ❌ Actions REJECTED by State Manager: {}",
                         self.asset, response.message
                     );
                 } else {
-                    debug!(
-                        "[Runner {}] Actions submitted to State Manager.",
-                        self.asset
+                    info!(
+                        "[Runner {}] ✅ Actions accepted by State Manager: {}",
+                        self.asset, response.message
                     );
                 }
             }
