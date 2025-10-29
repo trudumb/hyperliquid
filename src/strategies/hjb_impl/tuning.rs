@@ -120,6 +120,48 @@ impl Default for TuningParams {
 }
 
 impl TuningParams {
+    /// Convert to a vector representation (for SPSA perturbations)
+    pub fn to_vec(&self) -> Vec<f64> {
+        vec![
+            self.skew_adjustment_factor_phi,
+            self.adverse_selection_adjustment_factor_phi,
+            self.adverse_selection_lambda_phi,
+            self.inventory_urgency_threshold_phi,
+            self.liquidation_rate_multiplier_phi,
+            self.min_spread_base_ratio_phi,
+            self.adverse_selection_spread_scale_phi,
+            self.control_gap_threshold_phi,
+        ]
+    }
+
+    /// Update from a vector representation
+    pub fn update_from_vec(&mut self, vec: Vec<f64>) {
+        assert_eq!(vec.len(), 8, "TuningParams vector must have 8 elements");
+        self.skew_adjustment_factor_phi = vec[0];
+        self.adverse_selection_adjustment_factor_phi = vec[1];
+        self.adverse_selection_lambda_phi = vec[2];
+        self.inventory_urgency_threshold_phi = vec[3];
+        self.liquidation_rate_multiplier_phi = vec[4];
+        self.min_spread_base_ratio_phi = vec[5];
+        self.adverse_selection_spread_scale_phi = vec[6];
+        self.control_gap_threshold_phi = vec[7];
+    }
+
+    /// Create from a vector representation
+    pub fn from_vec(vec: Vec<f64>) -> Self {
+        assert_eq!(vec.len(), 8, "TuningParams vector must have 8 elements");
+        Self {
+            skew_adjustment_factor_phi: vec[0],
+            adverse_selection_adjustment_factor_phi: vec[1],
+            adverse_selection_lambda_phi: vec[2],
+            inventory_urgency_threshold_phi: vec[3],
+            liquidation_rate_multiplier_phi: vec[4],
+            min_spread_base_ratio_phi: vec[5],
+            adverse_selection_spread_scale_phi: vec[6],
+            control_gap_threshold_phi: vec[7],
+        }
+    }
+
     pub fn get_constrained(&self) -> ConstrainedTuningParams {
         ConstrainedTuningParams {
             skew_adjustment_factor: scaled_sigmoid(self.skew_adjustment_factor_phi, 0.0, 2.0),
