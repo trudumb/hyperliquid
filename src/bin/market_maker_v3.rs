@@ -293,16 +293,45 @@ impl StateManagerActor {
             }
         });
 
+        // Watchdog timer to detect stalled event loop
+        let mut watchdog_timer = interval(Duration::from_secs(30));
+        watchdog_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Message timeout detection
+        let mut last_ws_message_time = std::time::Instant::now();
+        let ws_timeout = Duration::from_secs(60); // Alert if no WS messages for 60 seconds
+
+        let mut healthcheck_timer = interval(Duration::from_secs(10));
+        healthcheck_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
                 // Handle incoming WebSocket messages (Fills, Order Updates)
                 Some(message) = user_ws_rx.recv() => {
+                    debug!("[State Manager] Received WebSocket message");
+                    last_ws_message_time = std::time::Instant::now();
                     self.handle_ws_message(message).await;
                 }
 
                 // Handle incoming action requests from Strategy Runners
                 Some(request) = self.action_rx.recv() => {
                     self.handle_action_request(request).await;
+                }
+
+                // Watchdog: periodically log that we're alive
+                _ = watchdog_timer.tick() => {
+                    info!("[State Manager] Watchdog: Event loop is running normally");
+                }
+
+                // Health check: detect stalled WebSocket connection
+                _ = healthcheck_timer.tick() => {
+                    let elapsed = last_ws_message_time.elapsed();
+                    if elapsed > ws_timeout {
+                        warn!("[State Manager] ⚠️  No WebSocket messages received for {:.1}s - connection may be stalled",
+                            elapsed.as_secs_f64());
+                    } else {
+                        debug!("[State Manager] Health check: Last WS message {:.1}s ago", elapsed.as_secs_f64());
+                    }
                 }
 
                 _ = tokio::signal::ctrl_c() => {
@@ -321,8 +350,10 @@ impl StateManagerActor {
         &mut self,
         sender: mpsc::UnboundedSender<Message>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        info!("[State Manager] Creating flume channel for user data subscriptions...");
         let (flume_tx, flume_rx) = flume::unbounded();
 
+        info!("[State Manager] Subscribing to UserEvents...");
         self.info_client
             .subscribe(
                 Subscription::UserEvents {
@@ -331,6 +362,9 @@ impl StateManagerActor {
                 flume_tx.clone(),
             )
             .await?;
+        info!("[State Manager] ✓ UserEvents subscription successful");
+
+        info!("[State Manager] Subscribing to UserFills...");
         self.info_client
             .subscribe(
                 Subscription::UserFills {
@@ -339,6 +373,9 @@ impl StateManagerActor {
                 flume_tx.clone(),
             )
             .await?;
+        info!("[State Manager] ✓ UserFills subscription successful");
+
+        info!("[State Manager] Subscribing to OrderUpdates...");
         self.info_client
             .subscribe(
                 Subscription::OrderUpdates {
@@ -347,17 +384,30 @@ impl StateManagerActor {
                 flume_tx.clone(),
             )
             .await?;
+        info!("[State Manager] ✓ OrderUpdates subscription successful");
 
-        // Spawn a forwarder task
+        // Spawn a forwarder task with diagnostic logging
+        info!("[State Manager] Spawning WebSocket forwarder task...");
         tokio::spawn(async move {
+            info!("[State Manager WS Forwarder] Started - waiting for messages from WebSocket...");
+            let mut message_count = 0u64;
             while let Ok(msg) = flume_rx.recv_async().await {
+                message_count += 1;
+                if message_count == 1 {
+                    info!("[State Manager WS Forwarder] 🎉 First message received from WebSocket!");
+                } else if message_count % 100 == 0 {
+                    debug!("[State Manager WS Forwarder] Forwarded {} messages", message_count);
+                }
+
                 if sender.send(msg).is_err() {
-                    error!("[State Manager] WS forwarder failed to send to main loop.");
+                    error!("[State Manager WS Forwarder] Failed to send to main loop (receiver dropped). Exiting forwarder.");
                     break;
                 }
             }
+            warn!("[State Manager WS Forwarder] Exiting - flume channel closed. Total messages forwarded: {}", message_count);
         });
 
+        info!("[State Manager] WebSocket forwarder task spawned successfully");
         Ok(())
     }
 
@@ -923,10 +973,23 @@ impl StrategyRunnerActor {
         let mut tick_timer = interval(Duration::from_secs(1));
         tick_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // Watchdog timer to detect stalled event loop
+        let mut watchdog_timer = interval(Duration::from_secs(30));
+        watchdog_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Message timeout detection
+        let mut last_market_message_time = std::time::Instant::now();
+        let ws_timeout = Duration::from_secs(60); // Alert if no WS messages for 60 seconds
+
+        let mut healthcheck_timer = interval(Duration::from_secs(15));
+        healthcheck_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
                 // Handle incoming *market data* (L2Book, Trades)
                 Some(message) = market_ws_rx.recv() => {
+                    debug!("[Runner {}] Received market data message", self.asset);
+                    last_market_message_time = std::time::Instant::now();
                     self.handle_market_message(message).await;
                 }
 
@@ -938,6 +1001,22 @@ impl StrategyRunnerActor {
                 // Handle periodic tick
                 _ = tick_timer.tick() => {
                     self.handle_tick().await;
+                }
+
+                // Watchdog: periodically log that we're alive
+                _ = watchdog_timer.tick() => {
+                    info!("[Runner {}] Watchdog: Event loop is running normally", self.asset);
+                }
+
+                // Health check: detect stalled WebSocket connection
+                _ = healthcheck_timer.tick() => {
+                    let elapsed = last_market_message_time.elapsed();
+                    if elapsed > ws_timeout {
+                        warn!("[Runner {}] ⚠️  No market data messages received for {:.1}s - connection may be stalled",
+                            self.asset, elapsed.as_secs_f64());
+                    } else {
+                        debug!("[Runner {}] Health check: Last market message {:.1}s ago", self.asset, elapsed.as_secs_f64());
+                    }
                 }
 
                  _ = tokio::signal::ctrl_c() => {
@@ -956,8 +1035,10 @@ impl StrategyRunnerActor {
         &mut self,
         sender: mpsc::UnboundedSender<Message>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        info!("[Runner {}] Creating flume channel for market data subscriptions...", self.asset);
         let (flume_tx, flume_rx) = flume::unbounded();
 
+        info!("[Runner {}] Subscribing to L2Book...", self.asset);
         self.info_client
             .subscribe(
                 Subscription::L2Book {
@@ -966,6 +1047,9 @@ impl StrategyRunnerActor {
                 flume_tx.clone(),
             )
             .await?;
+        info!("[Runner {}] ✓ L2Book subscription successful", self.asset);
+
+        info!("[Runner {}] Subscribing to Trades...", self.asset);
         self.info_client
             .subscribe(
                 Subscription::Trades {
@@ -974,19 +1058,37 @@ impl StrategyRunnerActor {
                 flume_tx.clone(),
             )
             .await?;
+        info!("[Runner {}] ✓ Trades subscription successful", self.asset);
+
+        info!("[Runner {}] Subscribing to AllMids...", self.asset);
         self.info_client
             .subscribe(Subscription::AllMids, flume_tx.clone())
             .await?;
+        info!("[Runner {}] ✓ AllMids subscription successful", self.asset);
 
-        // Spawn a forwarder task
+        // Spawn a forwarder task with diagnostic logging
+        let asset_for_task = self.asset.clone();
+        info!("[Runner {}] Spawning market data forwarder task...", self.asset);
         tokio::spawn(async move {
+            info!("[Runner {} Market Forwarder] Started - waiting for messages from WebSocket...", asset_for_task);
+            let mut message_count = 0u64;
             while let Ok(msg) = flume_rx.recv_async().await {
+                message_count += 1;
+                if message_count == 1 {
+                    info!("[Runner {} Market Forwarder] 🎉 First message received from WebSocket!", asset_for_task);
+                } else if message_count % 500 == 0 {
+                    debug!("[Runner {} Market Forwarder] Forwarded {} messages", asset_for_task, message_count);
+                }
+
                 if sender.send(msg).is_err() {
-                    error!("[Runner] Market WS forwarder failed.");
+                    error!("[Runner {} Market Forwarder] Failed to send to main loop (receiver dropped). Exiting forwarder.", asset_for_task);
                     break;
                 }
             }
+            warn!("[Runner {} Market Forwarder] Exiting - flume channel closed. Total messages forwarded: {}", asset_for_task, message_count);
         });
+
+        info!("[Runner {}] Market data forwarder task spawned successfully", self.asset);
         Ok(())
     }
 
@@ -1331,19 +1433,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("✅ All {} Strategy Runner Actors spawned.", runner_handles.len());
 
-    // --- 6. Run LocalSet until Ctrl+C ---
+    // --- 6. Spawn Global Watchdog (runs outside LocalSet) ---
+    // This watchdog runs on the regular tokio runtime and can detect if the LocalSet is blocked
+    let watchdog_handle = tokio::spawn(async {
+        let mut watchdog_timer = interval(Duration::from_secs(45));
+        watchdog_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            watchdog_timer.tick().await;
+            info!("🐕 [Global Watchdog] Tokio runtime is alive and processing tasks");
+        }
+    });
+
+    // --- 7. Run LocalSet with Timeout and Shutdown Handler ---
+    info!("🚀 Starting market maker event loop...");
+
     local_set
         .run_until(async move {
-            tokio::signal::ctrl_c().await.expect("Failed to wait for Ctrl+C");
+            // Create a shutdown signal channel
+            let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+            // Spawn a task to listen for Ctrl+C
+            tokio::spawn(async move {
+                tokio::signal::ctrl_c().await.expect("Failed to wait for Ctrl+C");
+                info!("🛑 Ctrl+C received, initiating shutdown...");
+                let _ = shutdown_tx.send(()).await;
+            });
+
+            // Wait for shutdown signal
+            let _ = shutdown_rx.recv().await;
             info!("Main task shutting down. Actors will terminate.");
 
-            // Wait for actors to finish (optional)
-            let _ = state_manager_handle.await;
-            for handle in runner_handles {
-                let _ = handle.await;
+            // Give actors time to clean up (with timeout)
+            info!("Waiting for State Manager to finish...");
+            match tokio::time::timeout(Duration::from_secs(5), state_manager_handle).await {
+                Ok(_) => info!("State Manager shutdown complete"),
+                Err(_) => warn!("State Manager shutdown timed out"),
             }
+
+            info!("Waiting for {} Strategy Runners to finish...", runner_handles.len());
+            for (i, handle) in runner_handles.into_iter().enumerate() {
+                match tokio::time::timeout(Duration::from_secs(3), handle).await {
+                    Ok(_) => debug!("Runner {} shutdown complete", i),
+                    Err(_) => warn!("Runner {} shutdown timed out", i),
+                }
+            }
+
+            info!("All actors have been shut down");
         })
         .await;
 
+    // Cancel the watchdog
+    watchdog_handle.abort();
+
+    info!("✅ Market maker shutdown complete");
     Ok(())
 }
