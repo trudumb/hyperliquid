@@ -1412,6 +1412,18 @@ impl HjbStrategy {
             );
 
             if adjusted_size >= min_size_step {
+                // Check minimum notional value ($10)
+                let notional_value = adjusted_size * price;
+                let min_notional = 10.0;
+
+                if notional_value < min_notional {
+                    log::warn!(
+                        "   ⚠️  Skipping Liquidation SELL: Notional ${:.2} < min ${:.2}",
+                        notional_value, min_notional
+                    );
+                    continue;
+                }
+
                 log::info!(
                     "   📤 Liquidation SELL: {:.4} @ {:.2} (reduce_only)",
                     adjusted_size, price
@@ -1476,6 +1488,18 @@ impl HjbStrategy {
             );
 
             if adjusted_size >= min_size_step {
+                // Check minimum notional value ($10)
+                let notional_value = adjusted_size * price;
+                let min_notional = 10.0;
+
+                if notional_value < min_notional {
+                    log::warn!(
+                        "   ⚠️  Skipping Liquidation BUY: Notional ${:.2} < min ${:.2}",
+                        notional_value, min_notional
+                    );
+                    continue;
+                }
+
                 log::info!(
                     "   📥 Liquidation BUY: {:.4} @ {:.2} (reduce_only)",
                     adjusted_size, price
