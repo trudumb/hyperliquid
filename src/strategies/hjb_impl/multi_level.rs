@@ -157,15 +157,22 @@ impl Default for MultiLevelConfig {
     fn default() -> Self {
         Self {
             max_levels: 3,
-            min_profitable_spread_bps: 4.0,  // 3 bps fees + 1 bps edge
+            // ✅ INCREASED: Was 4.0, now 6.0 to provide more safety margin
+            // This gives more room for aggression adjustments without crossing spread
+            min_profitable_spread_bps: 6.0,  // 3 bps fees + 3 bps edge/buffer
             level_spacing_bps: 2.0,
             total_size_per_side: 1.0,
-            inventory_risk_limit: 0.7,
+            // ✅ REDUCED: Was 0.7, now 0.5 for slower inventory accumulation
+            inventory_risk_limit: 0.5,
             directional_aggression: 2.0,
             momentum_threshold: 1.3,
             momentum_tightening_bps: 1.0,
-            inventory_urgency_threshold: 0.8,
-            volatility_to_spread_factor: 0.01,  // Conservative default: 1% of volatility becomes spread
+            // ✅ INCREASED: Was 0.8, now 0.85 to delay liquidation mode
+            // We want maker liquidation logic to almost never run
+            inventory_urgency_threshold: 0.85,
+            // ✅ INCREASED: Was 0.01, now 0.015 for wider base spreads
+            // Wider spreads give more room for aggressive adjustments
+            volatility_to_spread_factor: 0.015,  // 1.5% of volatility becomes spread
         }
     }
 }
@@ -205,6 +212,25 @@ impl MultiLevelOptimizer {
         base_half_spread_bps: f64,
         tuning_params: &ConstrainedTuningParams,
     ) -> MultiLevelControl {
+        // ✅ SAFETY: Add aggressive minimum spread buffer to prevent crossing
+        // This ensures we always have enough "room" to absorb aggression adjustments
+        let min_safe_half_spread = (self.config.min_profitable_spread_bps / 2.0) * 1.5; // 50% safety buffer
+        let base_half_spread_safe = base_half_spread_bps.max(min_safe_half_spread);
+
+        // ✅ VALIDATION: Warn if aggression parameters might be too high
+        if tuning_params.skew_adjustment_factor > 0.75 {
+            log::warn!(
+                "⚠️  skew_adjustment_factor={:.2} is high - may cause spread crossing. Recommend <= 0.5",
+                tuning_params.skew_adjustment_factor
+            );
+        }
+        if tuning_params.adverse_selection_adjustment_factor > 0.75 {
+            log::warn!(
+                "⚠️  adverse_selection_adjustment_factor={:.2} is high - may cause spread crossing. Recommend <= 0.5",
+                tuning_params.adverse_selection_adjustment_factor
+            );
+        }
+
         // 1. Calculate directional bias
         let inventory_ratio = state.inventory / state.max_position;
         let (bid_aggression, ask_aggression) = self.calculate_aggression(
@@ -212,6 +238,25 @@ impl MultiLevelOptimizer {
             inventory_ratio,
             tuning_params,
         );
+
+        // ✅ SAFETY: Cap maximum aggression to prevent crossing spread
+        // Max aggression should not exceed 80% of base_half_spread
+        let max_safe_aggression = base_half_spread_safe * 0.8;
+        let bid_aggression_capped = bid_aggression.clamp(-max_safe_aggression * 2.0, max_safe_aggression);
+        let ask_aggression_capped = ask_aggression.clamp(-max_safe_aggression * 2.0, max_safe_aggression);
+
+        if bid_aggression.abs() != bid_aggression_capped.abs() {
+            log::warn!(
+                "⚠️  Bid aggression capped: {:.2} -> {:.2} bps (base_spread={:.2})",
+                bid_aggression, bid_aggression_capped, base_half_spread_safe
+            );
+        }
+        if ask_aggression.abs() != ask_aggression_capped.abs() {
+            log::warn!(
+                "⚠️  Ask aggression capped: {:.2} -> {:.2} bps (base_spread={:.2})",
+                ask_aggression, ask_aggression_capped, base_half_spread_safe
+            );
+        }
 
         // 2. Determine number of levels (could be dynamic in future)
         let num_levels = self.config.max_levels;
@@ -223,19 +268,21 @@ impl MultiLevelOptimizer {
         let mut bid_levels = Vec::new();
         for level in 0..num_levels {
             let level_offset = level as f64 * self.config.level_spacing_bps;
-            let base_offset = base_half_spread_bps.max(self.config.min_profitable_spread_bps / 2.0);
+            let base_offset = base_half_spread_safe.max(self.config.min_profitable_spread_bps / 2.0);
 
-            // Apply directional aggression
-            let mut adjusted_offset = base_offset + level_offset - bid_aggression;
+            // Apply directional aggression (use capped value for safety)
+            let mut adjusted_offset = base_offset + level_offset - bid_aggression_capped;
 
             // Check for Hawkes momentum and tighten further
             if state.hawkes_model.has_momentum(level, true, state.current_time, self.config.momentum_threshold) {
                 adjusted_offset -= self.config.momentum_tightening_bps;
             }
 
-            // Enforce minimum using tunable min_spread_base_ratio
-            let min_offset = base_half_spread_bps * tuning_params.min_spread_base_ratio;
-            adjusted_offset = adjusted_offset.max(min_offset).max(self.config.min_profitable_spread_bps / 2.0);
+            // ✅ SAFETY: Enforce strict minimum with safety buffer
+            // Minimum must be at least min_profitable_spread/2 to cover fees
+            let absolute_min = self.config.min_profitable_spread_bps / 2.0;
+            let safe_min = base_half_spread_safe * tuning_params.min_spread_base_ratio.max(0.5); // At least 50% of base
+            adjusted_offset = adjusted_offset.max(safe_min).max(absolute_min);
 
             bid_levels.push((adjusted_offset, bid_sizes[level]));
         }
@@ -244,17 +291,19 @@ impl MultiLevelOptimizer {
         let mut ask_levels = Vec::new();
         for level in 0..num_levels {
             let level_offset = level as f64 * self.config.level_spacing_bps;
-            let base_offset = base_half_spread_bps.max(self.config.min_profitable_spread_bps / 2.0);
+            let base_offset = base_half_spread_safe.max(self.config.min_profitable_spread_bps / 2.0);
 
-            let mut adjusted_offset = base_offset + level_offset - ask_aggression;
+            // Apply directional aggression (use capped value for safety)
+            let mut adjusted_offset = base_offset + level_offset - ask_aggression_capped;
 
             if state.hawkes_model.has_momentum(level, false, state.current_time, self.config.momentum_threshold) {
                 adjusted_offset -= self.config.momentum_tightening_bps;
             }
 
-            // Enforce minimum using tunable min_spread_base_ratio
-            let min_offset = base_half_spread_bps * tuning_params.min_spread_base_ratio;
-            adjusted_offset = adjusted_offset.max(min_offset).max(self.config.min_profitable_spread_bps / 2.0);
+            // ✅ SAFETY: Enforce strict minimum with safety buffer
+            let absolute_min = self.config.min_profitable_spread_bps / 2.0;
+            let safe_min = base_half_spread_safe * tuning_params.min_spread_base_ratio.max(0.5);
+            adjusted_offset = adjusted_offset.max(safe_min).max(absolute_min);
 
             ask_levels.push((adjusted_offset, ask_sizes[level]));
         }
@@ -310,9 +359,10 @@ impl MultiLevelOptimizer {
         // ========================================================================
         if is_short && price_rising {
             // We're short and price is moving against us → PANIC BUY
+            // ✅ REDUCED: Was 3.0x, now 1.5x to prevent crossing spread
             // Dramatically increase bid aggression to get filled before price runs away
             let urgency = inventory_ratio.abs() * adverse_selection_bps.abs();
-            bid_aggression = 3.0 * urgency * tuning_params.skew_adjustment_factor;
+            bid_aggression = 1.5 * urgency * tuning_params.skew_adjustment_factor;
             ask_aggression = -2.0; // Pull asks even further away (don't add to short!)
             decision_reason = format!(
                 "🚨 SHORT + RISING: Panic cover (inv={:.2}, AS={:.2}bps)",
@@ -338,8 +388,9 @@ impl MultiLevelOptimizer {
         // ========================================================================
         } else if is_flat && price_rising {
             // We're neutral and price is rising → PROACTIVELY GET LONG
+            // ✅ REDUCED: Was 1.5x, now 1.0x for gentler entry
             // Increase bid aggression to catch momentum, decrease ask aggression to avoid getting short
-            bid_aggression = 1.5 * adverse_selection_bps.abs() * tuning_params.skew_adjustment_factor;
+            bid_aggression = 1.0 * adverse_selection_bps.abs() * tuning_params.skew_adjustment_factor;
             ask_aggression = -1.0; // Widen asks to avoid getting short
             decision_reason = format!(
                 "📈 FLAT + RISING: Build long (AS={:.2}bps)",
@@ -351,9 +402,10 @@ impl MultiLevelOptimizer {
         // ========================================================================
         } else if is_long && price_falling {
             // We're long and price is moving against us → PANIC SELL
+            // ✅ REDUCED: Was 3.0x, now 1.5x to prevent crossing spread
             // Dramatically increase ask aggression to get filled before price drops more
             let urgency = inventory_ratio * adverse_selection_bps.abs();
-            ask_aggression = 3.0 * urgency * tuning_params.skew_adjustment_factor;
+            ask_aggression = 1.5 * urgency * tuning_params.skew_adjustment_factor;
             bid_aggression = -2.0; // Pull bids further away (don't add to long!)
             decision_reason = format!(
                 "🚨 LONG + FALLING: Panic exit (inv={:.2}, AS={:.2}bps)",
@@ -379,8 +431,9 @@ impl MultiLevelOptimizer {
         // ========================================================================
         } else if is_flat && price_falling {
             // We're neutral and price is falling → PROACTIVELY GET SHORT
+            // ✅ REDUCED: Was 1.5x, now 1.0x for gentler entry
             // Increase ask aggression to catch momentum, decrease bid aggression to avoid getting long
-            ask_aggression = 1.5 * adverse_selection_bps.abs() * tuning_params.skew_adjustment_factor;
+            ask_aggression = 1.0 * adverse_selection_bps.abs() * tuning_params.skew_adjustment_factor;
             bid_aggression = -1.0; // Widen bids to avoid getting long
             decision_reason = format!(
                 "📉 FLAT + FALLING: Build short (AS={:.2}bps)",
@@ -392,13 +445,14 @@ impl MultiLevelOptimizer {
         // ========================================================================
         } else if price_neutral {
             // No strong directional signal → Use traditional inventory mean reversion
+            // ✅ REDUCED: Was 3.0x, now 2.0x for gentler mean reversion
             // But still slightly bias based on weak signals
             if inventory_ratio > 0.3 {
                 // Moderately long → gently skew to sell
-                ask_aggression = (inventory_ratio - 0.3) * 3.0 * tuning_params.skew_adjustment_factor;
+                ask_aggression = (inventory_ratio - 0.3) * 2.0 * tuning_params.skew_adjustment_factor;
             } else if inventory_ratio < -0.3 {
                 // Moderately short → gently skew to buy
-                bid_aggression = (inventory_ratio.abs() - 0.3) * 3.0 * tuning_params.skew_adjustment_factor;
+                bid_aggression = (inventory_ratio.abs() - 0.3) * 2.0 * tuning_params.skew_adjustment_factor;
             }
             decision_reason = format!(
                 "⚖️  NEUTRAL: Mean revert (inv={:.2}, AS={:.2}bps)",

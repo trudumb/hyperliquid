@@ -445,15 +445,21 @@ impl Strategy for HjbStrategy {
         let multi_level_config = strategy_config.multi_level_config.clone()
             .unwrap_or_else(|| MultiLevelConfig::default());
 
+        // ✅ TUNED: More conservative defaults to prevent spread crossing
         // Initialize fixed tuning parameters (sensible defaults, no online learning)
         let tuning_params = ConstrainedTuningParams {
-            skew_adjustment_factor: 0.5,
-            adverse_selection_adjustment_factor: 0.3,  // Lower since microprice AS is stable
+            // ✅ REDUCED: Was 0.5, now 0.3 for gentler inventory management
+            skew_adjustment_factor: 0.3,
+            // ✅ REDUCED: Was 0.3, now 0.2 for less AS sensitivity
+            adverse_selection_adjustment_factor: 0.2,  // Lower since microprice AS is stable
             adverse_selection_lambda: 0.1,
-            inventory_urgency_threshold: 0.7,
+            // ✅ INCREASED: Was 0.7, now 0.85 to delay liquidation mode
+            inventory_urgency_threshold: 0.85,
             liquidation_rate_multiplier: 10.0,
-            min_spread_base_ratio: 0.2,
-            adverse_selection_spread_scale: 50.0,  // Lower since microprice AS is stable
+            // ✅ INCREASED: Was 0.2, now 0.5 for stricter minimum spreads
+            min_spread_base_ratio: 0.5,
+            // ✅ REDUCED: Was 50.0, now 30.0 for less AS amplification
+            adverse_selection_spread_scale: 30.0,  // Lower since microprice AS is stable
             control_gap_threshold: 0.1,
         };
 
