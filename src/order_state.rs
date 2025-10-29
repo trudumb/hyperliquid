@@ -258,11 +258,16 @@ impl OrderStateManager {
                 info!("Order OID {} confirmed Canceled", oid);
                 OrderUpdateResult::RemoveAndCache(oid, OrderState::Cancelled)
             }
-            "rejected" => {
-                error!("Order OID {} Rejected!", oid);
+            "rejected" | "minTradeNtlRejected" => {
+                let reason = if status == "minTradeNtlRejected" {
+                    "minimum trade notional requirement not met"
+                } else {
+                    "unknown reason"
+                };
+                error!("Order OID {} Rejected ({})", oid, reason);
                 if let Some(cloid) = cloid_opt {
                     if let Some(mut order) = self.pending_place_orders.remove(&cloid) {
-                        warn!("Placement Rejected for Cloid {}: {:?}", cloid, order);
+                        warn!("Placement Rejected for Cloid {} ({}): {:?}", cloid, reason, order);
                         order.oid = Some(oid);
                         order.state = OrderState::Rejected;
                         order.timestamp = current_timestamp;

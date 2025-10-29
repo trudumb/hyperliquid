@@ -268,10 +268,16 @@ impl HjbMultiLevelOptimizer {
             0.0,  // as_uncertainty_bps (not used currently, could be added to OptimizerInputs)
         );
 
-        // 2. Calculate base half-spread from volatility
+        // 2. Calculate base half-spread from volatility using configurable factor
         let min_profitable_half_spread = self.multi_level_optimizer.config().min_profitable_spread_bps / 2.0;
-        let base_half_spread = (robust_params.sigma_worst_case * 0.1)
+        let vol_to_spread_factor = self.multi_level_optimizer.config().volatility_to_spread_factor;
+        let base_half_spread = (robust_params.sigma_worst_case * vol_to_spread_factor)
             .max(min_profitable_half_spread);
+
+        debug!(
+            "[SPREAD CALC] Vol: {:.2} bps, Vol Uncertainty: {:.2} bps, Worst-case Vol: {:.2} bps, Factor: {:.4}, Base Half-Spread: {:.2} bps",
+            inputs.volatility_bps, inputs.vol_uncertainty_bps, robust_params.sigma_worst_case, vol_to_spread_factor, base_half_spread
+        );
 
         // 3. Calculate inventory skew adjustment using the inventory skew component
         // Analyze the order book if available
@@ -287,6 +293,11 @@ impl HjbMultiLevelOptimizer {
 
         // 4. Apply spread multiplier from robust control
         let robust_base_half_spread = base_half_spread * robust_params.spread_multiplier;
+
+        debug!(
+            "[SPREAD CALC] Spread Multiplier: {:.4}, Robust Base Half-Spread: {:.2} bps (Full Spread: {:.2} bps)",
+            robust_params.spread_multiplier, robust_base_half_spread, robust_base_half_spread * 2.0
+        );
 
         // 5. Prepare optimization state
         let opt_state = OptimizationState {

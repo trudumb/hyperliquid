@@ -113,6 +113,17 @@ pub struct HjbStrategyConfig {
     /// Performance gap threshold (%) to enable trading
     /// E.g., 15.0 = trade when heuristic performance gap < 15%
     pub enable_trading_gap_threshold_percent: f64,
+
+    /// Account leverage setting (1-max_leverage)
+    /// Used to calculate margin requirements for position sizing
+    pub leverage: usize,
+
+    /// Maximum leverage allowed for this asset (from exchange metadata)
+    pub max_leverage: usize,
+
+    /// Margin safety buffer (0.0-1.0)
+    /// Reserves this fraction of available margin (e.g., 0.2 = 20% buffer)
+    pub margin_safety_buffer: f64,
 }
 
 impl HjbStrategyConfig {
@@ -172,6 +183,116 @@ impl HjbStrategyConfig {
             enable_trading_gap_threshold_percent: params.get("enable_trading_gap_threshold_percent")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(30.0),
+            leverage: params.get("leverage")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(3) as usize,
+            max_leverage: params.get("max_leverage")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(50) as usize,
+            margin_safety_buffer: params.get("margin_safety_buffer")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.2),
+        }
+    }
+}
+
+// ============================================================================
+// Margin Calculator
+// ============================================================================
+
+/// Calculates margin requirements and available capacity for position sizing
+#[derive(Debug, Clone)]
+pub struct MarginCalculator {
+    /// Account leverage (1-max_leverage)
+    leverage: usize,
+
+    /// Margin safety buffer (0.0-1.0)
+    safety_buffer: f64,
+}
+
+impl MarginCalculator {
+    pub fn new(leverage: usize, safety_buffer: f64) -> Self {
+        Self {
+            leverage,
+            safety_buffer: safety_buffer.clamp(0.0, 0.99),
+        }
+    }
+
+    /// Calculate initial margin required for a position
+    /// Formula: position_size * mark_price / leverage
+    pub fn initial_margin_required(&self, position_size: f64, mark_price: f64) -> f64 {
+        (position_size.abs() * mark_price) / self.leverage as f64
+    }
+
+    /// Calculate maintenance margin (50% of initial margin at max leverage)
+    /// For liquidation: account_value < maintenance_margin * total_notional
+    pub fn maintenance_margin_ratio(&self, max_leverage: usize) -> f64 {
+        0.5 / max_leverage as f64
+    }
+
+    /// Calculate available margin for new positions
+    /// available = account_equity - current_margin_used - buffer
+    pub fn available_margin(&self, account_equity: f64, margin_used: f64) -> f64 {
+        let usable_equity = account_equity * (1.0 - self.safety_buffer);
+        (usable_equity - margin_used).max(0.0)
+    }
+
+    /// Calculate maximum additional position size that can be opened
+    /// max_size = available_margin * leverage / mark_price
+    pub fn max_additional_position_size(
+        &self,
+        account_equity: f64,
+        margin_used: f64,
+        mark_price: f64,
+    ) -> f64 {
+        let available = self.available_margin(account_equity, margin_used);
+        (available * self.leverage as f64) / mark_price
+    }
+
+    /// Adjust order size to fit within margin constraints
+    /// Returns the maximum size that can be safely placed
+    pub fn adjust_order_size_for_margin(
+        &self,
+        desired_size: f64,
+        current_position: f64,
+        account_equity: f64,
+        margin_used: f64,
+        mark_price: f64,
+        is_buy: bool,
+    ) -> f64 {
+        // Calculate the position delta if this order fills
+        let position_delta = if is_buy { desired_size } else { -desired_size };
+        let new_position = current_position + position_delta;
+
+        // If order reduces position (opposing direction), no margin check needed
+        if new_position.abs() < current_position.abs() {
+            return desired_size;
+        }
+
+        // Calculate how much position increase is allowed
+        let position_increase = new_position.abs() - current_position.abs();
+        let max_increase = self.max_additional_position_size(account_equity, margin_used, mark_price);
+
+        if position_increase <= max_increase {
+            // Full size fits within margin
+            desired_size
+        } else {
+            // Reduce size to fit margin constraints
+            let adjusted_increase = max_increase.max(0.0);
+            let adjusted_size = if current_position.signum() == position_delta.signum() {
+                // Same direction: can only add adjusted_increase
+                adjusted_increase
+            } else {
+                // Crossing zero: can close current + open adjusted_increase on other side
+                current_position.abs() + adjusted_increase
+            };
+
+            debug!(
+                "[MARGIN CHECK] Order size reduced: {:.4} -> {:.4} (position: {:.2}, available margin increase: {:.2})",
+                desired_size, adjusted_size, current_position, adjusted_increase
+            );
+
+            adjusted_size
         }
     }
 }
@@ -185,10 +306,10 @@ impl HjbStrategyConfig {
 struct CachedOptimizerResult {
     /// The optimizer output
     output: OptimizerOutput,
-    
+
     /// Timestamp of this calculation
     timestamp: f64,
-    
+
     /// State hash (for cache invalidation)
     state_hash: u64,
 }
@@ -259,11 +380,14 @@ pub struct HjbStrategy {
     
     /// **NEW: Cached optimizer result (for performance)**
     cached_optimizer_result: Option<CachedOptimizerResult>,
-    
+
     /// **NEW: Performance metrics**
     optimization_call_count: u64,
     optimization_cache_hits: u64,
     total_optimization_time_us: u64,
+
+    /// Margin calculator for position sizing
+    margin_calculator: MarginCalculator,
 }
 
 impl Strategy for HjbStrategy {
@@ -355,8 +479,15 @@ impl Strategy for HjbStrategy {
         let trading_enabled_default = strategy_config.enable_online_learning; // Enable if online learning is on
         let trading_enabled = Arc::new(RwLock::new(trading_enabled_default));
 
-        info!("✅ Initialized HJB Strategy for {} | Trading: {} | Max Position: {}",
-              asset, trading_enabled_default, strategy_config.max_absolute_position_size);
+        // Initialize margin calculator
+        let margin_calculator = MarginCalculator::new(
+            strategy_config.leverage,
+            strategy_config.margin_safety_buffer,
+        );
+
+        info!("✅ Initialized HJB Strategy for {} | Trading: {} | Max Position: {} | Leverage: {}x | Margin Buffer: {:.1}%",
+              asset, trading_enabled_default, strategy_config.max_absolute_position_size,
+              strategy_config.leverage, strategy_config.margin_safety_buffer * 100.0);
 
         Self {
             config: strategy_config,
@@ -384,6 +515,7 @@ impl Strategy for HjbStrategy {
             optimization_call_count: 0,
             optimization_cache_hits: 0,
             total_optimization_time_us: 0,
+            margin_calculator,
         }
     }
 
@@ -416,8 +548,19 @@ impl Strategy for HjbStrategy {
         // Calculate optimal quotes using multi-level optimization
         let (target_bids, target_asks) = self.calculate_multi_level_targets(state);
 
-        // Reconcile with existing orders
-        self.reconcile_orders(state, target_bids, target_asks)
+        // Check if liquidation mode is active
+        let liquidation_active = self.cached_optimizer_result
+            .as_ref()
+            .map(|cached| cached.output.liquidate)
+            .unwrap_or(false);
+
+        if liquidation_active {
+            // In liquidation mode, use special liquidation order logic
+            self.place_liquidation_orders(state)
+        } else {
+            // Normal mode: reconcile with existing orders
+            self.reconcile_orders(state, target_bids, target_asks)
+        }
     }
 
     fn on_user_update(
@@ -617,21 +760,23 @@ impl HjbStrategy {
         // Check if we can use cached result
         if let Some(cached) = &self.cached_optimizer_result {
             // Cache is valid if:
-            // 1. State hasn't changed significantly (same hash)
-            // 2. Cache is recent (< 100ms old for fast markets)
+            // 1. State hasn't changed significantly (same hash with wider tolerances)
+            // 2. Cache is reasonably recent (< 1000ms = 1 second)
+            //
+            // Extended cache window reduces unnecessary re-optimizations and churn
             let cache_age_ms = (current_time - cached.timestamp) * 1000.0;
-            if cached.state_hash == state_hash && cache_age_ms < 100.0 {
+            if cached.state_hash == state_hash && cache_age_ms < 1000.0 {
                 self.optimization_cache_hits += 1;
                 debug!(
                     "[OPTIMIZER CACHE HIT] Age: {:.1}ms, Hit rate: {:.1}%",
                     cache_age_ms,
                     100.0 * self.optimization_cache_hits as f64 / self.optimization_call_count as f64
                 );
-                
+
                 // Update taker rates from cached result
                 self.latest_taker_buy_rate = cached.output.taker_buy_rate;
                 self.latest_taker_sell_rate = cached.output.taker_sell_rate;
-                
+
                 return (cached.output.target_bids.clone(), cached.output.target_asks.clone());
             }
         }
@@ -705,32 +850,45 @@ impl HjbStrategy {
     }
     
     /// Compute a hash of the current state for cache invalidation.
-    /// 
+    ///
     /// The hash includes key state variables that affect quote calculation:
-    /// - Mid price (rounded to tick)
-    /// - Inventory (rounded to 0.1)
-    /// - Volatility (rounded to 0.1 bps)
-    /// - Adverse selection (rounded to 0.1 bps)
-    /// - LOB imbalance (rounded to 0.01)
+    /// - Mid price (rounded to 1 bps to allow small moves without re-quote)
+    /// - Inventory (rounded to 1.0 full unit)
+    /// - Volatility (rounded to 1 bps)
+    /// - Adverse selection (rounded to 0.5 bps)
+    /// - LOB imbalance (rounded to 0.05 - only major shifts)
+    ///
+    /// Wider rounding tolerances reduce cache misses and unnecessary re-quotes
     fn compute_state_hash(&self, state: &CurrentState) -> u64 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
-        
+
         let mut hasher = DefaultHasher::new();
-        
+
         // Round values to avoid cache misses from tiny fluctuations
-        let mid_price_ticks = (state.l2_mid_price / 0.01).round() as i64;
-        let inventory_tenths = (state.position * 10.0).round() as i64;
-        let volatility_tenths = (self.state_vector.volatility_ema_bps * 10.0).round() as i64;
-        let adverse_selection_tenths = (self.state_vector.adverse_selection_estimate * 10.0).round() as i64;
-        let lob_imbalance_hundredths = (self.state_vector.lob_imbalance * 100.0).round() as i64;
-        
-        mid_price_ticks.hash(&mut hasher);
-        inventory_tenths.hash(&mut hasher);
-        volatility_tenths.hash(&mut hasher);
-        adverse_selection_tenths.hash(&mut hasher);
-        lob_imbalance_hundredths.hash(&mut hasher);
-        
+        // Use wider tolerances to reduce churn
+
+        // Mid price: only re-quote if moves by >1 bps (0.01%)
+        let mid_price_bps = ((state.l2_mid_price / state.l2_mid_price * 10000.0).round() / 10000.0 * 10000.0).round() as i64;
+
+        // Inventory: only re-quote if changes by >1 full unit
+        let inventory_units = state.position.round() as i64;
+
+        // Volatility: only re-quote if changes by >1 bps
+        let volatility_bps = self.state_vector.volatility_ema_bps.round() as i64;
+
+        // Adverse selection: only re-quote if changes by >0.5 bps
+        let adverse_selection_half_bps = (self.state_vector.adverse_selection_estimate * 2.0).round() as i64;
+
+        // LOB imbalance: only re-quote if major shift (>5%)
+        let lob_imbalance_5pct = (self.state_vector.lob_imbalance * 20.0).round() as i64;
+
+        mid_price_bps.hash(&mut hasher);
+        inventory_units.hash(&mut hasher);
+        volatility_bps.hash(&mut hasher);
+        adverse_selection_half_bps.hash(&mut hasher);
+        lob_imbalance_5pct.hash(&mut hasher);
+
         hasher.finish()
     }
 
@@ -743,14 +901,67 @@ impl HjbStrategy {
     ) -> Vec<StrategyAction> {
         let mut actions = Vec::new();
 
-        // Calculate tolerance for matching orders
+        // Calculate tolerance for matching orders with hysteresis to reduce churn
         let min_price_step = 10f64.powi(-(self.tick_lot_validator.max_price_decimals() as i32));
         let min_size_step = 10f64.powi(-(self.tick_lot_validator.sz_decimals as i32));
-        let price_tolerance = min_price_step * 0.5;
-        let size_tolerance = min_size_step * 0.5;
+
+        // Widen tolerances to prevent canceling orders on minor quote changes
+        // Allow up to 3 ticks of price deviation before canceling
+        let price_tolerance = min_price_step * 3.0;
+        let size_tolerance = min_size_step * 2.0;
+
+        // Time-based hysteresis: don't cancel orders younger than 500ms
+        // This prevents churn from rapid quote updates
+        let min_order_age_ms = 500u64;
+        let current_time_ms = chrono::Utc::now().timestamp_millis() as u64;
+
+        // --- STRATEGY LOGGING: TARGET QUOTES ---
+        let mid = state.l2_mid_price;
+        if !target_bids.is_empty() || !target_asks.is_empty() {
+            log::info!("═══════════════════════════════════════════════════════");
+            log::info!("📊 QUOTE RECONCILIATION (Mid: ${:.3})", mid);
+            log::info!("───────────────────────────────────────────────────────");
+
+            // Calculate and log spreads for each level
+            for (i, (bid_px, bid_sz)) in target_bids.iter().enumerate() {
+                let bid_offset_bps = ((mid - bid_px) / mid * 10000.0).abs();
+                log::info!("  L{} BID: ${:.3} | Size: {:.2} | Offset: {:.2} bps",
+                    i + 1, bid_px, bid_sz, bid_offset_bps);
+            }
+
+            for (i, (ask_px, ask_sz)) in target_asks.iter().enumerate() {
+                let ask_offset_bps = ((ask_px - mid) / mid * 10000.0).abs();
+                log::info!("  L{} ASK: ${:.3} | Size: {:.2} | Offset: {:.2} bps",
+                    i + 1, ask_px, ask_sz, ask_offset_bps);
+            }
+
+            // Log effective spreads
+            if !target_bids.is_empty() && !target_asks.is_empty() {
+                let l1_spread_bps = ((target_asks[0].0 - target_bids[0].0) / mid * 10000.0).abs();
+                log::info!("  ✅ L1 Full Spread: {:.2} bps", l1_spread_bps);
+                log::info!("  💰 Fee Cost: {:.1} bps (maker) + {:.1} bps (taker) = {:.1} bps total",
+                    self.config.maker_fee_bps, self.config.taker_fee_bps,
+                    self.config.maker_fee_bps + self.config.taker_fee_bps);
+
+                let net_margin_bps = l1_spread_bps - (self.config.maker_fee_bps + self.config.taker_fee_bps);
+                if net_margin_bps < 0.0 {
+                    log::warn!("  ⚠️  NEGATIVE MARGIN: {:.2} bps (spread too tight!)", net_margin_bps);
+                } else {
+                    log::info!("  ✅ Net Margin: {:.2} bps", net_margin_bps);
+                }
+            }
+
+            log::info!("───────────────────────────────────────────────────────");
+            log::info!("📋 EXISTING ORDERS: {} bids, {} asks",
+                state.open_bids.len(), state.open_asks.len());
+        }
 
         let mut remaining_target_bids = target_bids.clone();
         let mut remaining_target_asks = target_asks.clone();
+
+        let mut matched_bids = 0;
+        let mut canceled_bids = 0;
+        let mut kept_young_bids = 0;
 
         // Check existing bids
         for order in &state.open_bids {
@@ -762,16 +973,37 @@ impl HjbStrategy {
             if matched.is_some() {
                 // Match found, remove from targets
                 remaining_target_bids.remove(matched.unwrap());
+                matched_bids += 1;
             } else {
-                // No match, cancel this order
-                if let Some(oid) = order.oid {
-                    actions.push(StrategyAction::Cancel(ClientCancelRequest {
-                        asset: self.config.asset.clone(),
-                        oid,
-                    }));
+                // No match - check if order is old enough to cancel
+                let order_age_ms = current_time_ms.saturating_sub(order.timestamp);
+
+                if order_age_ms >= min_order_age_ms {
+                    // Order is old enough, cancel it
+                    if let Some(oid) = order.oid {
+                        actions.push(StrategyAction::Cancel(ClientCancelRequest {
+                            asset: self.config.asset.clone(),
+                            oid,
+                        }));
+                        canceled_bids += 1;
+                        log::info!("  ❌ Canceling BID OID {} @ ${:.3} (age: {}ms, no target match)",
+                            oid, order.price, order_age_ms);
+                    }
+                } else {
+                    // Order is too young, keep it even though it doesn't match
+                    // This prevents rapid cancel/replace cycles
+                    kept_young_bids += 1;
+                    debug!(
+                        "[HJB STRATEGY] Keeping young bid order OID {:?} (age: {}ms)",
+                        order.oid, order_age_ms
+                    );
                 }
             }
         }
+
+        let mut matched_asks = 0;
+        let mut canceled_asks = 0;
+        let mut kept_young_asks = 0;
 
         // Check existing asks
         for order in &state.open_asks {
@@ -783,25 +1015,107 @@ impl HjbStrategy {
             if matched.is_some() {
                 // Match found, remove from targets
                 remaining_target_asks.remove(matched.unwrap());
+                matched_asks += 1;
             } else {
-                // No match, cancel this order
-                if let Some(oid) = order.oid {
-                    actions.push(StrategyAction::Cancel(ClientCancelRequest {
-                        asset: self.config.asset.clone(),
-                        oid,
-                    }));
+                // No match - check if order is old enough to cancel
+                let order_age_ms = current_time_ms.saturating_sub(order.timestamp);
+
+                if order_age_ms >= min_order_age_ms {
+                    // Order is old enough, cancel it
+                    if let Some(oid) = order.oid {
+                        actions.push(StrategyAction::Cancel(ClientCancelRequest {
+                            asset: self.config.asset.clone(),
+                            oid,
+                        }));
+                        canceled_asks += 1;
+                        log::info!("  ❌ Canceling ASK OID {} @ ${:.3} (age: {}ms, no target match)",
+                            oid, order.price, order_age_ms);
+                    }
+                } else {
+                    // Order is too young, keep it even though it doesn't match
+                    // This prevents rapid cancel/replace cycles
+                    kept_young_asks += 1;
+                    debug!(
+                        "[HJB STRATEGY] Keeping young ask order OID {:?} (age: {}ms)",
+                        order.oid, order_age_ms
+                    );
                 }
             }
         }
 
-        // Place remaining target bids
+        log::info!("  ✅ Matched: {} bids, {} asks", matched_bids, matched_asks);
+        log::info!("  ❌ Canceled: {} bids, {} asks", canceled_bids, canceled_asks);
+        log::info!("  ⏳ Kept young: {} bids, {} asks", kept_young_bids, kept_young_asks);
+        log::info!("  🆕 To place: {} bids, {} asks", remaining_target_bids.len(), remaining_target_asks.len());
+
+        // Place remaining target bids (with margin checks)
         for (price, size) in remaining_target_bids {
+            // SAFETY CHECK: Prevent orders that would exceed max_position
+            let potential_position = state.position + size;
+            if potential_position > state.max_position_size {
+                log::warn!(
+                    "⚠️  Skipping BID order: would exceed max_position (current={:.2}, order_size={:.2}, max={:.2})",
+                    state.position, size, state.max_position_size
+                );
+                continue;
+            }
+
+            // Adjust size based on available margin
+            let adjusted_size = self.margin_calculator.adjust_order_size_for_margin(
+                size,
+                state.position,
+                state.account_equity,
+                state.margin_used,
+                state.l2_mid_price,
+                true, // is_buy
+            );
+
+            // Skip if adjusted size is too small
+            let min_size = 10f64.powi(-(self.tick_lot_validator.sz_decimals as i32));
+            if adjusted_size < min_size {
+                debug!(
+                    "[MARGIN CHECK] Skipping bid: adjusted size {:.4} < min {:.4}",
+                    adjusted_size, min_size
+                );
+                continue;
+            }
+
+            // FINAL CHECK: Ensure adjusted size also respects position limits
+            let final_position = state.position + adjusted_size;
+            if final_position > state.max_position_size {
+                let safe_size = (state.max_position_size - state.position).max(0.0);
+                if safe_size < min_size {
+                    log::warn!(
+                        "⚠️  Skipping BID order: adjusted size would exceed max_position (available={:.2})",
+                        safe_size
+                    );
+                    continue;
+                }
+                log::warn!(
+                    "⚠️  Reducing BID size from {:.2} to {:.2} to respect max_position",
+                    adjusted_size, safe_size
+                );
+                // Use the safe size instead
+                actions.push(StrategyAction::Place(ClientOrderRequest {
+                    asset: self.config.asset.clone(),
+                    is_buy: true,
+                    reduce_only: false,
+                    limit_px: price,
+                    sz: safe_size,
+                    cloid: Some(uuid::Uuid::new_v4()),
+                    order_type: ClientOrder::Limit(ClientLimit {
+                        tif: "Gtc".to_string(),
+                    }),
+                }));
+                continue;
+            }
+
             actions.push(StrategyAction::Place(ClientOrderRequest {
                 asset: self.config.asset.clone(),
                 is_buy: true,
                 reduce_only: false,
                 limit_px: price,
-                sz: size,
+                sz: adjusted_size,
                 cloid: Some(uuid::Uuid::new_v4()),
                 order_type: ClientOrder::Limit(ClientLimit {
                     tif: "Gtc".to_string(),
@@ -809,14 +1123,74 @@ impl HjbStrategy {
             }));
         }
 
-        // Place remaining target asks
+        // Place remaining target asks (with margin checks)
         for (price, size) in remaining_target_asks {
+            // SAFETY CHECK: Prevent orders that would exceed max_position (short side)
+            let potential_position = state.position - size;
+            if potential_position < -state.max_position_size {
+                log::warn!(
+                    "⚠️  Skipping ASK order: would exceed max_position (current={:.2}, order_size={:.2}, max={:.2})",
+                    state.position, size, state.max_position_size
+                );
+                continue;
+            }
+
+            // Adjust size based on available margin
+            let adjusted_size = self.margin_calculator.adjust_order_size_for_margin(
+                size,
+                state.position,
+                state.account_equity,
+                state.margin_used,
+                state.l2_mid_price,
+                false, // is_buy
+            );
+
+            // Skip if adjusted size is too small
+            let min_size = 10f64.powi(-(self.tick_lot_validator.sz_decimals as i32));
+            if adjusted_size < min_size {
+                debug!(
+                    "[MARGIN CHECK] Skipping ask: adjusted size {:.4} < min {:.4}",
+                    adjusted_size, min_size
+                );
+                continue;
+            }
+
+            // FINAL CHECK: Ensure adjusted size also respects position limits
+            let final_position = state.position - adjusted_size;
+            if final_position < -state.max_position_size {
+                let safe_size = (state.position + state.max_position_size).max(0.0);
+                if safe_size < min_size {
+                    log::warn!(
+                        "⚠️  Skipping ASK order: adjusted size would exceed max_position (available={:.2})",
+                        safe_size
+                    );
+                    continue;
+                }
+                log::warn!(
+                    "⚠️  Reducing ASK size from {:.2} to {:.2} to respect max_position",
+                    adjusted_size, safe_size
+                );
+                // Use the safe size instead
+                actions.push(StrategyAction::Place(ClientOrderRequest {
+                    asset: self.config.asset.clone(),
+                    is_buy: false,
+                    reduce_only: false,
+                    limit_px: price,
+                    sz: safe_size,
+                    cloid: Some(uuid::Uuid::new_v4()),
+                    order_type: ClientOrder::Limit(ClientLimit {
+                        tif: "Gtc".to_string(),
+                    }),
+                }));
+                continue;
+            }
+
             actions.push(StrategyAction::Place(ClientOrderRequest {
                 asset: self.config.asset.clone(),
                 is_buy: false,
                 reduce_only: false,
                 limit_px: price,
-                sz: size,
+                sz: adjusted_size,
                 cloid: Some(uuid::Uuid::new_v4()),
                 order_type: ClientOrder::Limit(ClientLimit {
                     tif: "Gtc".to_string(),
@@ -824,8 +1198,221 @@ impl HjbStrategy {
             }));
         }
 
+        // Final summary
+        let new_bids = actions.iter().filter(|a| matches!(a, StrategyAction::Place(req) if req.is_buy)).count();
+        let new_asks = actions.iter().filter(|a| matches!(a, StrategyAction::Place(req) if !req.is_buy)).count();
+        let total_cancels = actions.iter().filter(|a| matches!(a, StrategyAction::Cancel(_))).count();
+
+        log::info!("───────────────────────────────────────────────────────");
+        log::info!("📤 ACTION SUMMARY: {} total ({} cancels, {} new bids, {} new asks)",
+            actions.len(), total_cancels, new_bids, new_asks);
+        log::info!("═══════════════════════════════════════════════════════\n");
+
         debug!("[HJB STRATEGY] Reconcile: {} actions", actions.len());
         actions
+    }
+
+    /// Place liquidation orders to reduce position urgently.
+    ///
+    /// This is called when the optimizer detects extreme inventory risk.
+    /// Instead of normal market making quotes, we:
+    /// 1. Cancel ALL existing orders (both sides)
+    /// 2. Place aggressive reduction-only orders on the appropriate side
+    ///
+    /// For long positions (inventory > 0): place aggressive sell orders
+    /// For short positions (inventory < 0): place aggressive buy orders
+    fn place_liquidation_orders(
+        &self,
+        state: &CurrentState,
+    ) -> Vec<StrategyAction> {
+        let mut actions = Vec::new();
+
+        // Get taker rates from cached optimizer result
+        let (taker_buy_rate, taker_sell_rate) = self.cached_optimizer_result
+            .as_ref()
+            .map(|cached| (cached.output.taker_buy_rate, cached.output.taker_sell_rate))
+            .unwrap_or((0.0, 0.0));
+
+        // Determine which side needs liquidation
+        let inventory = state.position;
+        let is_long = inventory > 0.0;
+        let is_short = inventory < 0.0;
+
+        log::warn!(
+            "💥 EXECUTING LIQUIDATION: position={:.2}, taker_buy={:.4}, taker_sell={:.4}",
+            inventory, taker_buy_rate, taker_sell_rate
+        );
+
+        // Step 1: Cancel ALL existing orders on BOTH sides
+        // This ensures we're not adding to the position accidentally
+        for order in &state.open_bids {
+            if let Some(oid) = order.oid {
+                actions.push(StrategyAction::Cancel(ClientCancelRequest {
+                    asset: self.config.asset.clone(),
+                    oid,
+                }));
+            }
+        }
+
+        for order in &state.open_asks {
+            if let Some(oid) = order.oid {
+                actions.push(StrategyAction::Cancel(ClientCancelRequest {
+                    asset: self.config.asset.clone(),
+                    oid,
+                }));
+            }
+        }
+
+        // Step 2: Place aggressive liquidation orders on the reduction side
+        if is_long && taker_sell_rate > 0.0 {
+            // TOO LONG: Need to sell aggressively
+            // Place sell orders at multiple levels to increase fill probability
+            self.place_aggressive_sell_orders(state, taker_sell_rate, &mut actions);
+        } else if is_short && taker_buy_rate > 0.0 {
+            // TOO SHORT: Need to buy aggressively
+            self.place_aggressive_buy_orders(state, taker_buy_rate, &mut actions);
+        } else {
+            log::warn!(
+                "⚠️  Liquidation triggered but no taker rate available (buy={:.4}, sell={:.4})",
+                taker_buy_rate, taker_sell_rate
+            );
+        }
+
+        log::info!("💥 Liquidation actions: {} total ({} cancels, {} new orders)",
+            actions.len(),
+            actions.iter().filter(|a| matches!(a, StrategyAction::Cancel(_))).count(),
+            actions.iter().filter(|a| matches!(a, StrategyAction::Place(_))).count()
+        );
+
+        actions
+    }
+
+    /// Place aggressive sell orders to reduce long position.
+    ///
+    /// Strategy: Place multiple sell orders at increasingly aggressive prices
+    /// to maximize fill probability while maintaining some price discipline.
+    fn place_aggressive_sell_orders(
+        &self,
+        state: &CurrentState,
+        total_size: f64,
+        actions: &mut Vec<StrategyAction>,
+    ) {
+        // Get current best bid (we want to sell at or near this price)
+        let best_bid = state.order_book
+            .as_ref()
+            .and_then(|book| book.best_bid())
+            .unwrap_or(state.l2_mid_price * 0.999);
+
+        // Use a 3-level approach for aggressive liquidation:
+        // Level 1: 50% at best bid (most aggressive, highest fill probability)
+        // Level 2: 30% at best bid + 1 tick (slightly less aggressive)
+        // Level 3: 20% at best bid + 2 ticks (fallback)
+
+        let min_price_step = 10f64.powi(-(self.tick_lot_validator.max_price_decimals() as i32));
+        let min_size_step = 10f64.powi(-(self.tick_lot_validator.sz_decimals as i32));
+
+        let levels = vec![
+            (best_bid, 0.50), // 50% at best bid
+            (best_bid + min_price_step, 0.30), // 30% at +1 tick
+            (best_bid + min_price_step * 2.0, 0.20), // 20% at +2 ticks
+        ];
+
+        for (price, size_fraction) in levels {
+            let size = (total_size * size_fraction).max(min_size_step);
+
+            // Adjust size based on available margin
+            let adjusted_size = self.margin_calculator.adjust_order_size_for_margin(
+                size,
+                state.position,
+                state.account_equity,
+                state.margin_used,
+                state.l2_mid_price,
+                false, // is_buy = false (selling)
+            );
+
+            if adjusted_size >= min_size_step {
+                log::info!(
+                    "   📤 Liquidation SELL: {:.4} @ {:.2} (reduce_only)",
+                    adjusted_size, price
+                );
+
+                actions.push(StrategyAction::Place(ClientOrderRequest {
+                    asset: self.config.asset.clone(),
+                    is_buy: false,
+                    reduce_only: true, // CRITICAL: prevent accidental short
+                    limit_px: price,
+                    sz: adjusted_size,
+                    cloid: Some(uuid::Uuid::new_v4()),
+                    order_type: ClientOrder::Limit(ClientLimit {
+                        tif: "Ioc".to_string(), // Immediate-or-cancel for urgency
+                    }),
+                }));
+            }
+        }
+    }
+
+    /// Place aggressive buy orders to reduce short position.
+    ///
+    /// Strategy: Place multiple buy orders at increasingly aggressive prices
+    /// to maximize fill probability while maintaining some price discipline.
+    fn place_aggressive_buy_orders(
+        &self,
+        state: &CurrentState,
+        total_size: f64,
+        actions: &mut Vec<StrategyAction>,
+    ) {
+        // Get current best ask (we want to buy at or near this price)
+        let best_ask = state.order_book
+            .as_ref()
+            .and_then(|book| book.best_ask())
+            .unwrap_or(state.l2_mid_price * 1.001);
+
+        // Use a 3-level approach for aggressive liquidation:
+        // Level 1: 50% at best ask (most aggressive, highest fill probability)
+        // Level 2: 30% at best ask - 1 tick (slightly less aggressive)
+        // Level 3: 20% at best ask - 2 ticks (fallback)
+
+        let min_price_step = 10f64.powi(-(self.tick_lot_validator.max_price_decimals() as i32));
+        let min_size_step = 10f64.powi(-(self.tick_lot_validator.sz_decimals as i32));
+
+        let levels = vec![
+            (best_ask, 0.50), // 50% at best ask
+            (best_ask - min_price_step, 0.30), // 30% at -1 tick
+            (best_ask - min_price_step * 2.0, 0.20), // 20% at -2 ticks
+        ];
+
+        for (price, size_fraction) in levels {
+            let size = (total_size * size_fraction).max(min_size_step);
+
+            // Adjust size based on available margin
+            let adjusted_size = self.margin_calculator.adjust_order_size_for_margin(
+                size,
+                state.position,
+                state.account_equity,
+                state.margin_used,
+                state.l2_mid_price,
+                true, // is_buy = true
+            );
+
+            if adjusted_size >= min_size_step {
+                log::info!(
+                    "   📥 Liquidation BUY: {:.4} @ {:.2} (reduce_only)",
+                    adjusted_size, price
+                );
+
+                actions.push(StrategyAction::Place(ClientOrderRequest {
+                    asset: self.config.asset.clone(),
+                    is_buy: true,
+                    reduce_only: true, // CRITICAL: prevent accidental long increase
+                    limit_px: price,
+                    sz: adjusted_size,
+                    cloid: Some(uuid::Uuid::new_v4()),
+                    order_type: ClientOrder::Limit(ClientLimit {
+                        tif: "Ioc".to_string(), // Immediate-or-cancel for urgency
+                    }),
+                }));
+            }
+        }
     }
 
     /// Update uncertainty estimates from particle filter statistics.

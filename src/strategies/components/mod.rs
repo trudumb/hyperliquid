@@ -51,6 +51,7 @@ pub mod online_sgd_as;
 pub mod hjb_multi_level_optimizer;
 pub mod inventory_skew_impl;
 pub mod robust_control_impl;
+pub mod order_churn_manager;
 
 // Order book analysis (supporting utilities)
 pub mod book_analyzer;
@@ -70,6 +71,7 @@ pub use online_sgd_as::OnlineSgdAsModel;
 pub use hjb_multi_level_optimizer::{HjbMultiLevelOptimizer, OptimizerOutput};
 pub use inventory_skew_impl::{StandardInventorySkew, InventorySkewConfig, InventorySkewCalculator};
 pub use robust_control_impl::{StandardRobustControl, RobustConfig};
+pub use order_churn_manager::{OrderChurnManager, OrderChurnConfig, OrderMetadata, MarketChurnState};
 
 // Re-export book analyzer types
 pub use book_analyzer::{BookAnalysis, OrderBook};

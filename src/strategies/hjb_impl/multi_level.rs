@@ -131,6 +131,11 @@ pub struct MultiLevelConfig {
 
     /// Inventory urgency threshold (start using taker orders)
     pub inventory_urgency_threshold: f64,
+
+    /// Volatility to spread conversion factor (multiplier for volatility_bps -> spread_bps)
+    /// Typical range: 0.005 - 0.02
+    /// Example: 0.01 means 1000 bps volatility -> 10 bps half-spread
+    pub volatility_to_spread_factor: f64,
 }
 
 impl Default for MultiLevelConfig {
@@ -145,6 +150,7 @@ impl Default for MultiLevelConfig {
             momentum_threshold: 1.3,
             momentum_tightening_bps: 1.0,
             inventory_urgency_threshold: 0.8,
+            volatility_to_spread_factor: 0.01,  // Conservative default: 1% of volatility becomes spread
         }
     }
 }
