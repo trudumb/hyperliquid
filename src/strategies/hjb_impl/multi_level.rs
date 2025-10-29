@@ -1,14 +1,29 @@
-//! Multi-Level Market Making Optimization
+//! Multi-Level Market Making Optimization (Alpha-Aware)
 //!
-//! This module implements multi-level quoting optimization combined with
-//! robust control and dynamic level count optimization.
+//! This module implements multi-level quoting optimization with proactive
+//! alpha-aware inventory management that considers both position and predicted
+//! price direction.
 //!
 //! Key Features:
 //! - Multi-level quote optimization
+//! - **Alpha-Aware Aggression**: Proactively adjusts quotes based on inventory × price prediction
 //! - Robust control with parameter uncertainty
 //! - Dynamic level count optimization
 //! - Kelly-inspired size allocation
 //! - Momentum-based quote tightening
+//!
+//! # Alpha-Aware Innovation
+//!
+//! Traditional market makers ask: "What is my inventory?" and skew to revert to zero.
+//! Alpha-aware market makers ask: "What is my inventory AND which way is price going?"
+//!
+//! Examples:
+//! - SHORT + RISING: Panic cover (dramatically widen bids to get filled)
+//! - LONG + RISING: Let winner run (widen asks to hold position)
+//! - FLAT + RISING: Build long (tighten bids, widen asks)
+//! - LONG + FALLING: Panic exit (dramatically widen asks to get filled)
+//! - SHORT + FALLING: Let winner run (widen bids to hold position)
+//! - FLAT + FALLING: Build short (tighten asks, widen bids)
 
 use serde::{Deserialize, Serialize};
 use super::super::ConstrainedTuningParams;
@@ -261,41 +276,143 @@ impl MultiLevelOptimizer {
         }
     }
 
-    /// Calculate aggression factors for each side
+    /// Calculate aggression factors for each side (ALPHA-AWARE)
+    ///
+    /// This function implements proactive quoting by considering both:
+    /// 1. Current inventory position (where are we?)
+    /// 2. Predicted price direction via adverse_selection_bps (where is price going?)
+    ///
+    /// Key insight: Don't just mean-revert. Ask "Should I fight this position or let it run?"
     fn calculate_aggression(
         &self,
         adverse_selection_bps: f64,
         inventory_ratio: f64,
         tuning_params: &ConstrainedTuningParams,
     ) -> (f64, f64) {
-        // Signal-driven aggression using tunable parameters
-        let signal_bid_aggression = adverse_selection_bps.max(0.0)
-            * tuning_params.adverse_selection_adjustment_factor
-            * tuning_params.adverse_selection_spread_scale;
-        let signal_ask_aggression = (-adverse_selection_bps).max(0.0)
-            * tuning_params.adverse_selection_adjustment_factor
-            * tuning_params.adverse_selection_spread_scale;
+        // Classify market regime
+        let price_rising = adverse_selection_bps > 0.5;   // Positive AS = upward price pressure
+        let price_falling = adverse_selection_bps < -0.5; // Negative AS = downward price pressure
+        let price_neutral = !price_rising && !price_falling;
 
-        // Inventory-driven aggression (need to reduce position)
-        // Use tunable skew_adjustment_factor to control inventory response
-        let inv_bid_aggression = if inventory_ratio < -0.3 {
-            // Short, want to buy back
-            (inventory_ratio.abs() - 0.3) * 5.0 * tuning_params.skew_adjustment_factor
-        } else {
-            0.0
-        };
+        // Classify inventory position
+        let is_long = inventory_ratio > 0.1;    // More than 10% long
+        let is_short = inventory_ratio < -0.1;  // More than 10% short
+        let is_flat = !is_long && !is_short;   // Near zero
 
-        let inv_ask_aggression = if inventory_ratio > 0.3 {
-            // Long, want to sell
-            (inventory_ratio - 0.3) * 5.0 * tuning_params.skew_adjustment_factor
-        } else {
-            0.0
-        };
+        // --- ALPHA-AWARE LOGIC: Position × Prediction ---
 
-        // Combine: signal when inventory low, inventory when high
-        let weight = 1.0 - inventory_ratio.abs();
-        let bid_aggression = signal_bid_aggression * weight + inv_bid_aggression;
-        let ask_aggression = signal_ask_aggression * weight + inv_ask_aggression;
+        let mut bid_aggression = 0.0;
+        let mut ask_aggression = 0.0;
+        let mut decision_reason = String::new();
+
+        // ========================================================================
+        // SCENARIO 1: SHORT + PRICE RISING (Worst case - need to cover URGENTLY)
+        // ========================================================================
+        if is_short && price_rising {
+            // We're short and price is moving against us → PANIC BUY
+            // Dramatically increase bid aggression to get filled before price runs away
+            let urgency = inventory_ratio.abs() * adverse_selection_bps.abs();
+            bid_aggression = 3.0 * urgency * tuning_params.skew_adjustment_factor;
+            ask_aggression = -2.0; // Pull asks even further away (don't add to short!)
+            decision_reason = format!(
+                "🚨 SHORT + RISING: Panic cover (inv={:.2}, AS={:.2}bps)",
+                inventory_ratio, adverse_selection_bps
+            );
+
+        // ========================================================================
+        // SCENARIO 2: LONG + PRICE RISING (Best case - let winner run!)
+        // ========================================================================
+        } else if is_long && price_rising {
+            // We're long and price is moving with us → LET IT RUN
+            // Decrease ask aggression (widen asks) to hold profitable position longer
+            bid_aggression = -1.5; // Pull bids back slightly (we already have what we want)
+            let confidence = inventory_ratio * (adverse_selection_bps / 2.0);
+            ask_aggression = -2.0 * confidence; // Negative = widen spread (don't sell cheap!)
+            decision_reason = format!(
+                "🚀 LONG + RISING: Let winner run (inv={:.2}, AS={:.2}bps)",
+                inventory_ratio, adverse_selection_bps
+            );
+
+        // ========================================================================
+        // SCENARIO 3: FLAT + PRICE RISING (Opportunity - build long position)
+        // ========================================================================
+        } else if is_flat && price_rising {
+            // We're neutral and price is rising → PROACTIVELY GET LONG
+            // Increase bid aggression to catch momentum, decrease ask aggression to avoid getting short
+            bid_aggression = 1.5 * adverse_selection_bps.abs() * tuning_params.skew_adjustment_factor;
+            ask_aggression = -1.0; // Widen asks to avoid getting short
+            decision_reason = format!(
+                "📈 FLAT + RISING: Build long (AS={:.2}bps)",
+                adverse_selection_bps
+            );
+
+        // ========================================================================
+        // SCENARIO 4: LONG + PRICE FALLING (Worst case - need to exit URGENTLY)
+        // ========================================================================
+        } else if is_long && price_falling {
+            // We're long and price is moving against us → PANIC SELL
+            // Dramatically increase ask aggression to get filled before price drops more
+            let urgency = inventory_ratio * adverse_selection_bps.abs();
+            ask_aggression = 3.0 * urgency * tuning_params.skew_adjustment_factor;
+            bid_aggression = -2.0; // Pull bids further away (don't add to long!)
+            decision_reason = format!(
+                "🚨 LONG + FALLING: Panic exit (inv={:.2}, AS={:.2}bps)",
+                inventory_ratio, adverse_selection_bps
+            );
+
+        // ========================================================================
+        // SCENARIO 5: SHORT + PRICE FALLING (Best case - let winner run!)
+        // ========================================================================
+        } else if is_short && price_falling {
+            // We're short and price is moving with us → LET IT RUN
+            // Decrease bid aggression (widen bids) to hold profitable short position
+            ask_aggression = -1.5; // Pull asks back slightly (we already have what we want)
+            let confidence = inventory_ratio.abs() * (adverse_selection_bps.abs() / 2.0);
+            bid_aggression = -2.0 * confidence; // Negative = widen spread (don't cover cheap!)
+            decision_reason = format!(
+                "🚀 SHORT + FALLING: Let winner run (inv={:.2}, AS={:.2}bps)",
+                inventory_ratio, adverse_selection_bps
+            );
+
+        // ========================================================================
+        // SCENARIO 6: FLAT + PRICE FALLING (Opportunity - build short position)
+        // ========================================================================
+        } else if is_flat && price_falling {
+            // We're neutral and price is falling → PROACTIVELY GET SHORT
+            // Increase ask aggression to catch momentum, decrease bid aggression to avoid getting long
+            ask_aggression = 1.5 * adverse_selection_bps.abs() * tuning_params.skew_adjustment_factor;
+            bid_aggression = -1.0; // Widen bids to avoid getting long
+            decision_reason = format!(
+                "📉 FLAT + FALLING: Build short (AS={:.2}bps)",
+                adverse_selection_bps
+            );
+
+        // ========================================================================
+        // SCENARIO 7: NEUTRAL MARKET (No strong signal)
+        // ========================================================================
+        } else if price_neutral {
+            // No strong directional signal → Use traditional inventory mean reversion
+            // But still slightly bias based on weak signals
+            if inventory_ratio > 0.3 {
+                // Moderately long → gently skew to sell
+                ask_aggression = (inventory_ratio - 0.3) * 3.0 * tuning_params.skew_adjustment_factor;
+            } else if inventory_ratio < -0.3 {
+                // Moderately short → gently skew to buy
+                bid_aggression = (inventory_ratio.abs() - 0.3) * 3.0 * tuning_params.skew_adjustment_factor;
+            }
+            decision_reason = format!(
+                "⚖️  NEUTRAL: Mean revert (inv={:.2}, AS={:.2}bps)",
+                inventory_ratio, adverse_selection_bps
+            );
+        }
+
+        // Log decision logic (helpful for understanding bot behavior)
+        if self.config.max_levels > 0 { // Only log if optimizer is active
+            log::debug!(
+                "[ALPHA-AWARE AGGRESSION] {} → bid_agg={:.2}, ask_agg={:.2}",
+                decision_reason, bid_aggression, ask_aggression
+            );
+        }
 
         (bid_aggression, ask_aggression)
     }
