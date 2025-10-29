@@ -559,16 +559,25 @@ impl ParticleFilterState {
     }
 
     /// Estimate volatility in basis points (weighted mean)
+    /// Returns INSTANTANEOUS volatility (per sqrt(second)), not annualized
     pub fn estimate_volatility_bps(&self) -> f64 {
         let weighted_mean_log_vol: f64 = self.particles.iter()
             .map(|p| p.log_vol * p.weight)
             .sum();
-        
+
+        // Get annualized volatility from particle filter state
         let volatility_annualized = weighted_mean_log_vol.exp().sqrt();
-        volatility_annualized * 10000.0
+
+        // Convert to instantaneous volatility (per sqrt(second))
+        // DO NOT ANNUALIZE for high-frequency quoting
+        let volatility_instantaneous = volatility_annualized / SECONDS_PER_YEAR.sqrt();
+
+        // Convert to basis points
+        volatility_instantaneous * 10000.0
     }
 
     /// Get standard deviation of current volatility estimate in BPS
+    /// Returns INSTANTANEOUS volatility uncertainty (per sqrt(second)), not annualized
     pub fn get_volatility_std_dev_bps(&self) -> f64 {
         let h_particles: Vec<f64> = self.particles.iter()
             .map(|p| p.log_vol)
@@ -584,11 +593,14 @@ impl ParticleFilterState {
             .sum::<f64>() / (h_particles.len() - 1) as f64;
         let h_std = h_variance.sqrt();
 
-        // Delta method approximation
+        // Delta method approximation (annualized)
         let sigma_mean_approx = (h_mean / 2.0).exp();
         let sigma_std_approx = (0.5 * sigma_mean_approx) * h_std;
 
-        sigma_std_approx * 10000.0
+        // Convert to instantaneous volatility uncertainty
+        let sigma_std_instantaneous = sigma_std_approx / SECONDS_PER_YEAR.sqrt();
+
+        sigma_std_instantaneous * 10000.0
     }
 
     /// Get parameter estimates (weighted means)
@@ -630,10 +642,16 @@ impl ParticleFilterState {
     }
 
     /// Get percentile estimate for volatility (for confidence intervals)
+    /// Returns INSTANTANEOUS volatility (per sqrt(second)), not annualized
     pub fn estimate_volatility_percentile_bps(&self, percentile: f64) -> f64 {
         let mut weighted_samples: Vec<(f64, f64)> = self.particles.iter()
             .map(|p| {
-                let vol_bps = p.log_vol.exp().sqrt() * 10000.0;
+                // Get annualized volatility
+                let vol_annualized = p.log_vol.exp().sqrt();
+                // Convert to instantaneous volatility
+                let vol_instantaneous = vol_annualized / SECONDS_PER_YEAR.sqrt();
+                // Convert to BPS
+                let vol_bps = vol_instantaneous * 10000.0;
                 (vol_bps, p.weight)
             })
             .collect();
