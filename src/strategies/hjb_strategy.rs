@@ -1176,6 +1176,18 @@ impl HjbStrategy {
                     "⚠️  Reducing BID size from {:.2} to {:.2} to respect max_position",
                     adjusted_size, safe_size
                 );
+
+                // ✅ ROBUST FIX: Ensure our bid is NOT a taker order (spread-crossing check)
+                if let Some(best_ask) = state.order_book.as_ref().and_then(|b| b.best_ask()) {
+                    if price >= best_ask {
+                        log::warn!(
+                            "⚠️  Skipping BID order: Price {:.3} would cross spread (best ask: {:.3})",
+                            price, best_ask
+                        );
+                        continue; // Do not place this order
+                    }
+                }
+
                 // Use the safe size instead
                 actions.push(StrategyAction::Place(ClientOrderRequest {
                     asset: self.config.asset.clone(),
@@ -1189,6 +1201,17 @@ impl HjbStrategy {
                     }),
                 }));
                 continue;
+            }
+
+            // ✅ ROBUST FIX: Ensure our bid is NOT a taker order (spread-crossing check)
+            if let Some(best_ask) = state.order_book.as_ref().and_then(|b| b.best_ask()) {
+                if price >= best_ask {
+                    log::warn!(
+                        "⚠️  Skipping BID order: Price {:.3} would cross spread (best ask: {:.3})",
+                        price, best_ask
+                    );
+                    continue; // Do not place this order
+                }
             }
 
             actions.push(StrategyAction::Place(ClientOrderRequest {
@@ -1251,6 +1274,18 @@ impl HjbStrategy {
                     "⚠️  Reducing ASK size from {:.2} to {:.2} to respect max_position",
                     adjusted_size, safe_size
                 );
+
+                // ✅ ROBUST FIX: Ensure our ask is NOT a taker order (spread-crossing check)
+                if let Some(best_bid) = state.order_book.as_ref().and_then(|b| b.best_bid()) {
+                    if price <= best_bid {
+                        log::warn!(
+                            "⚠️  Skipping ASK order: Price {:.3} would cross spread (best bid: {:.3})",
+                            price, best_bid
+                        );
+                        continue; // Do not place this order
+                    }
+                }
+
                 // Use the safe size instead
                 actions.push(StrategyAction::Place(ClientOrderRequest {
                     asset: self.config.asset.clone(),
@@ -1264,6 +1299,17 @@ impl HjbStrategy {
                     }),
                 }));
                 continue;
+            }
+
+            // ✅ ROBUST FIX: Ensure our ask is NOT a taker order (spread-crossing check)
+            if let Some(best_bid) = state.order_book.as_ref().and_then(|b| b.best_bid()) {
+                if price <= best_bid {
+                    log::warn!(
+                        "⚠️  Skipping ASK order: Price {:.3} would cross spread (best bid: {:.3})",
+                        price, best_bid
+                    );
+                    continue; // Do not place this order
+                }
             }
 
             actions.push(StrategyAction::Place(ClientOrderRequest {
