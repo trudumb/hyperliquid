@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
+use tracing::{debug, error, info};
 
 use crate::{
     exchange::{
@@ -171,6 +172,8 @@ impl ParallelOrderExecutor {
     ) -> BatchExecutionResult {
         let start_time = std::time::Instant::now();
 
+        debug!("[ParallelOrderExecutor] Executing {} actions", actions.len());
+
         // Separate actions by type for intelligent batching
         let mut places = Vec::new();
         let mut cancels = Vec::new();
@@ -192,12 +195,16 @@ impl ParallelOrderExecutor {
 
         let total_actions = places.len() + cancels.len() + cancels_by_cloid.len() + modifies.len();
 
+        info!("[ParallelOrderExecutor] Batched actions: {} places, {} cancels, {} cancels_by_cloid, {} modifies",
+            places.len(), cancels.len(), cancels_by_cloid.len(), modifies.len());
+
         // Execute batches in parallel
         let mut handles = Vec::new();
 
         // Batch place orders
         if !places.is_empty() {
             let batch_length = places.len();
+            info!("[ParallelOrderExecutor] Spawning PLACE batch task for {} orders", batch_length);
             let permit = self.semaphore.clone().acquire_owned().await.ok();
             let exchange = self.exchange.clone();
             let rate_limiter = self.rate_limiter.clone();
@@ -205,8 +212,10 @@ impl ParallelOrderExecutor {
 
             handles.push(tokio::spawn(async move {
                 // Acquire rate limit capacity for this batch
+                debug!("[ParallelOrderExecutor] Acquiring rate limit for {} places", batch_length);
                 rate_limiter.acquire(RequestWeight::Exchange { batch_length }, 0).await;
 
+                debug!("[ParallelOrderExecutor] Sending bulk_order request for {} places", batch_length);
                 let result = timeout(
                     Duration::from_millis(timeout_ms),
                     exchange.bulk_order(places, None),
@@ -216,9 +225,18 @@ impl ParallelOrderExecutor {
                 drop(permit); // Release semaphore permit
 
                 match result {
-                    Ok(Ok(response)) => Ok(response),
-                    Ok(Err(e)) => Err(e),
-                    Err(_) => Err(Error::GenericRequest("Request timeout".to_string())),
+                    Ok(Ok(response)) => {
+                        info!("[ParallelOrderExecutor] PLACE batch succeeded for {} orders", batch_length);
+                        Ok(response)
+                    }
+                    Ok(Err(e)) => {
+                        error!("[ParallelOrderExecutor] PLACE batch failed: {:?}", e);
+                        Err(e)
+                    }
+                    Err(_) => {
+                        error!("[ParallelOrderExecutor] PLACE batch timed out after {}ms", timeout_ms);
+                        Err(Error::GenericRequest("Request timeout".to_string()))
+                    }
                 }
             }));
         }

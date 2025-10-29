@@ -545,8 +545,11 @@ impl Strategy for HjbStrategy {
         state: &CurrentState,
         update: &MarketUpdate,
     ) -> Vec<StrategyAction> {
+        debug!("[HJB STRATEGY {}] on_market_update called", self.config.asset);
+
         // Check if trading is enabled
         if !self.trading_enabled {
+            debug!("[HJB STRATEGY {}] Trading disabled, returning NoOp", self.config.asset);
             return vec![StrategyAction::NoOp];
         }
 
@@ -555,19 +558,29 @@ impl Strategy for HjbStrategy {
 
         // Handle different types of market updates
         if let Some(ref l2_book) = update.l2_book {
+            debug!("[HJB STRATEGY {}] Processing L2 book update", self.config.asset);
             self.handle_l2_book_update(state, l2_book);
         }
 
         if !update.trades.is_empty() {
+            debug!("[HJB STRATEGY {}] Processing {} trades", self.config.asset, update.trades.len());
             self.handle_trades_update(state, &update.trades);
         }
 
         if update.mid_price.is_some() {
+            debug!("[HJB STRATEGY {}] Processing mid price update: ${:.3}",
+                self.config.asset, update.mid_price.unwrap());
             self.handle_mid_price_update(state, update.mid_price.unwrap());
         }
 
+        debug!("[HJB STRATEGY {}] Calculating multi-level targets (mid=${:.3}, pos={:.2})",
+            self.config.asset, state.l2_mid_price, state.position);
+
         // Calculate optimal quotes using multi-level optimization
         let (target_bids, target_asks) = self.calculate_multi_level_targets(state);
+
+        debug!("[HJB STRATEGY {}] Target quotes: {} bids, {} asks",
+            self.config.asset, target_bids.len(), target_asks.len());
 
         // Check if liquidation mode is active
         let liquidation_active = self.cached_optimizer_result
@@ -576,6 +589,7 @@ impl Strategy for HjbStrategy {
             .unwrap_or(false);
 
         if liquidation_active {
+            warn!("[HJB STRATEGY {}] 🚨 LIQUIDATION MODE ACTIVE", self.config.asset);
             // In liquidation mode, use special liquidation order logic
             self.place_liquidation_orders(state)
         } else {
@@ -600,13 +614,18 @@ impl Strategy for HjbStrategy {
     }
 
     fn on_tick(&mut self, state: &CurrentState) -> Vec<StrategyAction> {
+        debug!("[HJB STRATEGY {}] on_tick called", self.config.asset);
+
         // Check if trading is enabled
         if !self.trading_enabled {
+            debug!("[HJB STRATEGY {}] Trading disabled on tick", self.config.asset);
             return vec![StrategyAction::NoOp];
         }
 
         // Only place orders if we have a valid mid price
         if state.l2_mid_price <= 0.0 {
+            warn!("[HJB STRATEGY {}] Invalid mid price on tick: ${:.3}",
+                self.config.asset, state.l2_mid_price);
             return vec![StrategyAction::NoOp];
         }
 
@@ -616,17 +635,26 @@ impl Strategy for HjbStrategy {
         // If we have no open orders and a valid mid price, generate initial quotes
         let has_orders = !state.open_bids.is_empty() || !state.open_asks.is_empty();
 
+        debug!("[HJB STRATEGY {}] Tick state: mid=${:.3}, pos={:.2}, has_orders={}, bids={}, asks={}",
+            self.config.asset, state.l2_mid_price, state.position, has_orders,
+            state.open_bids.len(), state.open_asks.len());
+
         if !has_orders {
-            info!("[HJB STRATEGY] Placing initial orders on tick (mid: ${:.3})", state.l2_mid_price);
+            info!("[HJB STRATEGY {}] No open orders, placing initial orders (mid: ${:.3})",
+                self.config.asset, state.l2_mid_price);
 
             // Calculate optimal quotes
             let (target_bids, target_asks) = self.calculate_multi_level_targets(state);
+
+            info!("[HJB STRATEGY {}] Generated {} target bids, {} target asks",
+                self.config.asset, target_bids.len(), target_asks.len());
 
             // Generate orders for all target levels
             return self.reconcile_orders(state, target_bids, target_asks);
         }
 
         // Periodic cleanup and updates for existing orders
+        debug!("[HJB STRATEGY {}] Has orders, no action on tick", self.config.asset);
         vec![StrategyAction::NoOp]
     }
 
@@ -846,6 +874,10 @@ impl HjbStrategy {
 
         // USE MICROPRICE-BASED ADVERSE SELECTION (more stable than SGD model)
         let microprice_as_bps = self.microprice_as_model.get_adverse_selection_bps();
+
+        debug!("[OPTIMIZER INPUTS {}] vol={:.2}bps, vol_unc={:.2}bps, as={:.2}bps, lob_imb={:.3}, pos={:.2}",
+            self.config.asset, volatility_bps_pf, vol_uncertainty_bps_pf,
+            microprice_as_bps, self.state_vector.lob_imbalance, state.position);
 
         // Prepare optimizer inputs USING PARTICLE FILTER ESTIMATES AND MICROPRICE AS
         let inputs = OptimizerInputs {
