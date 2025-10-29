@@ -84,10 +84,9 @@ let strategy: Box<dyn Strategy> = match config.strategy_name.as_str() {
 use alloy::signers::local::PrivateKeySigner;
 use hyperliquid_rust_sdk::{
     AssetType, BaseUrl,
-    CurrentState, ExchangeClient, InfoClient, MarketUpdate, Message,
-    OrderBook, OrderState, OrderStateManager, OrderUpdate, OrderUpdateResult,
-    RestingOrder, Strategy, StrategyAction, Subscription, TickLotValidator,
-    TradeInfo, UserData, UserUpdate,
+    CurrentState, ExchangeClient, InfoClient, MarketUpdate, Message, OrderBook, OrderState,
+    OrderStateManager, OrderUpdate, OrderUpdateResult, RestingOrder, Strategy, StrategyAction,
+    Subscription, TickLotValidator, TradeInfo, UserData, UserUpdate,
     // New imports for optimized execution
     ParallelOrderExecutor, ExecutorConfig,
     ExchangeResponseStatus, ExchangeDataStatus, ExecutorAction,
@@ -214,14 +213,36 @@ impl BotRunner {
         // Get max position size from strategy
         let max_position_size = strategy.get_max_position_size();
 
+        // Initialize position from account state (not historical fills!)
+        let (position, avg_entry_price, cost_basis, unrealized_pnl) =
+            if let Some(asset_position) = user_state.asset_positions.iter().find(|ap| ap.position.coin == asset) {
+                let pos_data = &asset_position.position;
+                let szi = pos_data.szi.parse::<f64>().unwrap_or(0.0);
+                let entry_px = pos_data.entry_px.as_ref()
+                    .and_then(|p| p.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                let unrealized = pos_data.unrealized_pnl.parse::<f64>().unwrap_or(0.0);
+
+                // Calculate cost basis from position and entry price
+                let cost = szi.abs() * entry_px;
+
+                info!("📊 Found existing position for {}: {} units @ ${:.2}", asset, szi, entry_px);
+                info!("   Unrealized PnL: ${:.2}", unrealized);
+
+                (szi, entry_px, cost, unrealized)
+            } else {
+                info!("📊 No existing position found for {}", asset);
+                (0.0, 0.0, 0.0, 0.0)
+            };
+
         // Initialize current state
         let current_state = CurrentState {
-            position: 0.0,
-            avg_entry_price: 0.0,
-            cost_basis: 0.0,
-            unrealized_pnl: 0.0,
-            realized_pnl: 0.0,
-            total_fees: 0.0,
+            position,
+            avg_entry_price,
+            cost_basis,
+            unrealized_pnl,
+            realized_pnl: 0.0,  // Session realized PnL starts at 0
+            total_fees: 0.0,    // Session fees start at 0
             l2_mid_price: 0.0,
             order_book: None,
             market_spread_bps: 0.0,
@@ -255,7 +276,7 @@ impl BotRunner {
     }
 
     /// Start the bot runner event loop
-    async fn run(&mut self, mut shutdown_rx: tokio::sync::oneshot::Receiver<()>) -> Result<(), Box<dyn std::error::Error>> {
+    async fn run(&mut self, shutdown_rx: tokio::sync::oneshot::Receiver<()>) -> Result<(), Box<dyn std::error::Error>> {
         info!("🚀 Starting bot runner event loop...");
 
         // Set up websocket subscriptions
@@ -334,31 +355,81 @@ impl BotRunner {
         let mut tick_timer = tokio::time::interval(tokio::time::Duration::from_secs(1));
         tick_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // Periodic REST reconciliation timer (10 second interval)
+        // This captures manually-placed orders or orders from other systems
+        let mut reconciliation_timer = tokio::time::interval(tokio::time::Duration::from_secs(10));
+        reconciliation_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Shutdown timeout (will be created when shutdown starts)
+        let mut shutdown_timeout: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+
+        // Wrap shutdown_rx in Option so we can take it once and stop polling it
+        let mut shutdown_rx = Some(shutdown_rx);
+
         // Main event loop
         loop {
             tokio::select! {
                 biased;  // Prioritize shutdown signal over other branches
 
-                // Check for shutdown signal
-                _ = &mut shutdown_rx => {
+                // Check for shutdown signal (only if not yet received)
+                _ = async { shutdown_rx.as_mut().unwrap().await }, if shutdown_rx.is_some() => {
                     info!("🛑 Shutdown signal received by main loop");
+                    // Take the receiver to prevent polling it again
+                    shutdown_rx.take();
                     // Set the flag FIRST
                     self.is_shutting_down.store(true, Ordering::Relaxed);
-                    // Then handle shutdown actions
+                    // Then handle shutdown actions (sends cancellations with retry logic)
                     self.handle_shutdown().await;
+                    // Set a timeout to allow final WebSocket confirmations to arrive
+                    // Note: handle_shutdown() already waits and retries, so this is just a final grace period
+                    shutdown_timeout = Some(Box::pin(tokio::time::sleep(tokio::time::Duration::from_millis(500))));
+                    info!("⏳ Continuing to process WebSocket messages for final confirmations...");
+                }
+
+                // Check for shutdown timeout
+                _ = async { shutdown_timeout.as_mut().unwrap().await }, if shutdown_timeout.is_some() => {
+                    let remaining_bids = self.current_state.open_bids.len();
+                    let remaining_asks = self.current_state.open_asks.len();
+
+                    if remaining_bids > 0 || remaining_asks > 0 {
+                        warn!("⚠️ Final grace period expired with {} bids and {} asks in local state",
+                              remaining_bids, remaining_asks);
+                        warn!("   (Note: Orders may have been canceled on exchange - local state might be stale)");
+                    } else {
+                        info!("✅ All orders cleared from local state");
+                    }
+
+                    info!("🛑 Exiting main loop");
                     break;
                 }
 
                 // Handle WebSocket messages
                 message = receiver.recv_async() => {
-                    // Check flag BEFORE processing
-                    if self.is_shutting_down.load(Ordering::Relaxed) {
-                        warn!("Ignoring WS message during shutdown.");
-                        continue;
-                    }
                     match message {
                         Ok(message) => {
-                            self.handle_message(message).await;
+                            // Process OrderUpdates even during shutdown to update state
+                            // Other message types can be optionally filtered
+                            let is_shutting_down = self.is_shutting_down.load(Ordering::Relaxed);
+                            let is_order_update = matches!(message, Message::OrderUpdates(_));
+                            let should_process = !is_shutting_down || is_order_update;
+
+                            if should_process {
+                                self.handle_message(message).await;
+
+                                // During shutdown, check if all orders are cleared after each OrderUpdate
+                                if is_shutting_down && shutdown_timeout.is_some() && is_order_update {
+                                    let remaining_bids = self.current_state.open_bids.len();
+                                    let remaining_asks = self.current_state.open_asks.len();
+
+                                    if remaining_bids == 0 && remaining_asks == 0 {
+                                        info!("✅ All orders cleared from state - exiting early");
+                                        break;
+                                    }
+                                }
+                            } else {
+                                // Ignore non-critical messages during shutdown
+                                debug!("Ignoring non-OrderUpdate message during shutdown");
+                            }
                         }
                         Err(_) => {
                             error!("WebSocket channel closed");
@@ -375,6 +446,16 @@ impl BotRunner {
                         continue;
                     }
                     self.handle_tick().await;
+                }
+
+                // Handle periodic REST reconciliation (captures external orders)
+                _ = reconciliation_timer.tick() => {
+                    // Skip during shutdown
+                    if self.is_shutting_down.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    debug!("Running periodic REST reconciliation...");
+                    self.reconcile_with_rest().await;
                 }
             }
         }
@@ -418,21 +499,15 @@ impl BotRunner {
                 let is_snapshot = fills_data.is_snapshot.unwrap_or(false);
 
                 if is_snapshot {
-                    // Process snapshot ONCE to initialize position state
+                    // Skip snapshot processing - position already initialized from account state
                     if !self.snapshot_received {
-                        info!("📸 Initializing from snapshot: {} historical fills", fills_data.fills.len());
+                        info!("📸 Received snapshot with {} historical fills (skipping - position already initialized from account state)", fills_data.fills.len());
 
-                        // Process all historical fills to reconstruct current position
+                        // Track fill IDs to prevent duplicate processing from UserEvents
                         for fill in &fills_data.fills {
-                            self.process_fill(fill);
-                            // Track that we processed this fill
                             let fill_id = self.get_fill_id(fill);
                             self.processed_fill_ids.insert(fill_id);
                         }
-
-                        info!("✅ Position initialized: {} units @ avg price ${:.2}",
-                              self.current_state.position,
-                              self.current_state.avg_entry_price);
 
                         self.snapshot_received = true;
                     }
@@ -555,11 +630,25 @@ impl BotRunner {
                             .cloned()
                             .collect();
 
-                        let filled_level = self.order_state_mgr.get_order_level(oid, &all_orders);
+                        let mut filled_level = self.order_state_mgr.get_order_level(oid, &all_orders);
 
-                        // Log warning if not found
+                        // If order not found, trigger immediate REST reconciliation
                         if filled_level.is_none() {
-                            warn!("Fill received for unknown or too-old OID: {}. Cannot determine level.", oid);
+                            warn!("Fill received for unknown or too-old OID: {}. Triggering immediate REST reconciliation...", oid);
+                            self.reconcile_with_rest().await;
+
+                            // Try to get level again after reconciliation
+                            let all_orders: Vec<RestingOrder> = self.current_state.open_bids.iter()
+                                .chain(self.current_state.open_asks.iter())
+                                .cloned()
+                                .collect();
+                            filled_level = self.order_state_mgr.get_order_level(oid, &all_orders);
+
+                            if filled_level.is_some() {
+                                info!("✅ Successfully recovered level {} for OID {} after reconciliation", filled_level.unwrap(), oid);
+                            } else {
+                                warn!("⚠️ Could not determine level for OID {} even after reconciliation", oid);
+                            }
                         } else {
                             debug!("Determined level {} for fill OID {}", filled_level.unwrap_or(999), oid);
                         }
@@ -991,19 +1080,105 @@ impl BotRunner {
         self.current_state.open_asks.retain(|o| o.oid != Some(oid));
     }
 
+    /// Reconcile bot's tracked orders with actual open orders from REST API
+    /// This captures manually-placed orders or orders from other systems
+    async fn reconcile_with_rest(&mut self) {
+        let info_client = match self.info_client.as_ref() {
+            Some(client) => client,
+            None => {
+                error!("Cannot reconcile: info_client not available");
+                return;
+            }
+        };
+
+        // Fetch all open orders from REST API
+        let open_orders_result = info_client.open_orders(self.user_address).await;
+        let open_orders = match open_orders_result {
+            Ok(orders) => orders,
+            Err(e) => {
+                error!("Failed to fetch open orders for reconciliation: {:?}", e);
+                return;
+            }
+        };
+
+        // Filter orders for our asset
+        let our_asset_orders: Vec<_> = open_orders.into_iter()
+            .filter(|o| o.coin == self.asset)
+            .collect();
+
+        debug!("REST reconciliation: found {} open orders for {}", our_asset_orders.len(), self.asset);
+
+        // Build set of currently tracked OIDs
+        let tracked_oids: std::collections::HashSet<u64> = self.current_state.open_bids.iter()
+            .chain(self.current_state.open_asks.iter())
+            .filter_map(|o| o.oid)
+            .collect();
+
+        let mut imported_count = 0;
+
+        // Check each REST order
+        for rest_order in our_asset_orders {
+            let oid = rest_order.oid;
+
+            // Skip if we already track this order
+            if tracked_oids.contains(&oid) {
+                continue;
+            }
+
+            // This is an external order - import it
+            let price = rest_order.limit_px.parse::<f64>().unwrap_or(0.0);
+            let size = rest_order.sz.parse::<f64>().unwrap_or(0.0);
+            let is_buy = rest_order.side == "B";
+            let level = self.calculate_order_level(price, is_buy);
+            let cloid: Option<uuid::Uuid> = rest_order.cloid.as_deref().and_then(|s| s.parse().ok());
+
+            let external_order = RestingOrder {
+                oid: Some(oid),
+                cloid,
+                size,
+                orig_size: size, // We don't have orig_size from REST, use current size
+                price,
+                is_buy,
+                level,
+                state: OrderState::Active,
+                timestamp: rest_order.timestamp,
+            };
+
+            // Import into OrderStateManager cache
+            if self.order_state_mgr.import_external_order(oid, external_order.clone()) {
+                // Also add to current state so we track it going forward
+                self.add_order_to_current_state(external_order);
+                imported_count += 1;
+            }
+        }
+
+        if imported_count > 0 {
+            info!("REST reconciliation: imported {} external orders", imported_count);
+        } else {
+            debug!("REST reconciliation: no new external orders found");
+        }
+    }
+
     // NOTE: execute_place_order and execute_cancel_order methods removed
     // All order execution now handled by ParallelOrderExecutor via execute_actions()
 
-    /// Handle shutdown
+    /// Handle shutdown with retry logic for order cancellation
     async fn handle_shutdown(&mut self) {
         info!("🛑 Shutting down bot runner...");
 
-        // Call strategy shutdown hook
-        let actions = self.strategy.on_shutdown(&self.current_state);
+        const MAX_RETRIES: usize = 3;
+        const RETRY_DELAY_MS: u64 = 500;
 
-        // Execute final actions using the executor (await directly, don't spawn)
-        if !actions.is_empty() {
-            info!("Executing {} shutdown actions...", actions.len());
+        for attempt in 1..=MAX_RETRIES {
+            // Call strategy shutdown hook (generates actions based on current state)
+            let actions = self.strategy.on_shutdown(&self.current_state);
+
+            if actions.is_empty() {
+                info!("No shutdown actions required (attempt {}/{})", attempt, MAX_RETRIES);
+                break;
+            }
+
+            info!("Executing {} shutdown actions (attempt {}/{})...", actions.len(), attempt, MAX_RETRIES);
 
             // Convert strategy actions to executor actions and filter out NoOp
             let executor_actions: Vec<ExecutorAction> = actions
@@ -1020,9 +1195,82 @@ impl BotRunner {
             if !executor_actions.is_empty() {
                 let result = self.order_executor.execute_actions_parallel(executor_actions).await;
                 info!("Shutdown actions complete: {} successful, {} failed.", result.successful, result.failed);
+
+                // Log individual failures for debugging
+                if result.failed > 0 {
+                    warn!("Some shutdown actions failed - will retry if orders remain");
+                    for (idx, response) in result.responses.iter().enumerate() {
+                        if let Err(e) = response {
+                            error!("Shutdown action {} failed: {:?}", idx, e);
+                        }
+                    }
+                }
             }
-        } else {
-            info!("No shutdown actions required by strategy.");
+
+            // Verify orders were canceled using REST API (more reliable than WebSocket state)
+            if let Some(info_client) = self.info_client.as_ref() {
+                // Small delay to allow exchange to process cancellations
+                tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+
+                match info_client.open_orders(self.user_address).await {
+                    Ok(open_orders) => {
+                        let remaining_orders: Vec<_> = open_orders
+                            .into_iter()
+                            .filter(|o| o.coin == self.asset)
+                            .collect();
+
+                        if remaining_orders.is_empty() {
+                            info!("✅ REST API confirms all orders canceled");
+                            break;
+                        } else {
+                            warn!("⚠️ REST API shows {} orders still open after attempt {}/{}",
+                                  remaining_orders.len(), attempt, MAX_RETRIES);
+
+                            // Update local state with REST data for next retry
+                            self.current_state.open_bids.clear();
+                            self.current_state.open_asks.clear();
+
+                            for rest_order in remaining_orders {
+                                let price = rest_order.limit_px.parse::<f64>().unwrap_or(0.0);
+                                let size = rest_order.sz.parse::<f64>().unwrap_or(0.0);
+                                let is_buy = rest_order.side == "B";
+                                let level = self.calculate_order_level(price, is_buy);
+                                let cloid: Option<uuid::Uuid> = rest_order.cloid.as_deref().and_then(|s| s.parse().ok());
+
+                                let order = RestingOrder {
+                                    oid: Some(rest_order.oid),
+                                    cloid,
+                                    size,
+                                    orig_size: size,
+                                    price,
+                                    is_buy,
+                                    level,
+                                    state: OrderState::Active,
+                                    timestamp: rest_order.timestamp,
+                                };
+
+                                if is_buy {
+                                    self.current_state.open_bids.push(order);
+                                } else {
+                                    self.current_state.open_asks.push(order);
+                                }
+                            }
+
+                            if attempt < MAX_RETRIES {
+                                info!("Retrying cancellations for remaining orders...");
+                                continue;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to verify order cancellations via REST: {:?}", e);
+                        break;
+                    }
+                }
+            } else {
+                warn!("Cannot verify order cancellations - info_client not available");
+                break;
+            }
         }
 
         info!("✅ Bot runner shutdown procedures complete");

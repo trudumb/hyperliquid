@@ -370,6 +370,41 @@ impl OrderStateManager {
     pub fn get_cloid(&self, oid: u64) -> Option<Cloid> {
         self.oid_to_cloid.get(&oid).copied()
     }
+
+    /// Import an external order (not placed by bot) into the tracking system
+    /// This is used for orders placed manually or by other systems
+    /// Returns true if the order was successfully imported
+    pub fn import_external_order(&mut self, oid: u64, order: RestingOrder) -> bool {
+        let current_timestamp = chrono::Utc::now().timestamp_millis() as u64;
+
+        // Check if we already know about this order
+        if self.oid_to_cloid.contains_key(&oid) {
+            debug!("Order OID {} already tracked, skipping import", oid);
+            return false;
+        }
+
+        // Add to cache with Active state (or current state if already specified)
+        let mut imported_order = order;
+        imported_order.oid = Some(oid);
+        if imported_order.timestamp == 0 {
+            imported_order.timestamp = current_timestamp;
+        }
+
+        // Store the level before moving imported_order
+        let level = imported_order.level;
+
+        // Note: We don't add to cloid_to_oid mappings since external orders may not have our CLOIDs
+        // If the order has a CLOID, add mapping
+        if let Some(cloid) = imported_order.cloid {
+            self.cloid_to_oid.insert(cloid, oid);
+            self.oid_to_cloid.insert(oid, cloid);
+        }
+
+        self.recently_completed_orders.insert(oid, imported_order);
+
+        info!("Imported external order OID {} into cache (Level: {})", oid, level);
+        true
+    }
 }
 
 impl Default for OrderStateManager {

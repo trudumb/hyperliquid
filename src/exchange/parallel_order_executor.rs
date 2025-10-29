@@ -7,8 +7,8 @@ use tokio::time::timeout;
 
 use crate::{
     exchange::{
-        ClientCancelRequest, ClientModifyRequest, ClientOrderRequest, ExchangeClient,
-        ExchangeResponseStatus,
+        ClientCancelRequest, ClientCancelRequestCloid, ClientModifyRequest, ClientOrderRequest,
+        ExchangeClient, ExchangeResponseStatus,
     },
     prelude::*,
     rate_limiter::{RateLimitConfig, RateLimiter, RequestWeight},
@@ -24,10 +24,14 @@ pub enum StrategyAction {
     Place(ClientOrderRequest),
     /// Place multiple orders in a batch
     BatchPlace(Vec<ClientOrderRequest>),
-    /// Cancel a single order
+    /// Cancel a single order by OID
     Cancel(ClientCancelRequest),
-    /// Cancel multiple orders in a batch
+    /// Cancel multiple orders by OID in a batch
     BatchCancel(Vec<ClientCancelRequest>),
+    /// Cancel a single order by CLOID (more reliable)
+    CancelByCloid(ClientCancelRequestCloid),
+    /// Cancel multiple orders by CLOID in a batch (more reliable)
+    BatchCancelByCloid(Vec<ClientCancelRequestCloid>),
     /// Modify a single order
     Modify(ClientModifyRequest),
     /// Modify multiple orders in a batch
@@ -170,6 +174,7 @@ impl ParallelOrderExecutor {
         // Separate actions by type for intelligent batching
         let mut places = Vec::new();
         let mut cancels = Vec::new();
+        let mut cancels_by_cloid = Vec::new();
         let mut modifies = Vec::new();
 
         for action in actions {
@@ -178,12 +183,14 @@ impl ParallelOrderExecutor {
                 StrategyAction::BatchPlace(orders) => places.extend(orders),
                 StrategyAction::Cancel(cancel) => cancels.push(cancel),
                 StrategyAction::BatchCancel(cancels_batch) => cancels.extend(cancels_batch),
+                StrategyAction::CancelByCloid(cancel) => cancels_by_cloid.push(cancel),
+                StrategyAction::BatchCancelByCloid(cancels_batch) => cancels_by_cloid.extend(cancels_batch),
                 StrategyAction::Modify(modify) => modifies.push(modify),
                 StrategyAction::BatchModify(modifies_batch) => modifies.extend(modifies_batch),
             }
         }
 
-        let total_actions = places.len() + cancels.len() + modifies.len();
+        let total_actions = places.len() + cancels.len() + cancels_by_cloid.len() + modifies.len();
 
         // Execute batches in parallel
         let mut handles = Vec::new();
@@ -216,7 +223,7 @@ impl ParallelOrderExecutor {
             }));
         }
 
-        // Batch cancel orders
+        // Batch cancel orders (by OID)
         if !cancels.is_empty() {
             let batch_length = cancels.len();
             let permit = self.semaphore.clone().acquire_owned().await.ok();
@@ -231,6 +238,34 @@ impl ParallelOrderExecutor {
                 let result = timeout(
                     Duration::from_millis(timeout_ms),
                     exchange.bulk_cancel(cancels, None),
+                )
+                .await;
+
+                drop(permit);
+
+                match result {
+                    Ok(Ok(response)) => Ok(response),
+                    Ok(Err(e)) => Err(e),
+                    Err(_) => Err(Error::GenericRequest("Request timeout".to_string())),
+                }
+            }));
+        }
+
+        // Batch cancel orders (by CLOID - more reliable)
+        if !cancels_by_cloid.is_empty() {
+            let batch_length = cancels_by_cloid.len();
+            let permit = self.semaphore.clone().acquire_owned().await.ok();
+            let exchange = self.exchange.clone();
+            let rate_limiter = self.rate_limiter.clone();
+            let timeout_ms = self.config.request_timeout_ms;
+
+            handles.push(tokio::spawn(async move {
+                // Acquire rate limit capacity for this batch
+                rate_limiter.acquire(RequestWeight::Exchange { batch_length }, 0).await;
+
+                let result = timeout(
+                    Duration::from_millis(timeout_ms),
+                    exchange.bulk_cancel_by_cloid(cancels_by_cloid, None),
                 )
                 .await;
 
@@ -350,6 +385,16 @@ impl ParallelOrderExecutor {
             }
             StrategyAction::BatchCancel(cancels) => {
                 timeout(timeout_duration, self.exchange.bulk_cancel(cancels, None))
+                    .await
+                    .map_err(|_| Error::GenericRequest("Request timeout".to_string()))?
+            }
+            StrategyAction::CancelByCloid(cancel) => {
+                timeout(timeout_duration, self.exchange.cancel_by_cloid(cancel, None))
+                    .await
+                    .map_err(|_| Error::GenericRequest("Request timeout".to_string()))?
+            }
+            StrategyAction::BatchCancelByCloid(cancels) => {
+                timeout(timeout_duration, self.exchange.bulk_cancel_by_cloid(cancels, None))
                     .await
                     .map_err(|_| Error::GenericRequest("Request timeout".to_string()))?
             }

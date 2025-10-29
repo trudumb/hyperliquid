@@ -15,7 +15,7 @@ pub struct CancelRequest {
     pub oid: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ClientCancelRequestCloid {
     pub asset: String,
     pub cloid: Uuid,
