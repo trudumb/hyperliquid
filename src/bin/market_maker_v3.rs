@@ -1227,7 +1227,8 @@ impl StrategyRunnerActor {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- 1. Initialization ---
     let file_appender = tracing_appender::rolling::never("./", "market_maker_v3.log");
-    let (non_blocking_writer, _guard) = tracing_appender::non_blocking(file_appender);
+    // Keep the guard alive for the entire program lifetime to maintain the logging worker thread
+    let (non_blocking_writer, _log_guard) = tracing_appender::non_blocking(file_appender);
     let file_layer = fmt::layer().json().with_writer(non_blocking_writer);
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,hyperliquid_rust_sdk::bin::market_maker_v3=debug"));
