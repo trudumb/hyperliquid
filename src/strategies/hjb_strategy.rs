@@ -54,6 +54,7 @@ use crate::strategies::components::{RobustConfig, InventorySkewConfig};
 use crate::strategies::components::{
     HjbMultiLevelOptimizer, OptimizerInputs, OptimizerOutput,
     OrderChurnManager, OrderChurnConfig, OrderMetadata, MarketChurnState,
+    MicropriceAsModel,
 };
 
 // ----------------------------------------------------------------------------
@@ -506,8 +507,11 @@ pub struct HjbStrategy {
     /// Particle filter for stochastic volatility estimation
     particle_filter: Arc<RwLock<ParticleFilterState>>,
 
-    /// Online adverse selection learning model
+    /// Online adverse selection learning model (SGD-based)
     online_adverse_selection_model: Arc<RwLock<OnlineAdverseSelectionModel>>,
+
+    /// Microprice-based adverse selection model (more stable)
+    microprice_as_model: MicropriceAsModel,
 
     /// Cached volatility estimate (updated periodically by background task)
     cached_volatility: Arc<RwLock<CachedVolatilityEstimate>>,
@@ -695,6 +699,7 @@ impl Strategy for HjbStrategy {
             hawkes_model,
             particle_filter,
             online_adverse_selection_model,
+            microprice_as_model: MicropriceAsModel::with_params(0.15, 8.0),  // Smoother, capped at 8bps
             cached_volatility,
             robust_config,
             current_uncertainty,
@@ -900,6 +905,9 @@ impl HjbStrategy {
                 self.state_vector.market_spread_bps =
                     ((analysis.weighted_ask_price - analysis.weighted_bid_price) / analysis.weighted_bid_price) * 10000.0;
             }
+
+            // Update microprice-based adverse selection model (no trades yet, will be updated in handle_trades_update)
+            self.microprice_as_model.update(Some(&book), &[]);
         }
     }
 
@@ -908,6 +916,9 @@ impl HjbStrategy {
         let constrained_params = self.tuning_params.read().get_constrained();
         let trades_vec = trades.to_vec();
         self.state_vector.update_trade_flow_ema(&trades_vec, &constrained_params);
+
+        // Update microprice model with trade flow (no order book here, just trades)
+        self.microprice_as_model.update(None, trades);
     }
 
     /// Handle mid-price updates
@@ -1024,12 +1035,15 @@ impl HjbStrategy {
         let vol_uncertainty_bps_pf = cached_vol.volatility_std_dev_bps; // Get PF uncertainty
         drop(cached_vol);
 
-        // Prepare optimizer inputs USING PARTICLE FILTER ESTIMATES
+        // USE MICROPRICE-BASED ADVERSE SELECTION (more stable than SGD model)
+        let microprice_as_bps = self.microprice_as_model.get_adverse_selection_bps();
+
+        // Prepare optimizer inputs USING PARTICLE FILTER ESTIMATES AND MICROPRICE AS
         let inputs = OptimizerInputs {
             current_time_sec: current_time,
             volatility_bps: volatility_bps_pf, // USE PF ESTIMATE HERE
             vol_uncertainty_bps: vol_uncertainty_bps_pf, // USE PF UNCERTAINTY HERE
-            adverse_selection_bps: self.state_vector.adverse_selection_estimate, // Keep AS from state_vector
+            adverse_selection_bps: microprice_as_bps, // USE MICROPRICE AS (more stable)
             lob_imbalance: self.state_vector.lob_imbalance, // Keep LOB from state_vector
         };
 
