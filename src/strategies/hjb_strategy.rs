@@ -37,6 +37,7 @@
 use std::sync::Arc;
 use parking_lot::RwLock;
 use log::{debug, info, warn};
+use rand::Rng;
 
 use serde_json::Value;
 
@@ -52,6 +53,7 @@ use crate::strategies::components::{RobustConfig, InventorySkewConfig};
 // Import the component-based architecture
 use crate::strategies::components::{
     HjbMultiLevelOptimizer, OptimizerInputs, OptimizerOutput,
+    OrderChurnManager, OrderChurnConfig, OrderMetadata, MarketChurnState,
 };
 
 // ----------------------------------------------------------------------------
@@ -124,6 +126,12 @@ pub struct HjbStrategyConfig {
     /// Margin safety buffer (0.0-1.0)
     /// Reserves this fraction of available margin (e.g., 0.2 = 20% buffer)
     pub margin_safety_buffer: f64,
+
+    /// Order churn management configuration
+    pub order_churn_config: Option<OrderChurnConfig>,
+
+    /// SPSA online learning configuration
+    pub spsa_config: SpsaConfig,
 }
 
 impl HjbStrategyConfig {
@@ -162,6 +170,16 @@ impl HjbStrategyConfig {
             serde_json::from_value(v.clone()).ok()
         });
 
+        // Load order churn config
+        let order_churn_config = params.get("order_churn_config").and_then(|v| {
+            serde_json::from_value(v.clone()).ok()
+        });
+
+        // Load SPSA config
+        let spsa_config = params.get("spsa_config")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
         Self {
             asset: asset.to_string(),
             asset_type: AssetType::Perp,  // Default to Perp (can be configured via separate field if needed)
@@ -192,6 +210,8 @@ impl HjbStrategyConfig {
             margin_safety_buffer: params.get("margin_safety_buffer")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.2),
+            order_churn_config,
+            spsa_config,
         }
     }
 }
@@ -298,6 +318,147 @@ impl MarginCalculator {
 }
 
 // ============================================================================
+// SPSA Online Learning - State Management
+// ============================================================================
+
+/// State for the asynchronous SPSA learning cycle
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LearningState {
+    /// Not currently learning, trading on baseline parameters.
+    Idle,
+    /// Trading on positively perturbed parameters to gather loss.
+    WaitingOnPerturbPlus { start_time: f64 },
+    /// Trading on negatively perturbed parameters to gather loss.
+    WaitingOnPerturbMinus { start_time: f64 },
+}
+
+/// Configuration for the SPSA (Simultaneous Perturbation Stochastic Approximation) optimizer.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SpsaConfig {
+    /// Learning rate gain (Adam optimizer's rate is separate).
+    pub a: f64,
+    /// Perturbation size gain.
+    pub c: f64,
+    /// Gain decay exponent.
+    pub alpha: f64,
+    /// Perturbation decay exponent.
+    pub gamma: f64,
+    /// Stability constant for 'a'.
+    pub capital_a: f64,
+    /// How long (in seconds) to run each perturbation to gather loss.
+    pub eval_duration_sec: f64,
+    /// How long (in seconds) to wait between starting learning cycles.
+    pub cycle_interval_sec: f64,
+}
+
+impl Default for SpsaConfig {
+    fn default() -> Self {
+        Self {
+            a: 0.1,         // Start with a modest learning rate
+            c: 0.01,        // Start with 1% perturbation
+            alpha: 0.602,   // Standard SPSA values
+            gamma: 0.101,   // Standard SPSA values
+            capital_a: 100.0, // Stabilizer
+            eval_duration_sec: 15.0, // Gather 15s of data per step
+            cycle_interval_sec: 60.0, // Run a full cycle every minute
+        }
+    }
+}
+
+/// SPSA internal state for gradient estimation
+#[derive(Debug, Clone)]
+struct SpsaState {
+    /// The current optimization step number.
+    k: u64,
+    /// SPSA gain parameters.
+    config: SpsaConfig,
+    /// The last random perturbation vector (delta).
+    last_delta: Vec<f64>,
+    /// The gain `c_k` for the current step.
+    last_c_k: f64,
+}
+
+impl SpsaState {
+    fn new(config: SpsaConfig) -> Self {
+        Self {
+            k: 0,
+            config,
+            last_delta: vec![0.0; 8],
+            last_c_k: 0.0,
+        }
+    }
+
+    /// Generate the next perturbation step
+    fn generate_step(&mut self) -> (Vec<f64>, f64) {
+        self.k += 1;
+        let k_f = self.k as f64;
+
+        // SPSA gain sequences
+        let _a_k = self.config.a / (k_f + 1.0 + self.config.capital_a).powf(self.config.alpha);
+        let c_k = self.config.c / (k_f + 1.0).powf(self.config.gamma);
+
+        // Generate a random perturbation vector (delta)
+        // Uses a Bernoulli distribution (+/- 1), which is robust.
+        let mut rng = rand::thread_rng();
+        let delta_vec: Vec<f64> = (0..8).map(|_| {
+            if rng.gen_bool(0.5) { 1.0 } else { -1.0 }
+        }).collect();
+
+        self.last_delta = delta_vec.clone();
+        self.last_c_k = c_k;
+
+        (delta_vec, c_k)
+    }
+}
+
+/// Tracks P&L and inventory risk for loss computation
+#[derive(Debug, Clone)]
+struct LossTracker {
+    /// Sum of all PnL changes during the window.
+    realized_pnl: f64,
+    /// Sum of (phi * inventory^2 * dt) over the window.
+    integrated_inventory_risk: f64,
+    /// The time the window started.
+    start_time: f64,
+    /// Last time inventory risk was updated.
+    last_update_time: f64,
+}
+
+impl LossTracker {
+    fn new(start_time: f64) -> Self {
+        Self {
+            realized_pnl: 0.0,
+            integrated_inventory_risk: 0.0,
+            start_time,
+            last_update_time: start_time,
+        }
+    }
+
+    /// Update risk based on holding inventory over time.
+    /// Call this from on_tick().
+    fn update_inventory_risk(&mut self, current_inventory: f64, phi: f64, current_time: f64) {
+        let dt = (current_time - self.last_update_time).max(0.0);
+        if dt > 0.0 {
+            // Quadratic penalty on inventory, integrated over time
+            let risk_cost = phi * current_inventory.powi(2) * dt;
+            self.integrated_inventory_risk += risk_cost;
+            self.last_update_time = current_time;
+        }
+    }
+
+    /// Record PnL from a fill. Call this from handle_fills().
+    fn record_fill_pnl(&mut self, pnl: f64) {
+        self.realized_pnl += pnl;
+    }
+
+    /// Calculate the final loss for the window.
+    /// Our objective is to MAXIMIZE (PnL - Risk), so we MINIMIZE (Risk - PnL).
+    fn compute_loss(&self) -> f64 {
+        self.integrated_inventory_risk - self.realized_pnl
+    }
+}
+
+// ============================================================================
 // Cached Optimizer Result
 // ============================================================================
 
@@ -388,6 +549,31 @@ pub struct HjbStrategy {
 
     /// Margin calculator for position sizing
     margin_calculator: MarginCalculator,
+
+    /// Intelligent order churn manager
+    order_churn_manager: OrderChurnManager,
+
+    // --- SPSA Online Learning Fields ---
+    /// SPSA internal state (step counter, perturbation history)
+    spsa_state: SpsaState,
+
+    /// The current state of the learning cycle (Idle, PerturbPlus, etc.)
+    learning_state: LearningState,
+
+    /// The baseline (un-perturbed) parameters we are optimizing.
+    baseline_params: Arc<RwLock<TuningParams>>,
+
+    /// Loss accumulated during the positive perturbation.
+    loss_plus: f64,
+
+    /// Loss accumulated during the negative perturbation.
+    loss_minus: f64,
+
+    /// Accumulates loss during an evaluation window.
+    loss_tracker: LossTracker,
+
+    /// The time the last learning cycle was started.
+    last_cycle_start_time: f64,
 }
 
 impl Strategy for HjbStrategy {
@@ -485,6 +671,16 @@ impl Strategy for HjbStrategy {
             strategy_config.margin_safety_buffer,
         );
 
+        // Initialize order churn manager
+        let order_churn_config = strategy_config.order_churn_config.clone()
+            .unwrap_or_else(|| OrderChurnConfig::default());
+        let order_churn_manager = OrderChurnManager::new(order_churn_config);
+
+        // Initialize SPSA online learning state
+        let spsa_state = SpsaState::new(strategy_config.spsa_config.clone());
+        let current_time = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let baseline_params = tuning_params.clone(); // Baseline starts as the live set
+
         info!("✅ Initialized HJB Strategy for {} | Trading: {} | Max Position: {} | Leverage: {}x | Margin Buffer: {:.1}%",
               asset, trading_enabled_default, strategy_config.max_absolute_position_size,
               strategy_config.leverage, strategy_config.margin_safety_buffer * 100.0);
@@ -516,6 +712,14 @@ impl Strategy for HjbStrategy {
             optimization_cache_hits: 0,
             total_optimization_time_us: 0,
             margin_calculator,
+            order_churn_manager,
+            spsa_state,
+            learning_state: LearningState::Idle,
+            baseline_params,
+            loss_plus: 0.0,
+            loss_minus: 0.0,
+            loss_tracker: LossTracker::new(current_time),
+            last_cycle_start_time: 0.0,
         }
     }
 
@@ -579,6 +783,10 @@ impl Strategy for HjbStrategy {
     }
 
     fn on_tick(&mut self, _state: &CurrentState) -> Vec<StrategyAction> {
+        // Drive the SPSA learning cycle state machine
+        let current_time = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        self.run_learning_cycle(current_time);
+
         // Periodic cleanup and updates
         // Could implement:
         // - Stale order cleanup
@@ -718,9 +926,10 @@ impl HjbStrategy {
         self.update_uncertainty_estimates();
     }
 
-    /// Handle fills (update Hawkes model)
+    /// Handle fills (update Hawkes model and order churn manager)
     fn handle_fills(&mut self, _state: &CurrentState, fills: &[(TradeInfo, Option<usize>)]) {
         let current_time = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let current_time_ms = (current_time * 1000.0) as u64;
 
         let mut hawkes = self.hawkes_model.write();
         for (fill, filled_level) in fills {
@@ -741,7 +950,34 @@ impl HjbStrategy {
 
             hawkes.record_fill(level, is_bid_fill, current_time);
 
+            // Record fill in order churn manager for fill rate tracking
+            // Note: We don't have the exact placement_time_ms from the fill event,
+            // so we'll use an estimate based on typical order lifetime
+            // A better approach would be to store placement times when placing orders
+            let estimated_placement_time_ms = current_time_ms.saturating_sub(2000); // Assume 2s average lifetime
+            self.order_churn_manager.record_fill(
+                level,
+                is_bid_fill,
+                estimated_placement_time_ms,
+                current_time_ms,
+            );
+
+            // Record PnL for SPSA loss tracker
+            // Calculate realized PnL vs. mid-price *at time of fill*
+            if let (Ok(fill_price), Ok(fill_size)) = (fill.px.parse::<f64>(), fill.sz.parse::<f64>()) {
+                let pnl = if is_bid_fill {
+                    // We bought. PnL is (mid_price - fill_price) * size
+                    (_state.l2_mid_price - fill_price) * fill_size
+                } else {
+                    // We sold. PnL is (fill_price - mid_price) * size
+                    (fill_price - _state.l2_mid_price) * fill_size
+                };
+                self.loss_tracker.record_fill_pnl(pnl);
+                debug!("SPSA loss tracker: PnL={:.4}", pnl);
+            }
+
             debug!("Hawkes model updated: level={}, is_bid={}, time={:.2}", level, is_bid_fill, current_time);
+            debug!("Churn manager fill recorded: level={}, is_bid={}", level, is_bid_fill);
         }
     }
 
@@ -894,7 +1130,7 @@ impl HjbStrategy {
 
     /// Reconcile existing orders with target quotes
     fn reconcile_orders(
-        &self,
+        &mut self,
         state: &CurrentState,
         target_bids: Vec<(f64, f64)>,
         target_asks: Vec<(f64, f64)>,
@@ -910,13 +1146,23 @@ impl HjbStrategy {
         let price_tolerance = min_price_step * 3.0;
         let size_tolerance = min_size_step * 2.0;
 
-        // Time-based hysteresis: don't cancel orders younger than 500ms
-        // This prevents churn from rapid quote updates
-        let min_order_age_ms = 500u64;
+        // Get current timestamp for order age calculations
         let current_time_ms = chrono::Utc::now().timestamp_millis() as u64;
 
-        // --- STRATEGY LOGGING: TARGET QUOTES ---
+        // Create market state for intelligent churn decisions
         let mid = state.l2_mid_price;
+        let market_churn_state = MarketChurnState {
+            current_time_ms,
+            mid_price: mid,
+            volatility_bps: self.state_vector.volatility_ema_bps,
+            adverse_selection_bps: self.state_vector.adverse_selection_estimate,
+            lob_imbalance: self.state_vector.lob_imbalance,
+            best_bid: state.order_book.as_ref().and_then(|b| b.best_bid()),
+            best_ask: state.order_book.as_ref().and_then(|b| b.best_ask()),
+            queue_depth_ahead: None, // Can add queue tracking later
+        };
+
+        // --- STRATEGY LOGGING: TARGET QUOTES ---
         if !target_bids.is_empty() || !target_asks.is_empty() {
             log::info!("═══════════════════════════════════════════════════════");
             log::info!("📊 QUOTE RECONCILIATION (Mid: ${:.3})", mid);
@@ -964,38 +1210,58 @@ impl HjbStrategy {
         let mut kept_young_bids = 0;
 
         // Check existing bids
-        for order in &state.open_bids {
-            let matched = remaining_target_bids.iter().position(|(p, s)| {
+        for (i, order) in state.open_bids.iter().enumerate() {
+            let matched = remaining_target_bids.iter().enumerate().position(|(_, (p, s))| {
                 (p - order.price).abs() <= price_tolerance &&
                 (s - order.size).abs() <= size_tolerance
             });
 
-            if matched.is_some() {
+            if let Some(target_idx) = matched {
                 // Match found, remove from targets
-                remaining_target_bids.remove(matched.unwrap());
+                remaining_target_bids.remove(target_idx);
                 matched_bids += 1;
             } else {
-                // No match - check if order is old enough to cancel
-                let order_age_ms = current_time_ms.saturating_sub(order.timestamp);
+                // No match - use intelligent churn logic
+                let order_meta = OrderMetadata {
+                    oid: order.oid.unwrap_or(0),
+                    price: order.price,
+                    size: order.size,
+                    is_buy: true,
+                    level: i, // Assuming orders are sorted by level
+                    placement_time_ms: order.timestamp,
+                    target_price: target_bids.get(i).map(|(p, _)| *p).unwrap_or(order.price),
+                    initial_queue_size_ahead: None,
+                };
 
-                if order_age_ms >= min_order_age_ms {
-                    // Order is old enough, cancel it
+                let (should_refresh, reason) = self.order_churn_manager.should_refresh_order(
+                    &order_meta,
+                    &market_churn_state,
+                );
+
+                if should_refresh {
                     if let Some(oid) = order.oid {
                         actions.push(StrategyAction::Cancel(ClientCancelRequest {
                             asset: self.config.asset.clone(),
                             oid,
                         }));
                         canceled_bids += 1;
-                        log::info!("  ❌ Canceling BID OID {} @ ${:.3} (age: {}ms, no target match)",
-                            oid, order.price, order_age_ms);
+                        log::info!("  ❌ Canceling BID OID {} @ ${:.3} (reason: {})",
+                            oid, order.price, reason);
+
+                        // Record timeout for fill rate tracking
+                        self.order_churn_manager.record_timeout(
+                            i,
+                            true,
+                            order.timestamp,
+                            current_time_ms,
+                        );
                     }
                 } else {
-                    // Order is too young, keep it even though it doesn't match
-                    // This prevents rapid cancel/replace cycles
+                    // Keep the order (too young or conditions don't warrant refresh)
                     kept_young_bids += 1;
                     debug!(
-                        "[HJB STRATEGY] Keeping young bid order OID {:?} (age: {}ms)",
-                        order.oid, order_age_ms
+                        "[HJB STRATEGY] Keeping bid order OID {:?} (reason: {})",
+                        order.oid, reason
                     );
                 }
             }
@@ -1006,38 +1272,58 @@ impl HjbStrategy {
         let mut kept_young_asks = 0;
 
         // Check existing asks
-        for order in &state.open_asks {
-            let matched = remaining_target_asks.iter().position(|(p, s)| {
+        for (i, order) in state.open_asks.iter().enumerate() {
+            let matched = remaining_target_asks.iter().enumerate().position(|(_, (p, s))| {
                 (p - order.price).abs() <= price_tolerance &&
                 (s - order.size).abs() <= size_tolerance
             });
 
-            if matched.is_some() {
+            if let Some(target_idx) = matched {
                 // Match found, remove from targets
-                remaining_target_asks.remove(matched.unwrap());
+                remaining_target_asks.remove(target_idx);
                 matched_asks += 1;
             } else {
-                // No match - check if order is old enough to cancel
-                let order_age_ms = current_time_ms.saturating_sub(order.timestamp);
+                // No match - use intelligent churn logic
+                let order_meta = OrderMetadata {
+                    oid: order.oid.unwrap_or(0),
+                    price: order.price,
+                    size: order.size,
+                    is_buy: false,
+                    level: i, // Assuming orders are sorted by level
+                    placement_time_ms: order.timestamp,
+                    target_price: target_asks.get(i).map(|(p, _)| *p).unwrap_or(order.price),
+                    initial_queue_size_ahead: None,
+                };
 
-                if order_age_ms >= min_order_age_ms {
-                    // Order is old enough, cancel it
+                let (should_refresh, reason) = self.order_churn_manager.should_refresh_order(
+                    &order_meta,
+                    &market_churn_state,
+                );
+
+                if should_refresh {
                     if let Some(oid) = order.oid {
                         actions.push(StrategyAction::Cancel(ClientCancelRequest {
                             asset: self.config.asset.clone(),
                             oid,
                         }));
                         canceled_asks += 1;
-                        log::info!("  ❌ Canceling ASK OID {} @ ${:.3} (age: {}ms, no target match)",
-                            oid, order.price, order_age_ms);
+                        log::info!("  ❌ Canceling ASK OID {} @ ${:.3} (reason: {})",
+                            oid, order.price, reason);
+
+                        // Record timeout for fill rate tracking
+                        self.order_churn_manager.record_timeout(
+                            i,
+                            false,
+                            order.timestamp,
+                            current_time_ms,
+                        );
                     }
                 } else {
-                    // Order is too young, keep it even though it doesn't match
-                    // This prevents rapid cancel/replace cycles
+                    // Keep the order (too young or conditions don't warrant refresh)
                     kept_young_asks += 1;
                     debug!(
-                        "[HJB STRATEGY] Keeping young ask order OID {:?} (age: {}ms)",
-                        order.oid, order_age_ms
+                        "[HJB STRATEGY] Keeping ask order OID {:?} (reason: {})",
+                        order.oid, reason
                     );
                 }
             }
@@ -1544,17 +1830,147 @@ impl HjbStrategy {
         }
     }
 
-    /// Perform online learning using the Adam optimizer.
+    /// Run the SPSA learning cycle state machine.
     ///
-    /// This method computes gradients of the loss function with respect to
-    /// tuning parameters and updates them using the Adam optimizer.
-    ///
-    /// The loss function is designed to minimize:
-    /// - Inventory risk (quadratic penalty on position)
-    /// - Adverse selection costs (based on realized vs. expected mid-price moves)
-    /// - Spread tightness vs. fill rate tradeoff
-    ///
-    /// Returns the computed loss value.
+    /// This is the main engine for asynchronous gradient estimation and parameter tuning.
+    /// Called from on_tick() to drive the state machine.
+    fn run_learning_cycle(&mut self, current_time: f64) {
+        if !self.config.enable_online_learning {
+            return;
+        }
+
+        let eval_duration = self.spsa_state.config.eval_duration_sec;
+        let cycle_interval = self.spsa_state.config.cycle_interval_sec;
+
+        // Update the inventory risk for the current time slice
+        self.loss_tracker.update_inventory_risk(
+            self.state_vector.inventory,
+            self.hjb_components.phi,
+            current_time
+        );
+
+        // --- SPSA State Machine ---
+        match self.learning_state {
+            LearningState::Idle => {
+                // Check if it's time to start a new learning cycle
+                if current_time - self.last_cycle_start_time > cycle_interval {
+                    info!("[SPSA LEARN] Starting new cycle (k={})", self.spsa_state.k + 1);
+                    self.last_cycle_start_time = current_time;
+
+                    // 1. Generate perturbation
+                    let (delta, c_k) = self.spsa_state.generate_step();
+                    let baseline_vec = self.baseline_params.read().to_vec();
+
+                    // 2. Apply positive perturbation
+                    let perturb_plus_vec: Vec<f64> = baseline_vec.iter().zip(delta.iter())
+                        .map(|(param, d)| param + c_k * d)
+                        .collect();
+
+                    self.tuning_params.write().update_from_vec(perturb_plus_vec);
+
+                    // 3. Reset loss tracker and change state
+                    self.loss_tracker = LossTracker::new(current_time);
+                    self.learning_state = LearningState::WaitingOnPerturbPlus { start_time: current_time };
+                    debug!("[SPSA LEARN] Applied positive perturbation. c_k={:.6}", c_k);
+                }
+            }
+
+            LearningState::WaitingOnPerturbPlus { start_time } => {
+                // Check if we've gathered enough data
+                if current_time - start_time > eval_duration {
+                    // 1. Store the loss from the positive perturbation
+                    self.loss_plus = self.loss_tracker.compute_loss();
+
+                    // 2. Apply negative perturbation
+                    let baseline_vec = self.baseline_params.read().to_vec();
+                    let delta_vec = &self.spsa_state.last_delta;
+                    let c_k = self.spsa_state.last_c_k;
+
+                    let perturb_minus_vec: Vec<f64> = baseline_vec.iter().zip(delta_vec.iter())
+                        .map(|(param, d)| param - c_k * d)
+                        .collect();
+
+                    self.tuning_params.write().update_from_vec(perturb_minus_vec);
+
+                    // 3. Reset loss tracker and change state
+                    self.loss_tracker = LossTracker::new(current_time);
+                    self.learning_state = LearningState::WaitingOnPerturbMinus { start_time: current_time };
+                    debug!("[SPSA LEARN] Applied negative perturbation. loss_plus={:.4}", self.loss_plus);
+                }
+            }
+
+            LearningState::WaitingOnPerturbMinus { start_time } => {
+                // Check if we've gathered enough data
+                if current_time - start_time > eval_duration {
+                    // 1. Store the loss from the negative perturbation
+                    self.loss_minus = self.loss_tracker.compute_loss();
+                    debug!("[SPSA LEARN] Got negative loss. loss_minus={:.4}", self.loss_minus);
+
+                    // --- This is the "Aha!" moment ---
+                    // 2. Calculate the SPSA gradient estimate
+                    let c_k = self.spsa_state.last_c_k;
+                    let delta_vec = &self.spsa_state.last_delta;
+                    let loss_diff = self.loss_plus - self.loss_minus;
+
+                    // g_k = (loss_plus - loss_minus) / (2 * c_k * delta)
+                    let gradient_estimate: Vec<f64> = delta_vec.iter().map(|&d| {
+                        if d.abs() < 1e-9 { 0.0 } // Avoid division by zero
+                        else { loss_diff / (2.0 * c_k * d) }
+                    }).collect();
+
+                    let grad_norm = gradient_estimate.iter().map(|g| g.powi(2)).sum::<f64>().sqrt();
+                    info!("[SPSA LEARN] Gradient estimated. Loss diff: {:.4}, Grad norm: {:.4}",
+                          loss_diff, grad_norm);
+
+                    // 3. Feed the gradient to the Adam optimizer
+                    let updates = self.adam_optimizer.write().compute_update(&gradient_estimate);
+
+                    // 4. Apply the updates from Adam to our *baseline* parameters
+                    let mut baseline = self.baseline_params.write();
+                    let mut baseline_vec = baseline.to_vec();
+
+                    for (param, update) in baseline_vec.iter_mut().zip(updates.iter()) {
+                        *param -= update; // Gradient *descent*
+                    }
+
+                    baseline.update_from_vec(baseline_vec);
+
+                    // 5. Restore live params to the new, optimized baseline
+                    self.tuning_params.write().clone_from(&*baseline);
+                    drop(baseline); // Release RwLock
+
+                    // 6. Reset loss tracker and return to Idle
+                    self.loss_tracker = LossTracker::new(current_time);
+                    self.learning_state = LearningState::Idle;
+
+                    info!("[SPSA LEARN] Cycle complete. Parameters updated.");
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // OLD PLACEHOLDER LEARNING FUNCTIONS - REPLACED BY SPSA
+    // ========================================================================
+    //
+    // The following functions have been replaced by the SPSA-based learning
+    // system implemented in run_learning_cycle(). They are kept here for
+    // reference but should not be used in production.
+    //
+    // Key problems with the old approach:
+    // 1. Synchronous gradient computation doesn't work for live trading
+    // 2. Finite differences require 2*N function evaluations (16 for 8 params)
+    // 3. Placeholder gradient computation (vec![0.001; 8]) was not useful
+    //
+    // SPSA advantages:
+    // 1. Asynchronous: gathers loss over time windows
+    // 2. Efficient: only 2 evaluations per cycle regardless of param count
+    // 3. Production-ready: proper gradient estimation from real P&L
+    //
+    // ========================================================================
+
+    /*
+    /// OLD: Perform online learning using the Adam optimizer.
     #[allow(dead_code)]
     fn perform_online_learning(&mut self, state: &CurrentState) -> f64 {
         if !self.config.enable_online_learning {
@@ -1590,10 +2006,7 @@ impl HjbStrategy {
         total_loss
     }
 
-    /// Compute finite difference gradients for online learning.
-    ///
-    /// This is a simplified gradient estimation using forward finite differences.
-    /// In production, use automatic differentiation or policy gradient methods.
+    /// OLD: Compute finite difference gradients for online learning.
     fn compute_finite_difference_gradients(
         &self,
         _tuning_params: &crate::TuningParams,
@@ -1604,7 +2017,7 @@ impl HjbStrategy {
         vec![0.001; 8]
     }
 
-    /// Apply parameter updates from the Adam optimizer.
+    /// OLD: Apply parameter updates from the Adam optimizer.
     fn apply_parameter_updates(&mut self, updates: &[f64]) {
         let mut tuning_params = self.tuning_params.write();
 
@@ -1637,4 +2050,5 @@ impl HjbStrategy {
         tuning_params.adverse_selection_spread_scale_phi = params_vec[6];
         tuning_params.control_gap_threshold_phi = params_vec[7];
     }
+    */
 }
