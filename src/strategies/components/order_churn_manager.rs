@@ -43,11 +43,11 @@ use std::collections::VecDeque;
 /// Configuration for order churn management
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderChurnConfig {
-    /// Base minimum order lifetime in milliseconds (default: 500ms)
+    /// Base minimum order lifetime in milliseconds (default: 1000ms)
     /// Orders younger than this are NEVER canceled (prevents rapid churn)
     pub min_order_lifetime_ms: u64,
 
-    /// Maximum order lifetime in milliseconds (default: 5000ms)
+    /// Maximum order lifetime in milliseconds (default: 10000ms)
     /// Orders older than this are ALWAYS refreshed (prevents stale quotes)
     pub max_order_lifetime_ms: u64,
 
@@ -63,8 +63,8 @@ pub struct OrderChurnConfig {
     /// lifetime_ms *= 1.0 / (1.0 + volatility_bps / volatility_scaling)
     pub volatility_scaling_factor: f64,
 
-    /// Spread deviation threshold in basis points (default: 2.0 bps)
-    /// If market moves such that order is >2bps from optimal, refresh it
+    /// Spread deviation threshold in basis points (default: 5.0 bps)
+    /// If market moves such that order is >5bps from optimal, refresh it
     pub spread_deviation_threshold_bps: f64,
 
     /// Adverse selection sensitivity (default: 0.5)
@@ -84,12 +84,12 @@ pub struct OrderChurnConfig {
 impl Default for OrderChurnConfig {
     fn default() -> Self {
         Self {
-            min_order_lifetime_ms: 500,
-            max_order_lifetime_ms: 5000,
+            min_order_lifetime_ms: 1000,  // Increased from 500ms to reduce churn
+            max_order_lifetime_ms: 10000, // Increased from 5000ms to keep orders longer
             target_fill_rate: 0.15,
             fill_rate_window_sec: 300,
             volatility_scaling_factor: 100.0,
-            spread_deviation_threshold_bps: 2.0,
+            spread_deviation_threshold_bps: 5.0,  // Increased from 2.0 to reduce sensitivity
             adverse_selection_sensitivity: 0.5,
             enable_queue_position_tracking: false,
             queue_deterioration_threshold: 2.0,
