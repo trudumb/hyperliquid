@@ -217,35 +217,22 @@ impl MicropriceAsModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::OrderBookLevel;
+    use crate::BookLevel;
 
     fn create_test_book(bid_px: f64, ask_px: f64, bid_sz: f64, ask_sz: f64) -> OrderBook {
+        let mid_price = (bid_px + ask_px) / 2.0;
         OrderBook {
-            coin: "TEST".to_string(),
-            levels: vec![vec![
-                OrderBookLevel {
-                    px: bid_px.to_string(),
-                    sz: bid_sz.to_string(),
-                    n: 1,
-                },
-            ], vec![
-                OrderBookLevel {
-                    px: ask_px.to_string(),
-                    sz: ask_sz.to_string(),
-                    n: 1,
-                },
-            ]],
-            time: 0,
-            bids: vec![OrderBookLevel {
+            bids: vec![BookLevel {
                 px: bid_px.to_string(),
                 sz: bid_sz.to_string(),
                 n: 1,
             }],
-            asks: vec![OrderBookLevel {
+            asks: vec![BookLevel {
                 px: ask_px.to_string(),
                 sz: ask_sz.to_string(),
                 n: 1,
             }],
+            mid_price,
         }
     }
 
