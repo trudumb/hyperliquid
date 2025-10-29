@@ -52,6 +52,7 @@ use crate::strategies::components::{RobustConfig, InventorySkewConfig};
 // Import the component-based architecture
 use crate::strategies::components::{
     HjbMultiLevelOptimizer, OptimizerInputs, OptimizerOutput,
+    OrderChurnManager, OrderChurnConfig, OrderMetadata, MarketChurnState,
 };
 
 // ----------------------------------------------------------------------------
@@ -124,6 +125,9 @@ pub struct HjbStrategyConfig {
     /// Margin safety buffer (0.0-1.0)
     /// Reserves this fraction of available margin (e.g., 0.2 = 20% buffer)
     pub margin_safety_buffer: f64,
+
+    /// Order churn management configuration
+    pub order_churn_config: Option<OrderChurnConfig>,
 }
 
 impl HjbStrategyConfig {
@@ -162,6 +166,11 @@ impl HjbStrategyConfig {
             serde_json::from_value(v.clone()).ok()
         });
 
+        // Load order churn config
+        let order_churn_config = params.get("order_churn_config").and_then(|v| {
+            serde_json::from_value(v.clone()).ok()
+        });
+
         Self {
             asset: asset.to_string(),
             asset_type: AssetType::Perp,  // Default to Perp (can be configured via separate field if needed)
@@ -192,6 +201,7 @@ impl HjbStrategyConfig {
             margin_safety_buffer: params.get("margin_safety_buffer")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.2),
+            order_churn_config,
         }
     }
 }
@@ -388,6 +398,9 @@ pub struct HjbStrategy {
 
     /// Margin calculator for position sizing
     margin_calculator: MarginCalculator,
+
+    /// Intelligent order churn manager
+    order_churn_manager: OrderChurnManager,
 }
 
 impl Strategy for HjbStrategy {
@@ -485,6 +498,11 @@ impl Strategy for HjbStrategy {
             strategy_config.margin_safety_buffer,
         );
 
+        // Initialize order churn manager
+        let order_churn_config = strategy_config.order_churn_config.clone()
+            .unwrap_or_else(|| OrderChurnConfig::default());
+        let order_churn_manager = OrderChurnManager::new(order_churn_config);
+
         info!("✅ Initialized HJB Strategy for {} | Trading: {} | Max Position: {} | Leverage: {}x | Margin Buffer: {:.1}%",
               asset, trading_enabled_default, strategy_config.max_absolute_position_size,
               strategy_config.leverage, strategy_config.margin_safety_buffer * 100.0);
@@ -516,6 +534,7 @@ impl Strategy for HjbStrategy {
             optimization_cache_hits: 0,
             total_optimization_time_us: 0,
             margin_calculator,
+            order_churn_manager,
         }
     }
 
@@ -718,9 +737,10 @@ impl HjbStrategy {
         self.update_uncertainty_estimates();
     }
 
-    /// Handle fills (update Hawkes model)
+    /// Handle fills (update Hawkes model and order churn manager)
     fn handle_fills(&mut self, _state: &CurrentState, fills: &[(TradeInfo, Option<usize>)]) {
         let current_time = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let current_time_ms = (current_time * 1000.0) as u64;
 
         let mut hawkes = self.hawkes_model.write();
         for (fill, filled_level) in fills {
@@ -741,7 +761,20 @@ impl HjbStrategy {
 
             hawkes.record_fill(level, is_bid_fill, current_time);
 
+            // Record fill in order churn manager for fill rate tracking
+            // Note: We don't have the exact placement_time_ms from the fill event,
+            // so we'll use an estimate based on typical order lifetime
+            // A better approach would be to store placement times when placing orders
+            let estimated_placement_time_ms = current_time_ms.saturating_sub(2000); // Assume 2s average lifetime
+            self.order_churn_manager.record_fill(
+                level,
+                is_bid_fill,
+                estimated_placement_time_ms,
+                current_time_ms,
+            );
+
             debug!("Hawkes model updated: level={}, is_bid={}, time={:.2}", level, is_bid_fill, current_time);
+            debug!("Churn manager fill recorded: level={}, is_bid={}", level, is_bid_fill);
         }
     }
 
@@ -894,7 +927,7 @@ impl HjbStrategy {
 
     /// Reconcile existing orders with target quotes
     fn reconcile_orders(
-        &self,
+        &mut self,
         state: &CurrentState,
         target_bids: Vec<(f64, f64)>,
         target_asks: Vec<(f64, f64)>,
@@ -910,13 +943,23 @@ impl HjbStrategy {
         let price_tolerance = min_price_step * 3.0;
         let size_tolerance = min_size_step * 2.0;
 
-        // Time-based hysteresis: don't cancel orders younger than 500ms
-        // This prevents churn from rapid quote updates
-        let min_order_age_ms = 500u64;
+        // Get current timestamp for order age calculations
         let current_time_ms = chrono::Utc::now().timestamp_millis() as u64;
 
-        // --- STRATEGY LOGGING: TARGET QUOTES ---
+        // Create market state for intelligent churn decisions
         let mid = state.l2_mid_price;
+        let market_churn_state = MarketChurnState {
+            current_time_ms,
+            mid_price: mid,
+            volatility_bps: self.state_vector.volatility_ema_bps,
+            adverse_selection_bps: self.state_vector.adverse_selection_estimate,
+            lob_imbalance: self.state_vector.lob_imbalance,
+            best_bid: state.order_book.as_ref().and_then(|b| b.best_bid()),
+            best_ask: state.order_book.as_ref().and_then(|b| b.best_ask()),
+            queue_depth_ahead: None, // Can add queue tracking later
+        };
+
+        // --- STRATEGY LOGGING: TARGET QUOTES ---
         if !target_bids.is_empty() || !target_asks.is_empty() {
             log::info!("═══════════════════════════════════════════════════════");
             log::info!("📊 QUOTE RECONCILIATION (Mid: ${:.3})", mid);
@@ -964,38 +1007,58 @@ impl HjbStrategy {
         let mut kept_young_bids = 0;
 
         // Check existing bids
-        for order in &state.open_bids {
-            let matched = remaining_target_bids.iter().position(|(p, s)| {
+        for (i, order) in state.open_bids.iter().enumerate() {
+            let matched = remaining_target_bids.iter().enumerate().position(|(_, (p, s))| {
                 (p - order.price).abs() <= price_tolerance &&
                 (s - order.size).abs() <= size_tolerance
             });
 
-            if matched.is_some() {
+            if let Some(target_idx) = matched {
                 // Match found, remove from targets
-                remaining_target_bids.remove(matched.unwrap());
+                remaining_target_bids.remove(target_idx);
                 matched_bids += 1;
             } else {
-                // No match - check if order is old enough to cancel
-                let order_age_ms = current_time_ms.saturating_sub(order.timestamp);
+                // No match - use intelligent churn logic
+                let order_meta = OrderMetadata {
+                    oid: order.oid.unwrap_or(0),
+                    price: order.price,
+                    size: order.size,
+                    is_buy: true,
+                    level: i, // Assuming orders are sorted by level
+                    placement_time_ms: order.timestamp,
+                    target_price: target_bids.get(i).map(|(p, _)| *p).unwrap_or(order.price),
+                    initial_queue_size_ahead: None,
+                };
 
-                if order_age_ms >= min_order_age_ms {
-                    // Order is old enough, cancel it
+                let (should_refresh, reason) = self.order_churn_manager.should_refresh_order(
+                    &order_meta,
+                    &market_churn_state,
+                );
+
+                if should_refresh {
                     if let Some(oid) = order.oid {
                         actions.push(StrategyAction::Cancel(ClientCancelRequest {
                             asset: self.config.asset.clone(),
                             oid,
                         }));
                         canceled_bids += 1;
-                        log::info!("  ❌ Canceling BID OID {} @ ${:.3} (age: {}ms, no target match)",
-                            oid, order.price, order_age_ms);
+                        log::info!("  ❌ Canceling BID OID {} @ ${:.3} (reason: {})",
+                            oid, order.price, reason);
+
+                        // Record timeout for fill rate tracking
+                        self.order_churn_manager.record_timeout(
+                            i,
+                            true,
+                            order.timestamp,
+                            current_time_ms,
+                        );
                     }
                 } else {
-                    // Order is too young, keep it even though it doesn't match
-                    // This prevents rapid cancel/replace cycles
+                    // Keep the order (too young or conditions don't warrant refresh)
                     kept_young_bids += 1;
                     debug!(
-                        "[HJB STRATEGY] Keeping young bid order OID {:?} (age: {}ms)",
-                        order.oid, order_age_ms
+                        "[HJB STRATEGY] Keeping bid order OID {:?} (reason: {})",
+                        order.oid, reason
                     );
                 }
             }
@@ -1006,38 +1069,58 @@ impl HjbStrategy {
         let mut kept_young_asks = 0;
 
         // Check existing asks
-        for order in &state.open_asks {
-            let matched = remaining_target_asks.iter().position(|(p, s)| {
+        for (i, order) in state.open_asks.iter().enumerate() {
+            let matched = remaining_target_asks.iter().enumerate().position(|(_, (p, s))| {
                 (p - order.price).abs() <= price_tolerance &&
                 (s - order.size).abs() <= size_tolerance
             });
 
-            if matched.is_some() {
+            if let Some(target_idx) = matched {
                 // Match found, remove from targets
-                remaining_target_asks.remove(matched.unwrap());
+                remaining_target_asks.remove(target_idx);
                 matched_asks += 1;
             } else {
-                // No match - check if order is old enough to cancel
-                let order_age_ms = current_time_ms.saturating_sub(order.timestamp);
+                // No match - use intelligent churn logic
+                let order_meta = OrderMetadata {
+                    oid: order.oid.unwrap_or(0),
+                    price: order.price,
+                    size: order.size,
+                    is_buy: false,
+                    level: i, // Assuming orders are sorted by level
+                    placement_time_ms: order.timestamp,
+                    target_price: target_asks.get(i).map(|(p, _)| *p).unwrap_or(order.price),
+                    initial_queue_size_ahead: None,
+                };
 
-                if order_age_ms >= min_order_age_ms {
-                    // Order is old enough, cancel it
+                let (should_refresh, reason) = self.order_churn_manager.should_refresh_order(
+                    &order_meta,
+                    &market_churn_state,
+                );
+
+                if should_refresh {
                     if let Some(oid) = order.oid {
                         actions.push(StrategyAction::Cancel(ClientCancelRequest {
                             asset: self.config.asset.clone(),
                             oid,
                         }));
                         canceled_asks += 1;
-                        log::info!("  ❌ Canceling ASK OID {} @ ${:.3} (age: {}ms, no target match)",
-                            oid, order.price, order_age_ms);
+                        log::info!("  ❌ Canceling ASK OID {} @ ${:.3} (reason: {})",
+                            oid, order.price, reason);
+
+                        // Record timeout for fill rate tracking
+                        self.order_churn_manager.record_timeout(
+                            i,
+                            false,
+                            order.timestamp,
+                            current_time_ms,
+                        );
                     }
                 } else {
-                    // Order is too young, keep it even though it doesn't match
-                    // This prevents rapid cancel/replace cycles
+                    // Keep the order (too young or conditions don't warrant refresh)
                     kept_young_asks += 1;
                     debug!(
-                        "[HJB STRATEGY] Keeping young ask order OID {:?} (age: {}ms)",
-                        order.oid, order_age_ms
+                        "[HJB STRATEGY] Keeping ask order OID {:?} (reason: {})",
+                        order.oid, reason
                     );
                 }
             }
