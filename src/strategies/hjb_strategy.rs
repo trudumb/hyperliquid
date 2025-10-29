@@ -618,13 +618,13 @@ impl Strategy for HjbStrategy {
 
         // Check if trading is enabled
         if !self.trading_enabled {
-            debug!("[HJB STRATEGY {}] Trading disabled on tick", self.config.asset);
+            warn!("[HJB STRATEGY {}] Trading disabled, returning NoOp", self.config.asset);
             return vec![StrategyAction::NoOp];
         }
 
         // Only place orders if we have a valid mid price
         if state.l2_mid_price <= 0.0 {
-            warn!("[HJB STRATEGY {}] Invalid mid price on tick: ${:.3}",
+            warn!("[HJB STRATEGY {}] Waiting for valid mid price (current: ${:.3})",
                 self.config.asset, state.l2_mid_price);
             return vec![StrategyAction::NoOp];
         }

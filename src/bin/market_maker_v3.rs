@@ -996,17 +996,24 @@ impl StrategyRunnerActor {
 
         match message {
             Message::L2Book(l2_book) => {
-                debug!("[Runner {}] Received L2Book update", self.asset);
                 if let Some(book) = OrderBook::from_l2_data(&l2_book.data) {
                     let mut state = self.local_state_cache.write().await;
+                    let old_mid = state.l2_mid_price;
                     if let Some(analysis) = book.analyze(5) {
                         state.lob_imbalance = analysis.imbalance;
                         state.market_spread_bps = book.spread_bps().unwrap_or(0.0);
                     }
                     if let (Some(bid), Some(ask)) = (book.best_bid(), book.best_ask()) {
                         let new_mid = (bid + ask) / 2.0;
-                        debug!("[Runner {}] L2Book: bid=${:.3}, ask=${:.3}, mid=${:.3}, imbalance={:.3}",
-                            self.asset, bid, ask, new_mid, state.lob_imbalance);
+
+                        // Log first L2Book or if mid price changed significantly
+                        if old_mid == 0.0 || (new_mid - old_mid).abs() / old_mid > 0.001 {
+                            info!("[Runner {}] L2Book update: bid=${:.3}, ask=${:.3}, mid=${:.3}, imbalance={:.3}",
+                                self.asset, bid, ask, new_mid, state.lob_imbalance);
+                        } else {
+                            debug!("[Runner {}] L2Book: bid=${:.3}, ask=${:.3}, mid=${:.3}, imbalance={:.3}",
+                                self.asset, bid, ask, new_mid, state.lob_imbalance);
+                        }
                         state.l2_mid_price = new_mid;
                     }
                     state.order_book = Some(book);
@@ -1023,9 +1030,17 @@ impl StrategyRunnerActor {
             Message::AllMids(all_mids) => {
                 if let Some(mid_str) = all_mids.data.mids.get(&self.asset) {
                     if let Ok(mid_price) = mid_str.parse::<f64>() {
-                        debug!("[Runner {}] Received AllMids: mid=${:.3}", self.asset, mid_price);
-                        // Update local state cache with mid price
                         let mut state = self.local_state_cache.write().await;
+                        let old_mid = state.l2_mid_price;
+
+                        // Log first AllMids or if mid price changed significantly
+                        if old_mid == 0.0 || (mid_price - old_mid).abs() / old_mid > 0.001 {
+                            info!("[Runner {}] AllMids update: mid=${:.3} (was ${:.3})",
+                                self.asset, mid_price, old_mid);
+                        } else {
+                            debug!("[Runner {}] Received AllMids: mid=${:.3}", self.asset, mid_price);
+                        }
+
                         state.l2_mid_price = mid_price;
                         drop(state);
 
@@ -1150,6 +1165,8 @@ impl StrategyRunnerActor {
         let has_orders = !state_write.open_bids.is_empty() || !state_write.open_asks.is_empty();
         let mid_price = state_write.l2_mid_price;
         let position = state_write.position;
+        let num_bids = state_write.open_bids.len();
+        let num_asks = state_write.open_asks.len();
         drop(state_write);
 
         debug!("[Runner {}] Tick: mid=${:.3}, pos={:.2}, has_orders={}",
@@ -1163,7 +1180,16 @@ impl StrategyRunnerActor {
             info!("[Runner {}] Tick generated {} action(s)", self.asset, actions.len());
             self.send_actions(actions).await;
         } else {
-            debug!("[Runner {}] Tick returned NoOp or empty actions", self.asset);
+            // Log diagnostic info when no actions are taken
+            if mid_price <= 0.0 {
+                warn!("[Runner {}] Tick: No actions - invalid mid price ${:.3}", self.asset, mid_price);
+            } else if !has_orders {
+                warn!("[Runner {}] Tick: No actions despite no orders (mid=${:.3}, pos={:.2})",
+                    self.asset, mid_price, position);
+            } else {
+                debug!("[Runner {}] Tick: NoOp with {} bids, {} asks (mid=${:.3})",
+                    self.asset, num_bids, num_asks, mid_price);
+            }
         }
     }
 
