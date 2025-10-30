@@ -211,6 +211,7 @@ impl MultiLevelOptimizer {
         state: &OptimizationState,
         base_half_spread_bps: f64,
         tuning_params: &ConstrainedTuningParams,
+        maker_fee_bps: f64,
     ) -> MultiLevelControl {
         // ✅ SAFETY: Add aggressive minimum spread buffer to prevent crossing
         // This ensures we always have enough "room" to absorb aggression adjustments
@@ -261,8 +262,21 @@ impl MultiLevelOptimizer {
         // 2. Determine number of levels (could be dynamic in future)
         let num_levels = self.config.max_levels;
 
+        // --- EXPERT ADDITION: Kelly Criterion Sizing ---
+        let kelly_factor = self.calculate_kelly_sizing_factor(
+            state,
+            base_half_spread_safe,
+            maker_fee_bps,
+        );
+        // --- End Kelly ---
+
         // 3. Calculate sizes for each level
-        let (bid_sizes, ask_sizes) = self.allocate_sizes(state, inventory_ratio, num_levels);
+        let (bid_sizes, ask_sizes) = self.allocate_sizes(
+            state,
+            inventory_ratio,
+            num_levels,
+            kelly_factor,
+        );
 
         // 4. Build bid levels with aggression and momentum
         let mut bid_levels = Vec::new();
@@ -471,12 +485,64 @@ impl MultiLevelOptimizer {
         (bid_aggression, ask_aggression)
     }
 
+    /// Calculates an optimal sizing factor (0.0 - 1.0) using an adaptation
+    /// of the Kelly Criterion, based on the market maker's perceived edge.
+    fn calculate_kelly_sizing_factor(
+        &self,
+        state: &OptimizationState,
+        base_half_spread_bps: f64,
+        maker_fee_bps: f64,
+    ) -> f64 {
+        // 1. Calculate the net "edge" (our profit per trade) in BPS
+        // Edge = What we capture - What we lose
+        // We use abs(AS) because drift in *either* direction is a cost to a neutral MM.
+        let edge_bps = base_half_spread_bps
+                       - state.adverse_selection_bps.abs()
+                       - maker_fee_bps;
+
+        // 2. If edge is zero or negative, don't trade.
+        if edge_bps <= 0.0 {
+            return 0.0; // No edge, post no volume.
+        }
+
+        // 3. Define our "odds" or "payout".
+        // This is a proxy for how much we win vs. how much we lose.
+        // We can define "risk" as the volatility (what we might lose to noise).
+        // Odds (b) = Edge / Risk
+        let risk_bps = state.volatility_bps.max(1.0); // Avoid div by zero
+        let odds = edge_bps / risk_bps;
+
+        // 4. Calculate Kelly Fraction (f* = p - q/b)
+        // We adapt this. A simple form is f* = (Edge / Volatility)
+        // A more robust form is to scale this by our inventory.
+        // Let's use a simple, clamped version:
+        let inventory_ratio = (state.inventory / state.max_position).abs();
+
+        // Full Kelly fraction (can be > 1.0, we'll cap it)
+        // We use `odds` as a proxy for (p*b - q) / b
+        let kelly_fraction = odds;
+
+        // Scale back size as inventory grows (to reduce risk)
+        let inventory_scalar = (1.0 - inventory_ratio).powi(2);
+
+        // Final factor: Kelly fraction * inventory scalar, capped at 1.0
+        let sizing_factor = (kelly_fraction * inventory_scalar).min(1.0).max(0.0);
+
+        log::debug!(
+            "[Kelly Sizing] Edge: {:.2}bps, Risk (Vol): {:.2}bps, Odds: {:.3}, InvRatio: {:.2}, Factor: {:.3}",
+            edge_bps, risk_bps, odds, inventory_ratio, sizing_factor
+        );
+
+        sizing_factor
+    }
+
     /// Allocate sizes across levels
     fn allocate_sizes(
         &self,
         state: &OptimizationState,
         _inventory_ratio: f64,  // Reserved for future use
         num_levels: usize,
+        kelly_sizing_factor: f64,
     ) -> (Vec<f64>, Vec<f64>) {
         // Base allocation (more size on inner levels)
         let base_allocations = vec![0.45, 0.30, 0.15, 0.07, 0.03];
@@ -508,8 +574,11 @@ impl MultiLevelOptimizer {
         let max_sell_absolute = (state.max_position + state.inventory).max(0.0);
         let max_sell = max_sell_risk_adjusted.min(max_sell_absolute);
 
-        let bid_budget = self.config.total_size_per_side.min(max_buy);
-        let ask_budget = self.config.total_size_per_side.min(max_sell);
+        // Apply Kelly factor to the base size, then constrain by margin/position limits
+        let kelly_adjusted_size = self.config.total_size_per_side * kelly_sizing_factor;
+
+        let bid_budget = kelly_adjusted_size.min(max_buy);
+        let ask_budget = kelly_adjusted_size.min(max_sell);
 
         // Log position limit constraints for debugging
         if bid_budget < self.config.total_size_per_side * 0.5 {
@@ -638,7 +707,7 @@ mod tests {
             hawkes_model: &hawkes,
         };
 
-        let control = optimizer.optimize(&state, 6.0, &tuning_params);
+        let control = optimizer.optimize(&state, 6.0, &tuning_params, 1.5);
 
         assert!(control.validate().is_ok());
         assert_eq!(control.bid_levels.len(), 3);
