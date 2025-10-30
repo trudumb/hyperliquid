@@ -821,7 +821,7 @@ impl StateManagerActor {
     /// Validates actions against authoritative state to ensure position and margin limits.
     ///
     /// Performs atomic validation of:
-    /// - Position size limits (max_position_size)
+    /// - Position size limits (max_position_size) INCLUDING pending orders on exchange
     /// - Margin requirements (with safety buffer)
     ///
     /// Returns (is_valid, error_message)
@@ -839,14 +839,24 @@ impl StateManagerActor {
 
         let current_position = asset_state.map_or(0.0, |s| s.position);
 
+        // Calculate pending exposure from orders already live on exchange
+        // Bids = positive (potential buys), Asks = negative (potential sells)
+        let pending_exposure = asset_state.map_or(0.0, |s| {
+            let bid_exposure: f64 = s.open_bids.iter().map(|o| o.size).sum();
+            let ask_exposure: f64 = s.open_asks.iter().map(|o| o.size).sum();
+            bid_exposure - ask_exposure
+        });
+
         debug!(
-            "[State Manager] Validation Check [{}]: Current Position: {:.4}, Max Position: {:.4}",
-            asset_name, current_position, self.max_position_size
+            "[State Manager] Validation Check [{}]: Current Position: {:.4}, Pending Orders: {:.4}, Max Position: {:.4}",
+            asset_name, current_position, pending_exposure, self.max_position_size
         );
 
         let mut net_size_change = 0.0;
         let mut estimated_margin_increase = 0.0;
-        let mut cumulative_pos_for_margin = current_position;
+
+        // Start from current position + pending orders to get true exposure
+        let mut cumulative_pos_for_margin = current_position + pending_exposure;
         let mut has_reduce_only = false;
 
         for action in actions {
@@ -878,25 +888,26 @@ impl StateManagerActor {
             }
         }
 
-        // --- Position Check ---
-        let final_potential_position = current_position + net_size_change;
+        // --- Position Check (INCLUDING PENDING ORDERS) ---
+        // This prevents the race condition where orders fill faster than state updates
+        let final_potential_position = current_position + pending_exposure + net_size_change;
 
         debug!(
-            "[State Manager] Position check: Current={:.4}, Change={:.4}, Final={:.4}, Max={:.4}",
-            current_position, net_size_change, final_potential_position, self.max_position_size
+            "[State Manager] Full position check: Current={:.4}, Pending={:.4}, New={:.4}, Final={:.4}, Max={:.4}",
+            current_position, pending_exposure, net_size_change, final_potential_position, self.max_position_size
         );
 
         if final_potential_position.abs() > self.max_position_size + 1e-9 { // Add tolerance for float errors
             // Allow liquidation orders (reduce_only) even if still over limit
             if has_reduce_only {
                 warn!(
-                    "[State Manager] ⚠️ Position still over limit but allowing reduce_only liquidation: {:.4} -> {:.4}",
-                    current_position, final_potential_position
+                    "[State Manager] ⚠️ Position still over limit but allowing reduce_only liquidation: Current={:.4}, Pending={:.4}, Final={:.4}",
+                    current_position, pending_exposure, final_potential_position
                 );
             } else {
                 let msg = format!(
-                    "Exceeds position limit (Current: {:.4}, Change: {:.4}, Final: {:.4}, Max: {:.4})",
-                    current_position, net_size_change, final_potential_position, self.max_position_size
+                    "Exceeds position limit (Current: {:.4}, Pending: {:.4}, New: {:.4}, Final: {:.4}, Max: {:.4})",
+                    current_position, pending_exposure, net_size_change, final_potential_position, self.max_position_size
                 );
                 return (false, msg);
             }
@@ -915,8 +926,8 @@ impl StateManagerActor {
         }
 
         debug!(
-            "[State Manager] Validation PASSED for {}: Pos Change={:.4}, Est Margin Increase={:.2}",
-            asset_name, net_size_change, estimated_margin_increase
+            "[State Manager] ✅ Validation PASSED for {}: Current={:.4}, Pending={:.4}, New={:.4}, Final={:.4}, Margin={:.2}",
+            asset_name, current_position, pending_exposure, net_size_change, final_potential_position, estimated_margin_increase
         );
         (true, String::new())
     }
