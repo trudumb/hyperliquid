@@ -406,6 +406,12 @@ pub struct HjbStrategy {
 
     /// EMA alpha for volatility smoothing (e.g., 0.1)
     vol_ema_alpha: f64,
+
+    /// Z-Score threshold to trigger a re-quote (e.g., 1.0 = 1 std dev)
+    z_score_threshold: f64,
+
+    /// The mid-price from the last *significant* re-quote
+    last_z_quote_mid_price: f64,
 }
 
 impl Strategy for HjbStrategy {
@@ -552,6 +558,8 @@ impl Strategy for HjbStrategy {
             // Initialize smoothed vol to the particle filter's initial estimate
             smoothed_volatility_bps: initial_volatility_bps,
             vol_ema_alpha: 0.1, // 10% weight on new observations (tunable)
+            z_score_threshold: 1.0, // Only re-quote if price moves > 1.0 std dev
+            last_z_quote_mid_price: 0.0,
         }
     }
 
@@ -561,6 +569,35 @@ impl Strategy for HjbStrategy {
         update: &MarketUpdate,
     ) -> Vec<StrategyAction> {
         debug!("[HJB STRATEGY {}] on_market_update called", self.config.asset);
+
+        // --- EXPERT ADDITION: Z-Score Event Filter ---
+        if let Some(mid_price) = update.mid_price.or(state.order_book.as_ref().map(|b| b.mid_price)) {
+            if self.last_z_quote_mid_price > 0.0 && self.smoothed_volatility_bps > 0.0 {
+                // Calculate volatility in absolute price terms
+                let vol_as_price = (self.smoothed_volatility_bps / 10000.0) * mid_price;
+
+                // Calculate Z-Score of the price move
+                let price_delta = (mid_price - self.last_z_quote_mid_price).abs();
+                let z_score = price_delta / vol_as_price.max(1e-6);
+
+                if z_score < self.z_score_threshold {
+                    // Price move is NOT statistically significant.
+                    // DO NOT re-quote. This is just noise.
+                    debug!("[HJB STRATEGY {}] Market update skipped (Z-Score: {:.2} < {:.2})",
+                           self.config.asset, z_score, self.z_score_threshold);
+                    return vec![StrategyAction::NoOp];
+                }
+
+                // Price move IS significant. Update our anchor price.
+                debug!("[HJB STRATEGY {}] Z-Score threshold breached (Z-Score: {:.2}). Re-quoting.",
+                       self.config.asset, z_score);
+                self.last_z_quote_mid_price = mid_price;
+            } else if mid_price > 0.0 {
+                // Initialize the anchor price on the first valid mid-price
+                self.last_z_quote_mid_price = mid_price;
+            }
+        }
+        // --- End Z-Score Filter ---
 
         // Check if trading is enabled
         if !self.trading_enabled {
