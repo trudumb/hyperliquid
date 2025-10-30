@@ -860,30 +860,64 @@ impl StateManagerActor {
         let mut has_reduce_only = false;
 
         for action in actions {
-            if let StrategyAction::Place(order) = action {
-                let position_delta = if order.is_buy { order.sz } else { -order.sz };
+            match action {
+                StrategyAction::Place(order) => {
+                    let position_delta = if order.is_buy { order.sz } else { -order.sz };
 
-                // ALWAYS count ALL orders (including reduce_only) for position validation
-                net_size_change += position_delta;
+                    // ALWAYS count ALL orders (including reduce_only) for position validation
+                    net_size_change += position_delta;
 
-                if order.reduce_only {
-                    has_reduce_only = true;
-                }
-
-                // Only count margin for non-reduce_only orders that increase position
-                if !order.reduce_only {
-                    let next_potential_pos = cumulative_pos_for_margin + position_delta;
-
-                    // Estimate margin increase ONLY if the order *increases* the absolute position size
-                    if next_potential_pos.abs() > cumulative_pos_for_margin.abs() {
-                        let size_increase = next_potential_pos.abs() - cumulative_pos_for_margin.abs();
-                        estimated_margin_increase += self.margin_calculator.initial_margin_required(size_increase, order.limit_px);
+                    if order.reduce_only {
+                        has_reduce_only = true;
                     }
 
-                    cumulative_pos_for_margin = next_potential_pos;
-                } else {
-                    // Update cumulative position for reduce_only orders without counting margin
-                    cumulative_pos_for_margin += position_delta;
+                    // Only count margin for non-reduce_only orders that increase position
+                    if !order.reduce_only {
+                        let next_potential_pos = cumulative_pos_for_margin + position_delta;
+
+                        // Estimate margin increase ONLY if the order *increases* the absolute position size
+                        if next_potential_pos.abs() > cumulative_pos_for_margin.abs() {
+                            let size_increase = next_potential_pos.abs() - cumulative_pos_for_margin.abs();
+                            estimated_margin_increase += self.margin_calculator.initial_margin_required(size_increase, order.limit_px);
+                        }
+
+                        cumulative_pos_for_margin = next_potential_pos;
+                    } else {
+                        // Update cumulative position for reduce_only orders without counting margin
+                        cumulative_pos_for_margin += position_delta;
+                    }
+                }
+                StrategyAction::BatchPlace(orders) => {
+                    // Process each order in the batch
+                    for order in orders {
+                        let position_delta = if order.is_buy { order.sz } else { -order.sz };
+
+                        // ALWAYS count ALL orders (including reduce_only) for position validation
+                        net_size_change += position_delta;
+
+                        if order.reduce_only {
+                            has_reduce_only = true;
+                        }
+
+                        // Only count margin for non-reduce_only orders that increase position
+                        if !order.reduce_only {
+                            let next_potential_pos = cumulative_pos_for_margin + position_delta;
+
+                            // Estimate margin increase ONLY if the order *increases* the absolute position size
+                            if next_potential_pos.abs() > cumulative_pos_for_margin.abs() {
+                                let size_increase = next_potential_pos.abs() - cumulative_pos_for_margin.abs();
+                                estimated_margin_increase += self.margin_calculator.initial_margin_required(size_increase, order.limit_px);
+                            }
+
+                            cumulative_pos_for_margin = next_potential_pos;
+                        } else {
+                            // Update cumulative position for reduce_only orders without counting margin
+                            cumulative_pos_for_margin += position_delta;
+                        }
+                    }
+                }
+                _ => {
+                    // Do nothing for Cancel or NoOp actions
                 }
             }
         }
