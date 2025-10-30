@@ -89,10 +89,16 @@ impl LockFreeWsManager {
             let writer = writer.clone();
             let stop_flag = Arc::clone(&stop_flag);
             let reader_fut = async move {
+                let mut message_count = 0u64;
                 while !stop_flag.load(Ordering::Relaxed) {
                     if let Some(data) = reader.next().await {
                         // Increment message counter atomically
+                        message_count += 1;
                         total_messages_copy.fetch_add(1, Ordering::Relaxed);
+
+                        if message_count <= 10 || message_count % 100 == 0 {
+                            info!("[WsManager Reader] 📨 Received message #{} from WebSocket", message_count);
+                        }
 
                         if let Err(err) =
                             LockFreeWsManager::parse_and_send_data(data, &subscriptions_copy).await
@@ -299,13 +305,22 @@ impl LockFreeWsManager {
                     let subscriptions = subscriptions.read();
                     let mut res = Ok(());
                     if let Some(subscription_datas) = subscriptions.get(&identifier) {
+                        info!("[WsManager] 📤 Dispatching message with identifier '{}' to {} subscription(s)",
+                            identifier.chars().take(50).collect::<String>(), subscription_datas.len());
                         for subscription_data in subscription_datas {
                             // flume send is much faster than tokio::mpsc
-                            if let Err(_e) = subscription_data.sending_channel.send(message.clone())
+                            if let Err(e) = subscription_data.sending_channel.send(message.clone())
                             {
+                                error!("[WsManager] ❌ Flume send failed for identifier '{}': {:?}", identifier, e);
                                 res = Err(Error::WsSend("flume send error".to_string()));
+                            } else {
+                                info!("[WsManager] ✓ Sent message to subscription for identifier '{}'",
+                                    identifier.chars().take(50).collect::<String>());
                             }
                         }
+                    } else {
+                        warn!("[WsManager] ⚠️  No subscriptions found for identifier '{}'",
+                            identifier.chars().take(50).collect::<String>());
                     }
                     res
                 }
@@ -418,8 +433,11 @@ impl LockFreeWsManager {
         subscriptions.push(SubscriptionData {
             sending_channel,
             subscription_id,
-            id: identifier,
+            id: identifier.clone(),
         });
+
+        info!("[WsManager] ➕ Added subscription #{} for identifier_entry '{}' (original identifier: '{}')",
+            subscription_id, identifier_entry, identifier.chars().take(50).collect::<String>());
 
         self.subscription_id += 1;
         Ok(subscription_id)
