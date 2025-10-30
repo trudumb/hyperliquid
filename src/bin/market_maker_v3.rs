@@ -820,11 +820,8 @@ impl StateManagerActor {
 
     /// Validates actions against authoritative state to ensure position and margin limits.
     ///
-    /// Performs atomic validation of:
-    /// - Position size limits (max_position_size) INCLUDING pending orders on exchange
-    /// - Margin requirements (with safety buffer)
-    ///
-    /// Returns (is_valid, error_message)
+    /// CRITICAL FIX: This version ONLY validates new Place orders.
+    /// Cancel orders are ALWAYS allowed, to prevent the deadlock loop.
     fn validate_actions(
         &self,
         global_state: &GlobalAccountState,
@@ -839,8 +836,7 @@ impl StateManagerActor {
 
         let current_position = asset_state.map_or(0.0, |s| s.position);
 
-        // Calculate pending exposure from orders already live on exchange
-        // Bids = positive (potential buys), Asks = negative (potential sells)
+        // Get the *actual* pending exposure from orders already on the exchange book
         let pending_exposure = asset_state.map_or(0.0, |s| {
             let bid_exposure: f64 = s.open_bids.iter().map(|o| o.size).sum();
             let ask_exposure: f64 = s.open_asks.iter().map(|o| o.size).sum();
@@ -852,106 +848,81 @@ impl StateManagerActor {
             asset_name, current_position, pending_exposure, self.max_position_size
         );
 
-        let mut net_size_change = 0.0;
+        let mut net_size_change_from_new_orders = 0.0;
         let mut estimated_margin_increase = 0.0;
 
         // Start from current position + pending orders to get true exposure
         let mut cumulative_pos_for_margin = current_position + pending_exposure;
-        let mut has_reduce_only = false;
 
+        // --- ONLY VALIDATE NEW PLACE ORDERS ---
         for action in actions {
             match action {
                 StrategyAction::Place(order) => {
                     let position_delta = if order.is_buy { order.sz } else { -order.sz };
+                    net_size_change_from_new_orders += position_delta;
 
-                    // ALWAYS count ALL orders (including reduce_only) for position validation
-                    net_size_change += position_delta;
-
-                    if order.reduce_only {
-                        has_reduce_only = true;
-                    }
-
-                    // Only count margin for non-reduce_only orders that increase position
                     if !order.reduce_only {
                         let next_potential_pos = cumulative_pos_for_margin + position_delta;
-
-                        // Estimate margin increase ONLY if the order *increases* the absolute position size
                         if next_potential_pos.abs() > cumulative_pos_for_margin.abs() {
                             let size_increase = next_potential_pos.abs() - cumulative_pos_for_margin.abs();
                             estimated_margin_increase += self.margin_calculator.initial_margin_required(size_increase, order.limit_px);
                         }
-
                         cumulative_pos_for_margin = next_potential_pos;
                     } else {
-                        // Update cumulative position for reduce_only orders without counting margin
                         cumulative_pos_for_margin += position_delta;
                     }
                 }
                 StrategyAction::BatchPlace(orders) => {
-                    // Process each order in the batch
                     for order in orders {
                         let position_delta = if order.is_buy { order.sz } else { -order.sz };
+                        net_size_change_from_new_orders += position_delta;
 
-                        // ALWAYS count ALL orders (including reduce_only) for position validation
-                        net_size_change += position_delta;
-
-                        if order.reduce_only {
-                            has_reduce_only = true;
-                        }
-
-                        // Only count margin for non-reduce_only orders that increase position
                         if !order.reduce_only {
                             let next_potential_pos = cumulative_pos_for_margin + position_delta;
-
-                            // Estimate margin increase ONLY if the order *increases* the absolute position size
                             if next_potential_pos.abs() > cumulative_pos_for_margin.abs() {
                                 let size_increase = next_potential_pos.abs() - cumulative_pos_for_margin.abs();
                                 estimated_margin_increase += self.margin_calculator.initial_margin_required(size_increase, order.limit_px);
                             }
-
                             cumulative_pos_for_margin = next_potential_pos;
                         } else {
-                            // Update cumulative position for reduce_only orders without counting margin
                             cumulative_pos_for_margin += position_delta;
                         }
                     }
                 }
-                _ => {
-                    // Do nothing for Cancel or NoOp actions
+                // --- CRITICAL CHANGE: Ignore Cancel and NoOp actions for validation ---
+                StrategyAction::Cancel(_) | StrategyAction::BatchCancel(_) | StrategyAction::NoOp => {
+                    // Do nothing, allow these to pass
                 }
             }
         }
 
-        // --- Position Check (INCLUDING PENDING ORDERS) ---
-        // This prevents the race condition where orders fill faster than state updates
-        let final_potential_position = current_position + pending_exposure + net_size_change;
+        // If there are no new orders, validation passes (this allows cancels to go through)
+        if net_size_change_from_new_orders.abs() < 1e-9 && estimated_margin_increase.abs() < 1e-9 {
+             debug!("[State Manager] Validation PASSED for [{}]: Only cancel/noop actions.", asset_name);
+            return (true, String::new());
+        }
+
+        // --- Position Check (ONLY for new orders) ---
+        let final_potential_position = current_position + pending_exposure + net_size_change_from_new_orders;
 
         debug!(
             "[State Manager] Full position check: Current={:.4}, Pending={:.4}, New={:.4}, Final={:.4}, Max={:.4}",
-            current_position, pending_exposure, net_size_change, final_potential_position, self.max_position_size
+            current_position, pending_exposure, net_size_change_from_new_orders, final_potential_position, self.max_position_size
         );
 
-        if final_potential_position.abs() > self.max_position_size + 1e-9 { // Add tolerance for float errors
-            // Allow liquidation orders (reduce_only) even if still over limit
-            if has_reduce_only {
-                warn!(
-                    "[State Manager] ⚠️ Position still over limit but allowing reduce_only liquidation: Current={:.4}, Pending={:.4}, Final={:.4}",
-                    current_position, pending_exposure, final_potential_position
-                );
-            } else {
-                let msg = format!(
-                    "Exceeds position limit (Current: {:.4}, Pending: {:.4}, New: {:.4}, Final: {:.4}, Max: {:.4})",
-                    current_position, pending_exposure, net_size_change, final_potential_position, self.max_position_size
-                );
-                return (false, msg);
-            }
+        if final_potential_position.abs() > self.max_position_size + 1e-9 {
+            let msg = format!(
+                "Exceeds position limit (Current: {:.4}, Pending: {:.4}, New: {:.4}, Final: {:.4}, Max: {:.4})",
+                current_position, pending_exposure, net_size_change_from_new_orders, final_potential_position, self.max_position_size
+            );
+            return (false, msg);
         }
 
-        // --- Margin Check ---
+        // --- Margin Check (ONLY for new orders) ---
         let potential_margin_used = global_state.margin_used + estimated_margin_increase;
         let max_allowed_margin = global_state.account_equity * (1.0 - self.safety_buffer);
 
-        if potential_margin_used > max_allowed_margin + 1e-9 { // Add tolerance
+        if potential_margin_used > max_allowed_margin + 1e-9 {
             let msg = format!(
                 "Insufficient margin (Current Used: {:.2}, Est. Increase: {:.2}, Potential Used: {:.2}, Max Allowed: {:.2}, Equity: {:.2})",
                 global_state.margin_used, estimated_margin_increase, potential_margin_used, max_allowed_margin, global_state.account_equity
@@ -961,7 +932,7 @@ impl StateManagerActor {
 
         debug!(
             "[State Manager] ✅ Validation PASSED for {}: Current={:.4}, Pending={:.4}, New={:.4}, Final={:.4}, Margin={:.2}",
-            asset_name, current_position, pending_exposure, net_size_change, final_potential_position, estimated_margin_increase
+            asset_name, current_position, pending_exposure, net_size_change_from_new_orders, final_potential_position, estimated_margin_increase
         );
         (true, String::new())
     }
