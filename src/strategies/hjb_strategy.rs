@@ -612,6 +612,16 @@ impl Strategy for HjbStrategy {
         if let Some(ref l2_book) = update.l2_book {
             debug!("[HJB STRATEGY {}] Processing L2 book update", self.config.asset);
             self.handle_l2_book_update(state, l2_book);
+
+            // --- FIX: Trigger volatility update from L2Book's mid-price ---
+            // The mid-price was just synced to state_vector by sync_state_vector.
+            // We need to update the particle filter with this price to ensure
+            // live volatility estimation on high-frequency L2Book ticks.
+            if self.state_vector.mid_price > 0.0 {
+                // state.l2_mid_price was updated by sync_state_vector earlier
+                self.handle_mid_price_update(state, state.l2_mid_price);
+            }
+            // --- END FIX ---
         }
 
         if !update.trades.is_empty() {
@@ -619,7 +629,8 @@ impl Strategy for HjbStrategy {
             self.handle_trades_update(state, &update.trades);
         }
 
-        if update.mid_price.is_some() {
+        // This 'else if' prevents running the update twice if an AllMids message comes
+        else if update.mid_price.is_some() {
             debug!("[HJB STRATEGY {}] Processing mid price update: ${:.3}",
                 self.config.asset, update.mid_price.unwrap());
             self.handle_mid_price_update(state, update.mid_price.unwrap());
