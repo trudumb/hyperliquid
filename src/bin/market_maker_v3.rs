@@ -820,8 +820,9 @@ impl StateManagerActor {
 
     /// Validates actions against authoritative state to ensure position and margin limits.
     ///
-    /// CRITICAL FIX: This version ONLY validates new Place orders.
-    /// Cancel orders are ALWAYS allowed, to prevent the deadlock loop.
+    /// CRITICAL FIX: This version calculates the net effect of cancels AND new orders.
+    /// If the batch is net-reducing (or neutral), it always passes validation,
+    /// preventing the validation-rejection deadlock loop.
     fn validate_actions(
         &self,
         global_state: &GlobalAccountState,
@@ -848,13 +849,41 @@ impl StateManagerActor {
             asset_name, current_position, pending_exposure, self.max_position_size
         );
 
+        // --- STEP 1: Calculate exposure being removed by cancels ---
+        let mut cancel_exposure = 0.0;
+        if let Some(state) = asset_state {
+            for action in actions {
+                match action {
+                    StrategyAction::Cancel(cancel) => {
+                        // Find this order and calculate its contribution to exposure
+                        if let Some(order) = state.open_bids.iter().find(|o| o.oid == Some(cancel.oid)) {
+                            cancel_exposure += order.size; // Bids add positive exposure
+                        } else if let Some(order) = state.open_asks.iter().find(|o| o.oid == Some(cancel.oid)) {
+                            cancel_exposure -= order.size; // Asks add negative exposure
+                        }
+                    }
+                    StrategyAction::BatchCancel(cancels) => {
+                        for cancel in cancels {
+                            if let Some(order) = state.open_bids.iter().find(|o| o.oid == Some(cancel.oid)) {
+                                cancel_exposure += order.size;
+                            } else if let Some(order) = state.open_asks.iter().find(|o| o.oid == Some(cancel.oid)) {
+                                cancel_exposure -= order.size;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // --- STEP 2: Calculate exposure being added by new orders ---
         let mut net_size_change_from_new_orders = 0.0;
         let mut estimated_margin_increase = 0.0;
 
-        // Start from current position + pending orders to get true exposure
-        let mut cumulative_pos_for_margin = current_position + pending_exposure;
+        // Start from current position + pending orders (AFTER cancels) to get true exposure
+        let adjusted_pending_exposure = pending_exposure - cancel_exposure;
+        let mut cumulative_pos_for_margin = current_position + adjusted_pending_exposure;
 
-        // --- ONLY VALIDATE NEW PLACE ORDERS ---
         for action in actions {
             match action {
                 StrategyAction::Place(order) => {
@@ -889,36 +918,48 @@ impl StateManagerActor {
                         }
                     }
                 }
-                // --- CRITICAL CHANGE: Ignore Cancel and NoOp actions for validation ---
-                StrategyAction::Cancel(_) | StrategyAction::BatchCancel(_) | StrategyAction::NoOp => {
-                    // Do nothing, allow these to pass
-                }
+                // Cancels already processed above
+                StrategyAction::Cancel(_) | StrategyAction::BatchCancel(_) | StrategyAction::NoOp => {}
             }
         }
 
-        // If there are no new orders, validation passes (this allows cancels to go through)
-        if net_size_change_from_new_orders.abs() < 1e-9 && estimated_margin_increase.abs() < 1e-9 {
-             debug!("[State Manager] Validation PASSED for [{}]: Only cancel/noop actions.", asset_name);
+        // --- STEP 3: DEADLOCK FIX - Allow batches that reduce or maintain exposure ---
+        // Calculate the net change in total exposure
+        let current_total_exposure = (current_position + pending_exposure).abs();
+        let final_total_exposure = (current_position + adjusted_pending_exposure + net_size_change_from_new_orders).abs();
+        let net_exposure_change = final_total_exposure - current_total_exposure;
+
+        debug!(
+            "[State Manager] Exposure analysis [{}]: Current Total={:.4}, Cancel={:.4}, New={:.4}, Final Total={:.4}, Net Change={:.4}",
+            asset_name, current_total_exposure, cancel_exposure.abs(), net_size_change_from_new_orders.abs(), final_total_exposure, net_exposure_change
+        );
+
+        // If this batch reduces or maintains total exposure, ALWAYS allow it (prevents deadlock)
+        if net_exposure_change <= 1e-9 {
+            info!(
+                "[State Manager] ✅ Validation PASSED for [{}]: Batch is net-reducing/neutral (Change: {:.4})",
+                asset_name, net_exposure_change
+            );
             return (true, String::new());
         }
 
-        // --- Position Check (ONLY for new orders) ---
-        let final_potential_position = current_position + pending_exposure + net_size_change_from_new_orders;
+        // --- STEP 4: Position Check (for exposure-increasing batches only) ---
+        let final_potential_position = current_position + adjusted_pending_exposure + net_size_change_from_new_orders;
 
         debug!(
-            "[State Manager] Full position check: Current={:.4}, Pending={:.4}, New={:.4}, Final={:.4}, Max={:.4}",
-            current_position, pending_exposure, net_size_change_from_new_orders, final_potential_position, self.max_position_size
+            "[State Manager] Position limit check: Current={:.4}, Pending={:.4}, Cancel={:.4}, New={:.4}, Final={:.4}, Max={:.4}",
+            current_position, pending_exposure, cancel_exposure, net_size_change_from_new_orders, final_potential_position, self.max_position_size
         );
 
         if final_potential_position.abs() > self.max_position_size + 1e-9 {
             let msg = format!(
-                "Exceeds position limit (Current: {:.4}, Pending: {:.4}, New: {:.4}, Final: {:.4}, Max: {:.4})",
-                current_position, pending_exposure, net_size_change_from_new_orders, final_potential_position, self.max_position_size
+                "Exceeds position limit (Current: {:.4}, Pending: {:.4}, Cancel: {:.4}, New: {:.4}, Final: {:.4}, Max: {:.4})",
+                current_position, pending_exposure, cancel_exposure, net_size_change_from_new_orders, final_potential_position, self.max_position_size
             );
             return (false, msg);
         }
 
-        // --- Margin Check (ONLY for new orders) ---
+        // --- STEP 5: Margin Check (for exposure-increasing batches only) ---
         let potential_margin_used = global_state.margin_used + estimated_margin_increase;
         let max_allowed_margin = global_state.account_equity * (1.0 - self.safety_buffer);
 
@@ -930,9 +971,9 @@ impl StateManagerActor {
             return (false, msg);
         }
 
-        debug!(
-            "[State Manager] ✅ Validation PASSED for {}: Current={:.4}, Pending={:.4}, New={:.4}, Final={:.4}, Margin={:.2}",
-            asset_name, current_position, pending_exposure, net_size_change_from_new_orders, final_potential_position, estimated_margin_increase
+        info!(
+            "[State Manager] ✅ Validation PASSED for {}: Current={:.4}, Pending={:.4}, Cancel={:.4}, New={:.4}, Final={:.4}, Margin Increase={:.2}",
+            asset_name, current_position, pending_exposure, cancel_exposure, net_size_change_from_new_orders, final_potential_position, estimated_margin_increase
         );
         (true, String::new())
     }
@@ -1525,6 +1566,7 @@ impl StrategyRunnerActor {
     /// Sends a list of actions to the State Manager for execution.
     /// CRITICAL FIX: This method no longer blocks waiting for a response.
     /// Response handling is done in a separate task to avoid blocking the event loop.
+    /// If actions are rejected, clears the local order cache to force state reconciliation.
     async fn send_actions(&self, actions: Vec<StrategyAction>) {
         let place_count = actions.iter().filter(|a| matches!(a, StrategyAction::Place(_) | StrategyAction::BatchPlace(_))).count();
         let cancel_count = actions.iter().filter(|a| matches!(a, StrategyAction::Cancel(_) | StrategyAction::BatchCancel(_))).count();
@@ -1547,6 +1589,7 @@ impl StrategyRunnerActor {
         // CRITICAL FIX: Spawn a separate task to handle the response
         // This prevents blocking the main event loop
         let asset_clone = self.asset.clone();
+        let state_cache_clone = self.local_state_cache.clone();
         tokio::spawn(async move {
             match resp_rx.await {
                 Ok(response) => {
@@ -1554,6 +1597,20 @@ impl StrategyRunnerActor {
                         warn!(
                             "[Runner {}] ❌ Actions REJECTED by State Manager: {}",
                             asset_clone, response.message
+                        );
+
+                        // SECONDARY FIX: Clear local order cache to force reconciliation
+                        // This prevents the runner from getting stuck with stale order state
+                        let mut state = state_cache_clone.write().await;
+                        let old_bid_count = state.open_bids.len();
+                        let old_ask_count = state.open_asks.len();
+                        state.open_bids.clear();
+                        state.open_asks.clear();
+                        drop(state);
+
+                        warn!(
+                            "[Runner {}] 🔄 Cleared local order cache ({} bids, {} asks) - waiting for State Manager reconciliation",
+                            asset_clone, old_bid_count, old_ask_count
                         );
                     } else {
                         info!(
