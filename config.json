@@ -20,7 +20,7 @@
           "max_levels": 5,
           "min_profitable_spread_bps": 6.0,
           "level_spacing_bps": 3.0,
-          "total_size_per_side": 0.7,
+          "total_size_per_side": 1.0,
           "inventory_risk_limit": 0.7,
           "directional_aggression": 2.0,
           "momentum_threshold": 1.3,
