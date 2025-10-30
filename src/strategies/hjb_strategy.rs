@@ -582,20 +582,33 @@ impl Strategy for HjbStrategy {
         debug!("[HJB STRATEGY {}] Target quotes: {} bids, {} asks",
             self.config.asset, target_bids.len(), target_asks.len());
 
-        // Check if liquidation mode is active
-        let liquidation_active = self.cached_optimizer_result
-            .as_ref()
-            .map(|cached| cached.output.liquidate)
-            .unwrap_or(false);
+        // --- NEW TIERED LOGIC ---
 
-        if liquidation_active {
-            warn!("[HJB STRATEGY {}] 🚨 LIQUIDATION MODE ACTIVE", self.config.asset);
-            // In liquidation mode, use special liquidation order logic
-            self.place_liquidation_orders(state)
-        } else {
-            // Normal mode: reconcile with existing orders
-            self.reconcile_orders(state, target_bids, target_asks)
+        // 1. Always reconcile MAKER orders.
+        //    (The aggressive skew from `calculate_aggression` is already in target_bids/target_asks)
+        let mut actions = self.reconcile_orders(state, target_bids, target_asks);
+
+        // 2. Check if the optimizer *also* requested TAKER orders (Tier 3)
+        let (taker_buy_rate, taker_sell_rate) = self.cached_optimizer_result
+            .as_ref()
+            .map(|cached| (cached.output.taker_buy_rate, cached.output.taker_sell_rate))
+            .unwrap_or((0.0, 0.0));
+
+        // 3. If TAKER orders are requested, add them (and cancel all existing orders for safety)
+        if taker_buy_rate > 0.0 || taker_sell_rate > 0.0 {
+            warn!("[HJB STRATEGY {}] 🚨 TAKER URGENCY: Adding taker orders to actions (buy_rate={:.4}, sell_rate={:.4})",
+                self.config.asset, taker_buy_rate, taker_sell_rate);
+
+            // Add actions to cancel *all* existing orders
+            actions.extend(self.create_cancel_all_orders(state));
+
+            // Add the new TAKER orders
+            // (Use the consolidated logic from the previous fix to avoid notional value errors)
+            actions.extend(self.create_taker_liquidation_orders(state, taker_buy_rate, taker_sell_rate));
         }
+
+        actions // Return all actions
+        // --- END NEW TIERED LOGIC ---
     }
 
     fn on_user_update(
@@ -646,25 +659,34 @@ impl Strategy for HjbStrategy {
             // Calculate optimal quotes
             let (target_bids, target_asks) = self.calculate_multi_level_targets(state);
 
-            // *** FIX 2: Check if liquidation mode is active AFTER running the optimizer ***
-            // Don't place new maker orders if we're trying to liquidate
-            let liquidation_active = self.cached_optimizer_result
-                .as_ref()
-                .map(|cached| cached.output.liquidate)
-                .unwrap_or(false);
-
-            if liquidation_active {
-                warn!("[HJB STRATEGY {}] on_tick: In liquidation mode, skipping initial order placement.", self.config.asset);
-                // Do not place new maker orders if we are trying to liquidate
-                return vec![StrategyAction::NoOp];
-            }
-            // *** END FIX 2 ***
-
             info!("[HJB STRATEGY {}] Generated {} target bids, {} target asks",
                 self.config.asset, target_bids.len(), target_asks.len());
 
-            // Generate orders for all target levels
-            return self.reconcile_orders(state, target_bids, target_asks);
+            // --- NEW TIERED LOGIC (same as on_market_update) ---
+
+            // 1. Always reconcile MAKER orders
+            let mut actions = self.reconcile_orders(state, target_bids, target_asks);
+
+            // 2. Check if the optimizer also requested TAKER orders (Tier 3)
+            let (taker_buy_rate, taker_sell_rate) = self.cached_optimizer_result
+                .as_ref()
+                .map(|cached| (cached.output.taker_buy_rate, cached.output.taker_sell_rate))
+                .unwrap_or((0.0, 0.0));
+
+            // 3. If TAKER orders are requested, add them
+            if taker_buy_rate > 0.0 || taker_sell_rate > 0.0 {
+                warn!("[HJB STRATEGY {}] on_tick: TAKER URGENCY detected (buy_rate={:.4}, sell_rate={:.4})",
+                    self.config.asset, taker_buy_rate, taker_sell_rate);
+
+                // Cancel all existing orders for safety
+                actions.extend(self.create_cancel_all_orders(state));
+
+                // Add taker orders
+                actions.extend(self.create_taker_liquidation_orders(state, taker_buy_rate, taker_sell_rate));
+            }
+
+            return actions;
+            // --- END NEW TIERED LOGIC ---
         }
 
         // Periodic cleanup and updates for existing orders
@@ -1430,40 +1452,17 @@ impl HjbStrategy {
         actions
     }
 
-    /// Place liquidation orders to reduce position urgently.
+    /// Create cancel actions for all open orders.
     ///
-    /// This is called when the optimizer detects extreme inventory risk.
-    /// Instead of normal market making quotes, we:
-    /// 1. Cancel ALL existing orders (both sides)
-    /// 2. Place aggressive reduction-only orders on the appropriate side
-    ///
-    /// For long positions (inventory > 0): place aggressive sell orders
-    /// For short positions (inventory < 0): place aggressive buy orders
-    fn place_liquidation_orders(
+    /// This is used as part of Tier 3 liquidation to ensure we don't add to position
+    /// while trying to urgently exit.
+    fn create_cancel_all_orders(
         &self,
         state: &CurrentState,
     ) -> Vec<StrategyAction> {
         let mut actions = Vec::new();
 
-        // Get taker rates from cached optimizer result
-        let (taker_buy_rate, taker_sell_rate) = self.cached_optimizer_result
-            .as_ref()
-            .map(|cached| (cached.output.taker_buy_rate, cached.output.taker_sell_rate))
-            .unwrap_or((0.0, 0.0));
-
-        // Determine which side needs liquidation
-        let inventory = state.position;
-        let is_long = inventory > 0.0;
-        let is_short = inventory < 0.0;
-
-        log::warn!(
-            "💥 EXECUTING LIQUIDATION: position={:.2}, taker_buy={:.4}, taker_sell={:.4}",
-            inventory, taker_buy_rate, taker_sell_rate
-        );
-
-        // Step 1: Cancel ALL existing orders on BOTH sides
-        // This ensures we're not adding to the position accidentally
-        // ✅ FIX: Skip orders already in PendingCancel state
+        // Cancel ALL existing orders on BOTH sides
         for order in &state.open_bids {
             if order.state == OrderState::PendingCancel {
                 debug!("Skipping bid OID {:?} - already PendingCancel", order.oid);
@@ -1490,29 +1489,40 @@ impl HjbStrategy {
             }
         }
 
-        // Step 2: Place aggressive liquidation orders on the reduction side
+        actions
+    }
+
+    /// Create taker liquidation orders based on rates.
+    ///
+    /// This is Tier 3 of the liquidation logic - aggressive taker orders
+    /// used only when inventory exceeds the urgency threshold (e.g., > 90%).
+    fn create_taker_liquidation_orders(
+        &self,
+        state: &CurrentState,
+        taker_buy_rate: f64,
+        taker_sell_rate: f64,
+    ) -> Vec<StrategyAction> {
+        let mut actions = Vec::new();
+        let inventory = state.position;
+        let is_long = inventory > 0.0;
+        let is_short = inventory < 0.0;
+
         if is_long && taker_sell_rate > 0.0 {
             // TOO LONG: Need to sell aggressively
-            // Place sell orders at multiple levels to increase fill probability
             self.place_aggressive_sell_orders(state, taker_sell_rate, &mut actions);
         } else if is_short && taker_buy_rate > 0.0 {
             // TOO SHORT: Need to buy aggressively
             self.place_aggressive_buy_orders(state, taker_buy_rate, &mut actions);
-        } else {
+        } else if taker_buy_rate > 0.0 || taker_sell_rate > 0.0 {
             log::warn!(
-                "⚠️  Liquidation triggered but no taker rate available (buy={:.4}, sell={:.4})",
+                "⚠️  Taker liquidation triggered but no valid rate (buy={:.4}, sell={:.4})",
                 taker_buy_rate, taker_sell_rate
             );
         }
 
-        log::info!("💥 Liquidation actions: {} total ({} cancels, {} new orders)",
-            actions.len(),
-            actions.iter().filter(|a| matches!(a, StrategyAction::Cancel(_))).count(),
-            actions.iter().filter(|a| matches!(a, StrategyAction::Place(_))).count()
-        );
-
         actions
     }
+
 
     /// Place aggressive sell orders to reduce long position.
     ///
