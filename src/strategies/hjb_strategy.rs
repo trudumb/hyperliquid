@@ -646,6 +646,20 @@ impl Strategy for HjbStrategy {
             // Calculate optimal quotes
             let (target_bids, target_asks) = self.calculate_multi_level_targets(state);
 
+            // *** FIX 2: Check if liquidation mode is active AFTER running the optimizer ***
+            // Don't place new maker orders if we're trying to liquidate
+            let liquidation_active = self.cached_optimizer_result
+                .as_ref()
+                .map(|cached| cached.output.liquidate)
+                .unwrap_or(false);
+
+            if liquidation_active {
+                warn!("[HJB STRATEGY {}] on_tick: In liquidation mode, skipping initial order placement.", self.config.asset);
+                // Do not place new maker orders if we are trying to liquidate
+                return vec![StrategyAction::NoOp];
+            }
+            // *** END FIX 2 ***
+
             info!("[HJB STRATEGY {}] Generated {} target bids, {} target asks",
                 self.config.asset, target_bids.len(), target_asks.len());
 
@@ -1516,14 +1530,44 @@ impl HjbStrategy {
             .and_then(|book| book.best_bid())
             .unwrap_or(state.l2_mid_price * 0.999);
 
+        let min_price_step = 10f64.powi(-(self.tick_lot_validator.max_price_decimals() as i32));
+        let min_size_step = 10f64.powi(-(self.tick_lot_validator.sz_decimals as i32));
+        let min_notional = 10.0; // $10 minimum
+
+        // *** FIX 1: Check if the total size is already below the notional limit ***
+        // If so, place it as a single order instead of splitting into dust
+        if (total_size * best_bid) < min_notional {
+            if total_size >= min_size_step {
+                log::info!(
+                    "   📤 Liquidation SELL (Single Order): {:.4} @ {:.2} (reduce_only)",
+                    total_size, best_bid
+                );
+                actions.push(StrategyAction::Place(ClientOrderRequest {
+                    asset: self.config.asset.clone(),
+                    is_buy: false,
+                    reduce_only: true,
+                    limit_px: best_bid, // Most aggressive price
+                    sz: total_size,
+                    cloid: Some(uuid::Uuid::new_v4()),
+                    order_type: ClientOrder::Limit(ClientLimit {
+                        tif: "Ioc".to_string(),
+                    }),
+                }));
+            } else {
+                log::warn!(
+                    "   ⚠️  Skipping Liquidation SELL: Total size {:.4} is below min size step {:.4}",
+                    total_size, min_size_step
+                );
+            }
+            return; // Exit function
+        }
+        // *** END FIX 1 ***
+
+        // If total_size is large enough, proceed with splitting
         // Use a 3-level approach for aggressive liquidation:
         // Level 1: 50% at best bid (most aggressive, highest fill probability)
         // Level 2: 30% at best bid + 1 tick (slightly less aggressive)
         // Level 3: 20% at best bid + 2 ticks (fallback)
-
-        let min_price_step = 10f64.powi(-(self.tick_lot_validator.max_price_decimals() as i32));
-        let min_size_step = 10f64.powi(-(self.tick_lot_validator.sz_decimals as i32));
-
         let levels = vec![
             (best_bid, 0.50), // 50% at best bid
             (best_bid + min_price_step, 0.30), // 30% at +1 tick
@@ -1546,7 +1590,6 @@ impl HjbStrategy {
             if adjusted_size >= min_size_step {
                 // Check minimum notional value ($10)
                 let notional_value = adjusted_size * price;
-                let min_notional = 10.0;
 
                 if notional_value < min_notional {
                     log::warn!(
@@ -1592,14 +1635,44 @@ impl HjbStrategy {
             .and_then(|book| book.best_ask())
             .unwrap_or(state.l2_mid_price * 1.001);
 
+        let min_price_step = 10f64.powi(-(self.tick_lot_validator.max_price_decimals() as i32));
+        let min_size_step = 10f64.powi(-(self.tick_lot_validator.sz_decimals as i32));
+        let min_notional = 10.0; // $10 minimum
+
+        // *** FIX 1: Check if the total size is already below the notional limit ***
+        // If so, place it as a single order instead of splitting into dust
+        if (total_size * best_ask) < min_notional {
+            if total_size >= min_size_step {
+                log::info!(
+                    "   📥 Liquidation BUY (Single Order): {:.4} @ {:.2} (reduce_only)",
+                    total_size, best_ask
+                );
+                actions.push(StrategyAction::Place(ClientOrderRequest {
+                    asset: self.config.asset.clone(),
+                    is_buy: true,
+                    reduce_only: true,
+                    limit_px: best_ask, // Most aggressive price
+                    sz: total_size,
+                    cloid: Some(uuid::Uuid::new_v4()),
+                    order_type: ClientOrder::Limit(ClientLimit {
+                        tif: "Ioc".to_string(),
+                    }),
+                }));
+            } else {
+                log::warn!(
+                    "   ⚠️  Skipping Liquidation BUY: Total size {:.4} is below min size step {:.4}",
+                    total_size, min_size_step
+                );
+            }
+            return; // Exit function
+        }
+        // *** END FIX 1 ***
+
+        // If total_size is large enough, proceed with splitting
         // Use a 3-level approach for aggressive liquidation:
         // Level 1: 50% at best ask (most aggressive, highest fill probability)
         // Level 2: 30% at best ask - 1 tick (slightly less aggressive)
         // Level 3: 20% at best ask - 2 ticks (fallback)
-
-        let min_price_step = 10f64.powi(-(self.tick_lot_validator.max_price_decimals() as i32));
-        let min_size_step = 10f64.powi(-(self.tick_lot_validator.sz_decimals as i32));
-
         let levels = vec![
             (best_ask, 0.50), // 50% at best ask
             (best_ask - min_price_step, 0.30), // 30% at -1 tick
@@ -1622,7 +1695,6 @@ impl HjbStrategy {
             if adjusted_size >= min_size_step {
                 // Check minimum notional value ($10)
                 let notional_value = adjusted_size * price;
-                let min_notional = 10.0;
 
                 if notional_value < min_notional {
                     log::warn!(
