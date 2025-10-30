@@ -253,6 +253,7 @@ impl StateManagerActor {
         info!("[State Manager] Initial state broadcast complete.");
 
         // Spawn a task to periodically fetch full account state via REST for reconciliation
+        // CRITICAL FIX: Use try_write() to avoid blocking the State Manager's event loop
         let global_state_clone = self.global_account_state.clone();
         let user_address = self.user_address;
         tokio::spawn(async move {
@@ -271,20 +272,56 @@ impl StateManagerActor {
             loop {
                 timer.tick().await;
                 debug!("[State Manager] Reconciling account state via REST...");
-                match info_client_for_reconciliation.user_state(user_address).await {
+
+                // Fetch state from REST API
+                let user_state_result = info_client_for_reconciliation.user_state(user_address).await;
+
+                match user_state_result {
                     Ok(user_state) => {
-                        let mut state = global_state_clone.write().await;
-                        state.account_equity = user_state
+                        // Parse values before attempting lock
+                        let account_equity: f64 = user_state
                             .margin_summary
                             .account_value
                             .parse()
-                            .unwrap_or(state.account_equity);
-                        state.margin_used = user_state
+                            .unwrap_or(0.0);
+                        let margin_used: f64 = user_state
                             .margin_summary
                             .total_margin_used
                             .parse()
-                            .unwrap_or(state.margin_used);
-                        state.timestamp_ms = chrono::Utc::now().timestamp_millis() as u64;
+                            .unwrap_or(0.0);
+                        let timestamp_ms = chrono::Utc::now().timestamp_millis() as u64;
+
+                        // Try to acquire write lock with exponential backoff
+                        let mut backoff_ms = 10;
+                        let max_attempts = 5;
+                        let mut success = false;
+
+                        for attempt in 1..=max_attempts {
+                            match global_state_clone.try_write() {
+                                Ok(mut state) => {
+                                    // Successfully acquired lock - update quickly
+                                    state.account_equity = account_equity;
+                                    state.margin_used = margin_used;
+                                    state.timestamp_ms = timestamp_ms;
+                                    debug!("[State Manager] ✓ Reconciliation complete: equity=${:.2}, margin=${:.2}",
+                                        account_equity, margin_used);
+                                    success = true;
+                                    break;
+                                }
+                                Err(_) => {
+                                    if attempt < max_attempts {
+                                        debug!("[State Manager] Reconciliation: Lock contention, retrying in {}ms (attempt {}/{})",
+                                            backoff_ms, attempt, max_attempts);
+                                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                                        backoff_ms *= 2; // Exponential backoff
+                                    }
+                                }
+                            }
+                        }
+
+                        if !success {
+                            warn!("[State Manager] ⚠️  Reconciliation skipped: Could not acquire lock after {} attempts", max_attempts);
+                        }
                     }
                     Err(e) => {
                         warn!("[State Manager] Failed to reconcile account state: {}", e);
@@ -320,32 +357,36 @@ impl StateManagerActor {
                 last_iteration_log = std::time::Instant::now();
             }
 
+            // CRITICAL FIX: Use biased selection to prioritize message processing over timers
+            // This prevents timer branches from starving critical message handling
             tokio::select! {
-                // 🚨 CRITICAL: Add timeout branch FIRST to detect deadlocks
-                _ = tokio::time::sleep(Duration::from_secs(2)) => {
-                    warn!("[State Manager] ⏰ SELECT TIMEOUT: No events processed for 2 seconds!");
-                    warn!("[State Manager]   -> This may indicate a deadlock or event starvation");
-                }
+                biased;
 
-                // Handle incoming WebSocket messages (Fills, Order Updates)
+                // HIGHEST PRIORITY: Handle incoming WebSocket messages (Fills, Order Updates)
                 Some(message) = user_ws_rx.recv() => {
                     debug!("[State Manager] Received WebSocket message (iteration #{})", loop_iterations);
                     last_ws_message_time = std::time::Instant::now();
                     self.handle_ws_message(message).await;
                 }
 
-                // Handle incoming action requests from Strategy Runners
+                // HIGH PRIORITY: Handle incoming action requests from Strategy Runners
                 Some(request) = self.action_rx.recv() => {
                     debug!("[State Manager] Received action request (iteration #{})", loop_iterations);
                     self.handle_action_request(request).await;
                 }
 
-                // Watchdog: periodically log that we're alive
+                // LOW PRIORITY: Timeout detection (only fires if no messages for 2 seconds)
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                    warn!("[State Manager] ⏰ SELECT TIMEOUT: No events processed for 2 seconds!");
+                    warn!("[State Manager]   -> This may indicate a deadlock or event starvation");
+                }
+
+                // LOW PRIORITY: Watchdog timer
                 _ = watchdog_timer.tick() => {
                     info!("[State Manager] Watchdog: Event loop is running normally (iteration #{})", loop_iterations);
                 }
 
-                // Health check: detect stalled WebSocket connection
+                // LOW PRIORITY: Health check timer
                 _ = healthcheck_timer.tick() => {
                     let elapsed = last_ws_message_time.elapsed();
                     if elapsed > ws_timeout {
@@ -356,6 +397,7 @@ impl StateManagerActor {
                     }
                 }
 
+                // CRITICAL: Shutdown signal
                 _ = tokio::signal::ctrl_c() => {
                     info!("[State Manager] Shutdown signal received.");
                     break;
@@ -590,7 +632,13 @@ impl StateManagerActor {
 
         // Validate that we're tracking this asset
         {
+            let lock_start = std::time::Instant::now();
             let asset_states = self.asset_states.read().await;
+            let lock_duration = lock_start.elapsed();
+            if lock_duration > Duration::from_millis(10) {
+                debug!("[State Manager] Lock acquisition took {:.1}ms for asset validation", lock_duration.as_secs_f64() * 1000.0);
+            }
+
             if !asset_states.contains_key(&asset) {
                 warn!(
                     "[State Manager] ❌ Rejected actions from [{}]: Unknown asset",
@@ -607,8 +655,13 @@ impl StateManagerActor {
         // ---
         // 1. Final Margin & Position Check (Atomicity)
         // ---
+        let lock_start = std::time::Instant::now();
         let asset_states_read = self.asset_states.read().await;
         let global_state_read = self.global_account_state.read().await;
+        let lock_duration = lock_start.elapsed();
+        if lock_duration > Duration::from_millis(10) {
+            warn!("[State Manager] ⚠️  Lock acquisition took {:.1}ms for validation (potential contention)", lock_duration.as_secs_f64() * 1000.0);
+        }
         let asset_state = asset_states_read.get(&asset);
 
         info!("[State Manager] Validating {} actions for [{}]: Equity=${:.2}, Margin Used=${:.2}",
@@ -827,8 +880,15 @@ impl StateManagerActor {
     /// Broadcasts the current authoritative state to all runners.
     /// Sends one update per asset so runners can filter by their asset.
     async fn broadcast_state(&self) {
+        let lock_start = std::time::Instant::now();
         let asset_states = self.asset_states.read().await;
         let global_state = self.global_account_state.read().await;
+        let lock_duration = lock_start.elapsed();
+
+        if lock_duration > Duration::from_millis(10) {
+            warn!("[State Manager] ⚠️  broadcast_state: Lock acquisition took {:.1}ms (potential contention)",
+                lock_duration.as_secs_f64() * 1000.0);
+        }
 
         // Broadcast state update for each asset
         for (asset, asset_state) in asset_states.iter() {
@@ -1038,38 +1098,41 @@ impl StrategyRunnerActor {
                 last_iteration_log = std::time::Instant::now();
             }
 
+            // CRITICAL FIX: Use biased selection to prioritize message processing over timers
             tokio::select! {
-                // 🚨 CRITICAL: Add timeout branch FIRST to detect deadlocks
-                _ = tokio::time::sleep(Duration::from_secs(2)) => {
-                    warn!("[Runner {}] ⏰ SELECT TIMEOUT: No events processed for 2 seconds!", self.asset);
-                    warn!("[Runner {}]   -> This may indicate a deadlock or event starvation", self.asset);
+                biased;
+
+                // HIGHEST PRIORITY: Handle incoming *authoritative state* from State Manager
+                Ok(update) = self.state_rx.recv() => {
+                    debug!("[Runner {}] Received state update (iteration #{})", self.asset, loop_iterations);
+                    self.handle_state_update(update).await;
                 }
 
-                // Handle incoming *market data* (L2Book, Trades)
+                // HIGH PRIORITY: Handle incoming *market data* (L2Book, Trades)
                 Some(message) = market_ws_rx.recv() => {
                     debug!("[Runner {}] Received market data message (iteration #{})", self.asset, loop_iterations);
                     last_market_message_time = std::time::Instant::now();
                     self.handle_market_message(message).await;
                 }
 
-                // Handle incoming *authoritative state* from State Manager
-                Ok(update) = self.state_rx.recv() => {
-                    debug!("[Runner {}] Received state update (iteration #{})", self.asset, loop_iterations);
-                    self.handle_state_update(update).await;
-                }
-
-                // Handle periodic tick
+                // MEDIUM PRIORITY: Handle periodic tick for strategy logic
                 _ = tick_timer.tick() => {
                     debug!("[Runner {}] Periodic tick (iteration #{})", self.asset, loop_iterations);
                     self.handle_tick().await;
                 }
 
-                // Watchdog: periodically log that we're alive
+                // LOW PRIORITY: Timeout detection
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                    warn!("[Runner {}] ⏰ SELECT TIMEOUT: No events processed for 2 seconds!", self.asset);
+                    warn!("[Runner {}]   -> This may indicate a deadlock or event starvation", self.asset);
+                }
+
+                // LOW PRIORITY: Watchdog timer
                 _ = watchdog_timer.tick() => {
                     info!("[Runner {}] Watchdog: Event loop is running normally (iteration #{})", self.asset, loop_iterations);
                 }
 
-                // Health check: detect stalled WebSocket connection
+                // LOW PRIORITY: Health check timer
                 _ = healthcheck_timer.tick() => {
                     let elapsed = last_market_message_time.elapsed();
                     if elapsed > ws_timeout {
@@ -1080,6 +1143,7 @@ impl StrategyRunnerActor {
                     }
                 }
 
+                // CRITICAL: Shutdown signal
                  _ = tokio::signal::ctrl_c() => {
                     info!("[Runner {}] Shutdown signal received.", self.asset);
                     self.handle_shutdown().await;
@@ -1383,6 +1447,8 @@ impl StrategyRunnerActor {
     }
 
     /// Sends a list of actions to the State Manager for execution.
+    /// CRITICAL FIX: This method no longer blocks waiting for a response.
+    /// Response handling is done in a separate task to avoid blocking the event loop.
     async fn send_actions(&self, actions: Vec<StrategyAction>) {
         let place_count = actions.iter().filter(|a| matches!(a, StrategyAction::Place(_) | StrategyAction::BatchPlace(_))).count();
         let cancel_count = actions.iter().filter(|a| matches!(a, StrategyAction::Cancel(_) | StrategyAction::BatchCancel(_))).count();
@@ -1402,25 +1468,32 @@ impl StrategyRunnerActor {
             return;
         }
 
-        // Wait for the State Manager to confirm receipt and validation
-        match resp_rx.await {
-            Ok(response) => {
-                if !response.success {
-                    warn!(
-                        "[Runner {}] ❌ Actions REJECTED by State Manager: {}",
-                        self.asset, response.message
-                    );
-                } else {
-                    info!(
-                        "[Runner {}] ✅ Actions accepted by State Manager: {}",
-                        self.asset, response.message
-                    );
+        // CRITICAL FIX: Spawn a separate task to handle the response
+        // This prevents blocking the main event loop
+        let asset_clone = self.asset.clone();
+        tokio::spawn(async move {
+            match resp_rx.await {
+                Ok(response) => {
+                    if !response.success {
+                        warn!(
+                            "[Runner {}] ❌ Actions REJECTED by State Manager: {}",
+                            asset_clone, response.message
+                        );
+                    } else {
+                        info!(
+                            "[Runner {}] ✅ Actions accepted by State Manager: {}",
+                            asset_clone, response.message
+                        );
+                    }
+                }
+                Err(_) => {
+                    error!("[Runner {}] Did not receive response from State Manager.", asset_clone);
                 }
             }
-            Err(_) => {
-                error!("[Runner {}] Did not receive response from State Manager.", self.asset);
-            }
-        }
+        });
+
+        // Log that we've dispatched the request without waiting
+        debug!("[Runner {}] Actions dispatched (non-blocking)", self.asset);
     }
 }
 
