@@ -1534,12 +1534,16 @@ impl HjbStrategy {
         let min_size_step = 10f64.powi(-(self.tick_lot_validator.sz_decimals as i32));
         let min_notional = 10.0; // $10 minimum
 
-        // *** FIX 1: Check if the total size is already below the notional limit ***
-        // If so, place it as a single order instead of splitting into dust
-        if (total_size * best_bid) < min_notional {
-            if total_size >= min_size_step {
+        // *** NEW LOGIC: ***
+        // Check if the *smallest split* (20% of total) will be below the notional limit.
+        // If it is, just send the *entire* amount as a single, consolidated order.
+        let smallest_split_notional = (total_size * 0.20) * best_bid;
+
+        if smallest_split_notional < min_notional {
+            // Small total size, send as one order to avoid splits failing
+            if total_size >= min_size_step && (total_size * best_bid) >= min_notional {
                 log::info!(
-                    "   📤 Liquidation SELL (Single Order): {:.4} @ {:.2} (reduce_only)",
+                    "   📤 Liquidation SELL (Consolidated Order): {:.4} @ {:.2} (reduce_only)",
                     total_size, best_bid
                 );
                 actions.push(StrategyAction::Place(ClientOrderRequest {
@@ -1555,13 +1559,13 @@ impl HjbStrategy {
                 }));
             } else {
                 log::warn!(
-                    "   ⚠️  Skipping Liquidation SELL: Total size {:.4} is below min size step {:.4}",
-                    total_size, min_size_step
+                    "   ⚠️  Skipping Liquidation SELL: Total size {:.4} (Notional ${:.2}) is below minimums.",
+                    total_size, total_size * best_bid
                 );
             }
             return; // Exit function
         }
-        // *** END FIX 1 ***
+        // *** END NEW LOGIC ***
 
         // If total_size is large enough, proceed with splitting
         // Use a 3-level approach for aggressive liquidation:
@@ -1639,12 +1643,16 @@ impl HjbStrategy {
         let min_size_step = 10f64.powi(-(self.tick_lot_validator.sz_decimals as i32));
         let min_notional = 10.0; // $10 minimum
 
-        // *** FIX 1: Check if the total size is already below the notional limit ***
-        // If so, place it as a single order instead of splitting into dust
-        if (total_size * best_ask) < min_notional {
-            if total_size >= min_size_step {
+        // *** NEW LOGIC: ***
+        // Check if the *smallest split* (20% of total) will be below the notional limit.
+        // If it is, just send the *entire* amount as a single, consolidated order.
+        let smallest_split_notional = (total_size * 0.20) * best_ask;
+
+        if smallest_split_notional < min_notional {
+            // Small total size, send as one order to avoid splits failing
+            if total_size >= min_size_step && (total_size * best_ask) >= min_notional {
                 log::info!(
-                    "   📥 Liquidation BUY (Single Order): {:.4} @ {:.2} (reduce_only)",
+                    "   📥 Liquidation BUY (Consolidated Order): {:.4} @ {:.2} (reduce_only)",
                     total_size, best_ask
                 );
                 actions.push(StrategyAction::Place(ClientOrderRequest {
@@ -1660,13 +1668,13 @@ impl HjbStrategy {
                 }));
             } else {
                 log::warn!(
-                    "   ⚠️  Skipping Liquidation BUY: Total size {:.4} is below min size step {:.4}",
-                    total_size, min_size_step
+                    "   ⚠️  Skipping Liquidation BUY: Total size {:.4} (Notional ${:.2}) is below minimums.",
+                    total_size, total_size * best_ask
                 );
             }
             return; // Exit function
         }
-        // *** END FIX 1 ***
+        // *** END NEW LOGIC ***
 
         // If total_size is large enough, proceed with splitting
         // Use a 3-level approach for aggressive liquidation:
