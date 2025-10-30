@@ -234,7 +234,8 @@ impl QuoteOptimizer for HjbMultiLevelOptimizer {
         state: &CurrentState,
         fill_model: &HawkesFillModel,
     ) -> (Vec<(f64, f64)>, Vec<(f64, f64)>) {
-        let output = self.calculate_target_quotes_with_metadata(inputs, state, fill_model);
+        // Use a default maker fee of 1.5 bps for the trait method
+        let output = self.calculate_target_quotes_with_metadata(inputs, state, fill_model, 1.5);
         (output.target_bids, output.target_asks)
     }
 }
@@ -257,6 +258,7 @@ impl HjbMultiLevelOptimizer {
         inputs: &OptimizerInputs,
         state: &CurrentState,
         fill_model: &HawkesFillModel,
+        maker_fee_bps: f64,
     ) -> OptimizerOutput {
         // --- Steps 1-5: Calculate Robust Params, Base Spread, Skew, Opt State ---
 
@@ -316,6 +318,7 @@ impl HjbMultiLevelOptimizer {
             &opt_state,
             robust_base_half_spread,
             &self.tuning_params,
+            maker_fee_bps,
         );
 
         // --- Step 7: Convert offsets to prices, apply skew robustly, check crossing ---

@@ -934,6 +934,7 @@ impl HjbStrategy {
             &inputs,
             state,
             &hawkes_lock,
+            self.config.maker_fee_bps,
         );
         drop(hawkes_lock);
 
