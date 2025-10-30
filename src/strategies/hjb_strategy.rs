@@ -399,6 +399,13 @@ pub struct HjbStrategy {
 
     /// Intelligent order churn manager
     order_churn_manager: OrderChurnManager,
+
+    // --- EXPERT ADDITIONS ---
+    /// Smoothed volatility (EWMA) for robust spread calculation
+    smoothed_volatility_bps: f64,
+
+    /// EMA alpha for volatility smoothing (e.g., 0.1)
+    vol_ema_alpha: f64,
 }
 
 impl Strategy for HjbStrategy {
@@ -488,6 +495,9 @@ impl Strategy for HjbStrategy {
         // Initialize cached volatility
         let cached_volatility = Arc::new(RwLock::new(CachedVolatilityEstimate::default()));
 
+        // Get initial volatility for EWMA initialization
+        let initial_volatility_bps = cached_volatility.read().volatility_bps;
+
         // Initialize parameter uncertainty
         let current_uncertainty = ParameterUncertainty::default();
 
@@ -537,6 +547,11 @@ impl Strategy for HjbStrategy {
             total_optimization_time_us: 0,
             margin_calculator,
             order_churn_manager,
+
+            // --- EXPERT ADDITIONS ---
+            // Initialize smoothed vol to the particle filter's initial estimate
+            smoothed_volatility_bps: initial_volatility_bps,
+            vol_ema_alpha: 0.1, // 10% weight on new observations (tunable)
         }
     }
 
@@ -822,6 +837,14 @@ impl HjbStrategy {
 
         // Update uncertainty estimates from particle filter
         self.update_uncertainty_estimates();
+
+        // --- EXPERT ADDITION: Update Volatility EWMA ---
+        let spot_volatility = self.cached_volatility.read().volatility_bps;
+        self.smoothed_volatility_bps = (self.vol_ema_alpha * spot_volatility)
+            + ((1.0 - self.vol_ema_alpha) * self.smoothed_volatility_bps);
+
+        debug!("[HJB STRATEGY] Volatility updated: Spot={:.2}bps, Smoothed={:.2}bps",
+            spot_volatility, self.smoothed_volatility_bps);
     }
 
     /// Handle fills (update Hawkes model and order churn manager)
@@ -915,14 +938,14 @@ impl HjbStrategy {
         let as_conviction = self.microprice_as_model.get_adverse_selection_conviction();
         let confident_as_bps = microprice_as_bps * as_conviction;
 
-        debug!("[OPTIMIZER INPUTS {}] vol={:.2}bps, vol_unc={:.2}bps, as_raw={:.2}bps, conviction={:.2}, as_final={:.2}bps, lob_imb={:.3}, pos={:.2}",
-            self.config.asset, volatility_bps_pf, vol_uncertainty_bps_pf,
+        debug!("[OPTIMIZER INPUTS {}] vol_spot={:.2}bps, vol_smooth={:.2}bps, vol_unc={:.2}bps, as_raw={:.2}bps, conviction={:.2}, as_final={:.2}bps, lob_imb={:.3}, pos={:.2}",
+            self.config.asset, volatility_bps_pf, self.smoothed_volatility_bps, vol_uncertainty_bps_pf,
             microprice_as_bps, as_conviction, confident_as_bps, self.state_vector.lob_imbalance, state.position);
 
-        // Prepare optimizer inputs USING PARTICLE FILTER ESTIMATES AND MICROPRICE AS
+        // Prepare optimizer inputs USING SMOOTHED VOLATILITY AND CONVICTION-SCALED AS
         let inputs = OptimizerInputs {
             current_time_sec: current_time,
-            volatility_bps: volatility_bps_pf, // USE PF ESTIMATE HERE
+            volatility_bps: self.smoothed_volatility_bps, // USE SMOOTHED VOL (more stable)
             vol_uncertainty_bps: vol_uncertainty_bps_pf, // USE PF UNCERTAINTY HERE
             adverse_selection_bps: confident_as_bps, // USE CONVICTION-SCALED AS (more reliable)
             lob_imbalance: self.state_vector.lob_imbalance, // Keep LOB from state_vector
