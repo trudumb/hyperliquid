@@ -1389,13 +1389,23 @@ impl StrategyRunnerActor {
 
     /// Handles the periodic 1-second tick.
     async fn handle_tick(&mut self) {
-        let _state = self.local_state_cache.read().await;
+        debug!("[Runner {}] on_tick called", self.asset);
 
-        // Update timestamp and unrealized PnL locally
-        // (This is fine as it's based on market data, which this runner owns)
+        // --- Step 1: Acquire WRITE lock for atomic check and update ---
+        // We acquire the write lock once to check the price and update state
+        // in a single atomic operation.
         let mut state_write = self.local_state_cache.write().await;
+
+        if state_write.l2_mid_price <= 0.0 {
+            warn!("[Runner {}] Waiting for valid mid price (current: ${:.3})",
+                self.asset, state_write.l2_mid_price);
+            // Return, which automatically releases the write lock
+            return;
+        }
+
+        // Update timestamp and unrealized PnL
         state_write.timestamp = chrono::Utc::now().timestamp() as f64;
-        if state_write.position.abs() > 1e-6 && state_write.l2_mid_price > 0.0 {
+        if state_write.position.abs() > 1e-6 {
             if state_write.position > 0.0 { // Long
                 state_write.unrealized_pnl =
                     state_write.position * (state_write.l2_mid_price - state_write.avg_entry_price);
@@ -1405,20 +1415,26 @@ impl StrategyRunnerActor {
             }
         }
 
-        let has_orders = !state_write.open_bids.is_empty() || !state_write.open_asks.is_empty();
+        // Copy out values needed for logging after dropping the lock
         let mid_price = state_write.l2_mid_price;
         let position = state_write.position;
+        let has_orders = !state_write.open_bids.is_empty() || !state_write.open_asks.is_empty();
         let num_bids = state_write.open_bids.len();
         let num_asks = state_write.open_asks.len();
+
+        // --- Step 2: Drop WRITE lock *before* running strategy ---
         drop(state_write);
 
         debug!("[Runner {}] Tick: mid=${:.3}, pos={:.2}, has_orders={}",
             self.asset, mid_price, position, has_orders);
 
-        // Now call the strategy's tick function with the read-lock
+        // --- Step 3: Acquire READ lock to run the strategy ---
+        // The state is now guaranteed to be updated from Step 1.
         let state_read = self.local_state_cache.read().await;
         let actions = self.strategy.on_tick(&state_read);
+        drop(state_read); // Drop READ lock
 
+        // --- Step 4: Send Actions (no lock held) ---
         if !actions.is_empty() && !matches!(actions[0], StrategyAction::NoOp) {
             info!("[Runner {}] Tick generated {} action(s)", self.asset, actions.len());
             self.send_actions(actions).await;
