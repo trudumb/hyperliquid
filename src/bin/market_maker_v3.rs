@@ -888,6 +888,30 @@ impl StateManagerActor {
             match action {
                 StrategyAction::Place(order) => {
                     let position_delta = if order.is_buy { order.sz } else { -order.sz };
+
+                    // --- ADD THIS NEW VALIDATION BLOCK ---
+                    if order.reduce_only {
+                        // Use the authoritative position for this check
+                        let authoritative_position = cumulative_pos_for_margin;
+
+                        let next_potential_pos = authoritative_position + position_delta;
+
+                        // Check if the order would flip the position's sign
+                        // (and the new position isn't just closing to 0.0)
+                        if authoritative_position.signum() != 0.0
+                           && authoritative_position.signum() != next_potential_pos.signum()
+                           && next_potential_pos.abs() > 1e-9 // Not a close-to-zero order
+                        {
+                            let msg = format!(
+                                "ReduceOnly order rejected: would flip position from {:.4} to {:.4}",
+                                authoritative_position, next_potential_pos
+                            );
+                            warn!("[State Manager] ❌ VALIDATION FAILED for [{}]: {}", asset_name, msg);
+                            return (false, msg); // Reject the action
+                        }
+                    }
+                    // --- END NEW VALIDATION BLOCK ---
+
                     net_size_change_from_new_orders += position_delta;
 
                     if !order.reduce_only {
@@ -904,6 +928,30 @@ impl StateManagerActor {
                 StrategyAction::BatchPlace(orders) => {
                     for order in orders {
                         let position_delta = if order.is_buy { order.sz } else { -order.sz };
+
+                        // --- ADD THIS NEW VALIDATION BLOCK ---
+                        if order.reduce_only {
+                            // Use the authoritative position for this check
+                            let authoritative_position = cumulative_pos_for_margin;
+
+                            let next_potential_pos = authoritative_position + position_delta;
+
+                            // Check if the order would flip the position's sign
+                            // (and the new position isn't just closing to 0.0)
+                            if authoritative_position.signum() != 0.0
+                               && authoritative_position.signum() != next_potential_pos.signum()
+                               && next_potential_pos.abs() > 1e-9 // Not a close-to-zero order
+                            {
+                                let msg = format!(
+                                    "ReduceOnly order rejected: would flip position from {:.4} to {:.4}",
+                                    authoritative_position, next_potential_pos
+                                );
+                                warn!("[State Manager] ❌ VALIDATION FAILED for [{}]: {}", asset_name, msg);
+                                return (false, msg); // Reject the action
+                            }
+                        }
+                        // --- END NEW VALIDATION BLOCK ---
+
                         net_size_change_from_new_orders += position_delta;
 
                         if !order.reduce_only {

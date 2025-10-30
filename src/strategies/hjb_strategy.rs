@@ -1578,14 +1578,14 @@ impl HjbStrategy {
         // *** END NEW LOGIC ***
 
         // If total_size is large enough, proceed with splitting
-        // Use a 3-level approach for aggressive liquidation:
-        // Level 1: 50% at best bid (most aggressive, highest fill probability)
-        // Level 2: 30% at best bid + 1 tick (slightly less aggressive)
-        // Level 3: 20% at best bid + 2 ticks (fallback)
+        // Price aggressively to cross the spread and walk the book
+        let aggressive_price_l1 = self.tick_lot_validator.round_price(best_bid - (min_price_step * 2.0), false); // 2 ticks *below* best bid
+        let aggressive_price_l2 = self.tick_lot_validator.round_price(best_bid - (min_price_step * 4.0), false); // 4 ticks *below*
+
+        // Split 60/40
         let levels = vec![
-            (best_bid, 0.50), // 50% at best bid
-            (best_bid + min_price_step, 0.30), // 30% at +1 tick
-            (best_bid + min_price_step * 2.0, 0.20), // 20% at +2 ticks
+            (aggressive_price_l1, 0.60),
+            (aggressive_price_l2, 0.40),
         ];
 
         for (price, size_fraction) in levels {
@@ -1687,14 +1687,14 @@ impl HjbStrategy {
         // *** END NEW LOGIC ***
 
         // If total_size is large enough, proceed with splitting
-        // Use a 3-level approach for aggressive liquidation:
-        // Level 1: 50% at best ask (most aggressive, highest fill probability)
-        // Level 2: 30% at best ask - 1 tick (slightly less aggressive)
-        // Level 3: 20% at best ask - 2 ticks (fallback)
+        // Price aggressively to cross the spread and walk the book
+        let aggressive_price_l1 = self.tick_lot_validator.round_price(best_ask + (min_price_step * 2.0), true); // 2 ticks *above* best ask
+        let aggressive_price_l2 = self.tick_lot_validator.round_price(best_ask + (min_price_step * 4.0), true); // 4 ticks *above*
+
+        // Split 60/40
         let levels = vec![
-            (best_ask, 0.50), // 50% at best ask
-            (best_ask - min_price_step, 0.30), // 30% at -1 tick
-            (best_ask - min_price_step * 2.0, 0.20), // 20% at -2 ticks
+            (aggressive_price_l1, 0.60),
+            (aggressive_price_l2, 0.40),
         ];
 
         for (price, size_fraction) in levels {
