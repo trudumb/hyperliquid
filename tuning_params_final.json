@@ -2,7 +2,7 @@
   "skew_adjustment_factor": 1.7492007544479824,
   "adverse_selection_adjustment_factor": 1.3076193826557185,
   "adverse_selection_lambda": 0.4978455175519057,
-  "inventory_urgency_threshold": 0.4974312544088832,
+  "inventory_urgency_threshold": 0.9,
   "liquidation_rate_multiplier": 49.78455175559015,
   "min_spread_base_ratio": 0.6763474503256264,
   "adverse_selection_spread_scale": 41.95413753137649,
