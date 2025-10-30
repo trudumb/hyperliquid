@@ -911,16 +911,20 @@ impl HjbStrategy {
         // USE MICROPRICE-BASED ADVERSE SELECTION (more stable than SGD model)
         let microprice_as_bps = self.microprice_as_model.get_adverse_selection_bps();
 
-        debug!("[OPTIMIZER INPUTS {}] vol={:.2}bps, vol_unc={:.2}bps, as={:.2}bps, lob_imb={:.3}, pos={:.2}",
+        // --- EXPERT ADDITION: Get conviction score ---
+        let as_conviction = self.microprice_as_model.get_adverse_selection_conviction();
+        let confident_as_bps = microprice_as_bps * as_conviction;
+
+        debug!("[OPTIMIZER INPUTS {}] vol={:.2}bps, vol_unc={:.2}bps, as_raw={:.2}bps, conviction={:.2}, as_final={:.2}bps, lob_imb={:.3}, pos={:.2}",
             self.config.asset, volatility_bps_pf, vol_uncertainty_bps_pf,
-            microprice_as_bps, self.state_vector.lob_imbalance, state.position);
+            microprice_as_bps, as_conviction, confident_as_bps, self.state_vector.lob_imbalance, state.position);
 
         // Prepare optimizer inputs USING PARTICLE FILTER ESTIMATES AND MICROPRICE AS
         let inputs = OptimizerInputs {
             current_time_sec: current_time,
             volatility_bps: volatility_bps_pf, // USE PF ESTIMATE HERE
             vol_uncertainty_bps: vol_uncertainty_bps_pf, // USE PF UNCERTAINTY HERE
-            adverse_selection_bps: microprice_as_bps, // USE MICROPRICE AS (more stable)
+            adverse_selection_bps: confident_as_bps, // USE CONVICTION-SCALED AS (more reliable)
             lob_imbalance: self.state_vector.lob_imbalance, // Keep LOB from state_vector
         };
 

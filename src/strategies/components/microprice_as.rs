@@ -264,9 +264,43 @@ impl MicropriceAsModel {
         }
     }
 
+    /// Uses a sigmoid function to map trade flow to a conviction score (0.0 - 1.0)
+    ///
+    /// This measures how confident we are in the adverse selection signal based on
+    /// the volume of trade flow. A signal based on large sustained trade flow is
+    /// high-conviction; a signal from minimal trades is low-conviction noise.
+    ///
+    /// # Returns
+    /// - 0.0: No trade flow, signal is pure noise
+    /// - 0.5: Moderate trade flow at the significance threshold
+    /// - 1.0: Very high trade flow, signal is highly reliable
+    fn get_conviction_score(&self) -> f64 {
+        // `trade_flow_ema` is the raw size imbalance (e.g., -5.0 to +5.0)
+        // We need to normalize it. Let's say a flow of 2.0 units is "significant".
+        const SIGNIFICANT_FLOW: f64 = 2.0;
+        let normalized_flow = self.trade_flow_ema.abs() / SIGNIFICANT_FLOW;
+
+        // Simple sigmoid: 1.0 / (1.0 + exp(-x))
+        // We scale `normalized_flow` to map it nicely.
+        // A k-value of 3.0 means it's sensitive around the `SIGNIFICANT_FLOW` mark.
+        let k = 3.0;
+        let score = 1.0 / (1.0 + (-k * (normalized_flow - 1.0)).exp());
+
+        // Clamp to ensure it's between 0 and 1
+        score.clamp(0.0, 1.0)
+    }
+
     /// Get current adverse selection estimate in basis points
     pub fn get_adverse_selection_bps(&self) -> f64 {
         self.adverse_selection_ema
+    }
+
+    /// Get the conviction score for the current AS estimate
+    ///
+    /// Returns a value between 0.0 and 1.0 indicating how confident we are
+    /// in the adverse selection signal based on trade flow volume.
+    pub fn get_adverse_selection_conviction(&self) -> f64 {
+        self.get_conviction_score()
     }
 
     /// Get current trade flow imbalance
