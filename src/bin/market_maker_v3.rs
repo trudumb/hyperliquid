@@ -93,6 +93,8 @@ struct StateManagerActor {
     state_tx: broadcast::Sender<AuthoritativeStateUpdate>,
     /// Tracks processed fill IDs to prevent duplicates
     processed_fill_ids: HashSet<u64>,
+    /// Tracks which assets have received their initial UserFills snapshot (to ignore historical data)
+    snapshot_received: HashMap<String, bool>,
     /// Margin calculator instance
     margin_calculator: MarginCalculator,
     /// Configurable safety buffer (e.g., 0.1 for 10%)
@@ -226,6 +228,7 @@ impl StateManagerActor {
             action_rx,
             state_tx,
             processed_fill_ids: HashSet::new(),
+            snapshot_received: HashMap::new(),
             // Initialize MarginCalculator
             margin_calculator: MarginCalculator::new(leverage, safety_buffer),
             safety_buffer,
@@ -562,14 +565,30 @@ impl StateManagerActor {
             }
             Message::UserFills(user_fills) => {
                 if user_fills.data.is_snapshot.unwrap_or(false) {
-                    info!(
-                        "[State Manager] Received UserFills snapshot with {} fills.",
+                    if user_fills.data.fills.is_empty() {
+                        return;
+                    }
+
+                    // Get the coin from the first fill to identify which asset this snapshot is for
+                    let coin = &user_fills.data.fills[0].coin;
+
+                    // Check if we've already received the initial snapshot for this asset
+                    if !self.snapshot_received.get(coin).copied().unwrap_or(false) {
+                        info!(
+                            "[State Manager] Ignoring historical UserFills snapshot for {} ({} fills) - using REST API position as source of truth",
+                            coin,
+                            user_fills.data.fills.len()
+                        );
+                        self.snapshot_received.insert(coin.clone(), true);
+                        return; // Don't process historical fills
+                    }
+
+                    // If we get here, this is a subsequent snapshot (unexpected)
+                    warn!(
+                        "[State Manager] Received unexpected second UserFills snapshot for {} ({} fills)",
+                        coin,
                         user_fills.data.fills.len()
                     );
-                    let changed = self.process_fills(user_fills.data.fills).await;
-                    if changed {
-                        state_changed = true;
-                    }
                 }
                 // Streaming fills from UserFills are ignored; UserEvents is the source of truth.
             }
@@ -802,7 +821,7 @@ impl StateManagerActor {
     /// Validates actions against authoritative state to ensure position and margin limits.
     ///
     /// Performs atomic validation of:
-    /// - Position size limits (max_position_size)
+    /// - Position size limits (max_position_size) INCLUDING pending orders on exchange
     /// - Margin requirements (with safety buffer)
     ///
     /// Returns (is_valid, error_message)
@@ -820,42 +839,78 @@ impl StateManagerActor {
 
         let current_position = asset_state.map_or(0.0, |s| s.position);
 
+        // Calculate pending exposure from orders already live on exchange
+        // Bids = positive (potential buys), Asks = negative (potential sells)
+        let pending_exposure = asset_state.map_or(0.0, |s| {
+            let bid_exposure: f64 = s.open_bids.iter().map(|o| o.size).sum();
+            let ask_exposure: f64 = s.open_asks.iter().map(|o| o.size).sum();
+            bid_exposure - ask_exposure
+        });
+
         debug!(
-            "[State Manager] Validation Check [{}]: Current Position: {:.4}, Max Position: {:.4}",
-            asset_name, current_position, self.max_position_size
+            "[State Manager] Validation Check [{}]: Current Position: {:.4}, Pending Orders: {:.4}, Max Position: {:.4}",
+            asset_name, current_position, pending_exposure, self.max_position_size
         );
 
         let mut net_size_change = 0.0;
         let mut estimated_margin_increase = 0.0;
 
+        // Start from current position + pending orders to get true exposure
+        let mut cumulative_pos_for_margin = current_position + pending_exposure;
+        let mut has_reduce_only = false;
+
         for action in actions {
             if let StrategyAction::Place(order) = action {
-                // Only consider non-reduceOnly orders for increasing position/margin
-                if !order.reduce_only {
-                    let order_size = order.sz;
-                    let order_price = order.limit_px; // Use limit price for estimation
+                let position_delta = if order.is_buy { order.sz } else { -order.sz };
 
-                    let position_delta = if order.is_buy { order_size } else { -order_size };
-                    let potential_new_position = current_position + position_delta;
+                // ALWAYS count ALL orders (including reduce_only) for position validation
+                net_size_change += position_delta;
+
+                if order.reduce_only {
+                    has_reduce_only = true;
+                }
+
+                // Only count margin for non-reduce_only orders that increase position
+                if !order.reduce_only {
+                    let next_potential_pos = cumulative_pos_for_margin + position_delta;
 
                     // Estimate margin increase ONLY if the order *increases* the absolute position size
-                    if potential_new_position.abs() > current_position.abs() {
-                        let size_increase = potential_new_position.abs() - current_position.abs();
-                        estimated_margin_increase += self.margin_calculator.initial_margin_required(size_increase, order_price);
+                    if next_potential_pos.abs() > cumulative_pos_for_margin.abs() {
+                        let size_increase = next_potential_pos.abs() - cumulative_pos_for_margin.abs();
+                        estimated_margin_increase += self.margin_calculator.initial_margin_required(size_increase, order.limit_px);
                     }
-                    net_size_change += position_delta;
+
+                    cumulative_pos_for_margin = next_potential_pos;
+                } else {
+                    // Update cumulative position for reduce_only orders without counting margin
+                    cumulative_pos_for_margin += position_delta;
                 }
             }
         }
 
-        // --- Position Check ---
-        let final_potential_position = current_position + net_size_change;
+        // --- Position Check (INCLUDING PENDING ORDERS) ---
+        // This prevents the race condition where orders fill faster than state updates
+        let final_potential_position = current_position + pending_exposure + net_size_change;
+
+        debug!(
+            "[State Manager] Full position check: Current={:.4}, Pending={:.4}, New={:.4}, Final={:.4}, Max={:.4}",
+            current_position, pending_exposure, net_size_change, final_potential_position, self.max_position_size
+        );
+
         if final_potential_position.abs() > self.max_position_size + 1e-9 { // Add tolerance for float errors
-            let msg = format!(
-                "Exceeds position limit (Current: {:.4}, Change: {:.4}, Potential: {:.4}, Max: {:.4})",
-                current_position, net_size_change, final_potential_position, self.max_position_size
-            );
-            return (false, msg);
+            // Allow liquidation orders (reduce_only) even if still over limit
+            if has_reduce_only {
+                warn!(
+                    "[State Manager] ⚠️ Position still over limit but allowing reduce_only liquidation: Current={:.4}, Pending={:.4}, Final={:.4}",
+                    current_position, pending_exposure, final_potential_position
+                );
+            } else {
+                let msg = format!(
+                    "Exceeds position limit (Current: {:.4}, Pending: {:.4}, New: {:.4}, Final: {:.4}, Max: {:.4})",
+                    current_position, pending_exposure, net_size_change, final_potential_position, self.max_position_size
+                );
+                return (false, msg);
+            }
         }
 
         // --- Margin Check ---
@@ -871,8 +926,8 @@ impl StateManagerActor {
         }
 
         debug!(
-            "[State Manager] Validation PASSED for {}: Pos Change={:.4}, Est Margin Increase={:.2}",
-            asset_name, net_size_change, estimated_margin_increase
+            "[State Manager] ✅ Validation PASSED for {}: Current={:.4}, Pending={:.4}, New={:.4}, Final={:.4}, Margin={:.2}",
+            asset_name, current_position, pending_exposure, net_size_change, final_potential_position, estimated_margin_increase
         );
         (true, String::new())
     }
