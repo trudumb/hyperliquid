@@ -304,23 +304,45 @@ impl StateManagerActor {
         let mut healthcheck_timer = interval(Duration::from_secs(10));
         healthcheck_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // 🔍 DEADLOCK DETECTION: Track loop iterations
+        let mut loop_iterations = 0u64;
+        let mut last_iteration_log = std::time::Instant::now();
+
         loop {
+            let loop_start = std::time::Instant::now();
+            loop_iterations += 1;
+
+            // Log iteration count every 10 seconds
+            if last_iteration_log.elapsed() >= Duration::from_secs(10) {
+                info!("[State Manager] 🔄 Event loop alive: {} iterations in last {:.1}s",
+                    loop_iterations, last_iteration_log.elapsed().as_secs_f64());
+                loop_iterations = 0;
+                last_iteration_log = std::time::Instant::now();
+            }
+
             tokio::select! {
+                // 🚨 CRITICAL: Add timeout branch FIRST to detect deadlocks
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                    warn!("[State Manager] ⏰ SELECT TIMEOUT: No events processed for 2 seconds!");
+                    warn!("[State Manager]   -> This may indicate a deadlock or event starvation");
+                }
+
                 // Handle incoming WebSocket messages (Fills, Order Updates)
                 Some(message) = user_ws_rx.recv() => {
-                    debug!("[State Manager] Received WebSocket message");
+                    debug!("[State Manager] Received WebSocket message (iteration #{})", loop_iterations);
                     last_ws_message_time = std::time::Instant::now();
                     self.handle_ws_message(message).await;
                 }
 
                 // Handle incoming action requests from Strategy Runners
                 Some(request) = self.action_rx.recv() => {
+                    debug!("[State Manager] Received action request (iteration #{})", loop_iterations);
                     self.handle_action_request(request).await;
                 }
 
                 // Watchdog: periodically log that we're alive
                 _ = watchdog_timer.tick() => {
-                    info!("[State Manager] Watchdog: Event loop is running normally");
+                    info!("[State Manager] Watchdog: Event loop is running normally (iteration #{})", loop_iterations);
                 }
 
                 // Health check: detect stalled WebSocket connection
@@ -338,6 +360,13 @@ impl StateManagerActor {
                     info!("[State Manager] Shutdown signal received.");
                     break;
                 }
+            }
+
+            let iteration_duration = loop_start.elapsed();
+            if iteration_duration > Duration::from_millis(100) {
+                warn!("[State Manager] ⚠️  Slow iteration: took {:.3}s", iteration_duration.as_secs_f64());
+            } else {
+                debug!("[State Manager] Loop iteration #{} took {:.3}ms", loop_iterations, iteration_duration.as_millis());
             }
         }
 
@@ -399,9 +428,18 @@ impl StateManagerActor {
                     debug!("[State Manager WS Forwarder] Forwarded {} messages", message_count);
                 }
 
-                if sender.send(msg).is_err() {
-                    error!("[State Manager WS Forwarder] Failed to send to main loop (receiver dropped). Exiting forwarder.");
-                    break;
+                // CRITICAL: Explicitly check if channel send succeeds
+                match sender.send(msg) {
+                    Ok(_) => {
+                        if message_count <= 5 || message_count % 100 == 0 {
+                            debug!("[State Manager WS Forwarder] ✓ Sent message #{} to main loop", message_count);
+                        }
+                    }
+                    Err(e) => {
+                        error!("[State Manager WS Forwarder] ❌ CHANNEL BROKEN: Failed to send message #{} - {:?}", message_count, e);
+                        error!("[State Manager WS Forwarder] Main loop receiver has been dropped! Exiting forwarder.");
+                        break;
+                    }
                 }
             }
             warn!("[State Manager WS Forwarder] Exiting - flume channel closed. Total messages forwarded: {}", message_count);
@@ -984,28 +1022,51 @@ impl StrategyRunnerActor {
         let mut healthcheck_timer = interval(Duration::from_secs(15));
         healthcheck_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // 🔍 DEADLOCK DETECTION: Track loop iterations
+        let mut loop_iterations = 0u64;
+        let mut last_iteration_log = std::time::Instant::now();
+
         loop {
+            let loop_start = std::time::Instant::now();
+            loop_iterations += 1;
+
+            // Log iteration count every 10 seconds
+            if last_iteration_log.elapsed() >= Duration::from_secs(10) {
+                info!("[Runner {}] 🔄 Event loop alive: {} iterations in last {:.1}s",
+                    self.asset, loop_iterations, last_iteration_log.elapsed().as_secs_f64());
+                loop_iterations = 0;
+                last_iteration_log = std::time::Instant::now();
+            }
+
             tokio::select! {
+                // 🚨 CRITICAL: Add timeout branch FIRST to detect deadlocks
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                    warn!("[Runner {}] ⏰ SELECT TIMEOUT: No events processed for 2 seconds!", self.asset);
+                    warn!("[Runner {}]   -> This may indicate a deadlock or event starvation", self.asset);
+                }
+
                 // Handle incoming *market data* (L2Book, Trades)
                 Some(message) = market_ws_rx.recv() => {
-                    debug!("[Runner {}] Received market data message", self.asset);
+                    debug!("[Runner {}] Received market data message (iteration #{})", self.asset, loop_iterations);
                     last_market_message_time = std::time::Instant::now();
                     self.handle_market_message(message).await;
                 }
 
                 // Handle incoming *authoritative state* from State Manager
                 Ok(update) = self.state_rx.recv() => {
+                    debug!("[Runner {}] Received state update (iteration #{})", self.asset, loop_iterations);
                     self.handle_state_update(update).await;
                 }
 
                 // Handle periodic tick
                 _ = tick_timer.tick() => {
+                    debug!("[Runner {}] Periodic tick (iteration #{})", self.asset, loop_iterations);
                     self.handle_tick().await;
                 }
 
                 // Watchdog: periodically log that we're alive
                 _ = watchdog_timer.tick() => {
-                    info!("[Runner {}] Watchdog: Event loop is running normally", self.asset);
+                    info!("[Runner {}] Watchdog: Event loop is running normally (iteration #{})", self.asset, loop_iterations);
                 }
 
                 // Health check: detect stalled WebSocket connection
@@ -1024,6 +1085,13 @@ impl StrategyRunnerActor {
                     self.handle_shutdown().await;
                     break;
                 }
+            }
+
+            let iteration_duration = loop_start.elapsed();
+            if iteration_duration > Duration::from_millis(100) {
+                warn!("[Runner {}] ⚠️  Slow iteration: took {:.3}s", self.asset, iteration_duration.as_secs_f64());
+            } else {
+                debug!("[Runner {}] Loop iteration #{} took {:.3}ms", self.asset, loop_iterations, iteration_duration.as_millis());
             }
         }
         info!("[Runner {}] Shutting down.", self.asset);
@@ -1080,9 +1148,18 @@ impl StrategyRunnerActor {
                     debug!("[Runner {} Market Forwarder] Forwarded {} messages", asset_for_task, message_count);
                 }
 
-                if sender.send(msg).is_err() {
-                    error!("[Runner {} Market Forwarder] Failed to send to main loop (receiver dropped). Exiting forwarder.", asset_for_task);
-                    break;
+                // CRITICAL: Explicitly check if channel send succeeds
+                match sender.send(msg) {
+                    Ok(_) => {
+                        if message_count <= 5 || message_count % 500 == 0 {
+                            debug!("[Runner {} Market Forwarder] ✓ Sent message #{} to main loop", asset_for_task, message_count);
+                        }
+                    }
+                    Err(e) => {
+                        error!("[Runner {} Market Forwarder] ❌ CHANNEL BROKEN: Failed to send message #{} - {:?}", asset_for_task, message_count, e);
+                        error!("[Runner {} Market Forwarder] Main loop receiver has been dropped! Exiting forwarder.", asset_for_task);
+                        break;
+                    }
                 }
             }
             warn!("[Runner {} Market Forwarder] Exiting - flume channel closed. Total messages forwarded: {}", asset_for_task, message_count);
@@ -1405,9 +1482,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         StateManagerActor::new(wallet.clone(), assets, action_rx, state_tx.clone(), &app_config).await?;
 
     let state_manager_handle = local_set.spawn_local(async move {
-        if let Err(e) = state_manager.run().await {
-            error!("[State Manager] Actor failed: {}", e);
+        info!("🚀 [State Manager] Task starting...");
+        match state_manager.run().await {
+            Ok(_) => {
+                warn!("⚠️  [State Manager] Actor exited normally (unexpected unless shutting down)");
+            }
+            Err(e) => {
+                error!("❌ [State Manager] Actor failed with error: {}", e);
+                error!("   Backtrace: {:?}", std::backtrace::Backtrace::capture());
+            }
         }
+        error!("🔴 [State Manager] Task has COMPLETED - this should only happen during shutdown!");
     });
 
     info!("✅ State Manager Actor spawned.");
@@ -1423,10 +1508,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
+        let asset_for_handle = asset.clone();
         let handle = local_set.spawn_local(async move {
-            if let Err(e) = runner.run().await {
-                error!("[Runner {}] Actor failed: {}", asset, e);
+            info!("🚀 [Runner {}] Task starting...", asset_for_handle);
+            match runner.run().await {
+                Ok(_) => {
+                    warn!("⚠️  [Runner {}] Actor exited normally (unexpected unless shutting down)", asset_for_handle);
+                }
+                Err(e) => {
+                    error!("❌ [Runner {}] Actor failed with error: {}", asset_for_handle, e);
+                    error!("   Backtrace: {:?}", std::backtrace::Backtrace::capture());
+                }
             }
+            error!("🔴 [Runner {}] Task has COMPLETED - this should only happen during shutdown!", asset_for_handle);
         });
         runner_handles.push(handle);
     }
