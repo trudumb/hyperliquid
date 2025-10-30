@@ -38,7 +38,7 @@ use tokio::task::LocalSet;
 use tokio::time::{interval, Duration};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-// RUST_LOG=info,hyperliquid_rust_sdk::bin::market_maker_v3=debug cargo run --release --bin market_maker_v3
+// RUST_LOG=info,debug cargo run --release --bin market_maker_v3
 
 // ============================================================================
 // Configuration
