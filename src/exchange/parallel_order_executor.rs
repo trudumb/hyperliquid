@@ -72,8 +72,8 @@ impl Default for ExecutorConfig {
         Self {
             max_concurrent: 10,          // 10 concurrent requests
             batch_window_us: 100,        // 100μs batching window
-            request_timeout_ms: 500,     // 500ms per request (matches HTTP timeout)
-            batch_timeout_ms: 2000,      // 2s for entire batch
+            request_timeout_ms: 3000,    // *** FIX 3: Increased from 500ms to 3000ms (3 seconds) ***
+            batch_timeout_ms: 5000,      // 5s for entire batch (also increased)
             rate_limit_config: RateLimitConfig::rest_api(), // Default REST API limits
         }
     }
@@ -482,8 +482,8 @@ mod tests {
         let config = ExecutorConfig::default();
         assert_eq!(config.max_concurrent, 10);
         assert_eq!(config.batch_window_us, 100);
-        assert_eq!(config.request_timeout_ms, 500);
-        assert_eq!(config.batch_timeout_ms, 2000);
+        assert_eq!(config.request_timeout_ms, 3000);  // Updated to match fix
+        assert_eq!(config.batch_timeout_ms, 5000);    // Updated to match fix
     }
 
     #[test]
