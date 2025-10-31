@@ -67,6 +67,31 @@ pub mod multi_objective_tuner;
 // Position management
 pub mod position_manager;
 
+// ============================================================================
+// NEW: Modular Architecture Components
+// ============================================================================
+
+// Event-driven architecture
+pub mod event_bus;
+
+// Order state management
+pub mod order_state_machine;
+
+// Unified state store
+pub mod trading_state_store;
+
+// Signal generation
+pub mod signal_generator;
+
+// Risk adjustment
+pub mod risk_adjuster;
+
+// Order execution
+pub mod order_executor;
+
+// Market data processing
+pub mod market_data_pipeline;
+
 // Re-export traits for convenience
 pub use volatility::VolatilityModel;
 pub use fill_model::FillModel;
@@ -98,4 +123,42 @@ pub use multi_objective_tuner::{MultiObjectiveTuner, TunerConfig, TuningHistory}
 // Re-export position manager types
 pub use position_manager::{
     PositionManager, PositionManagerConfig, PositionState, AllowedAction, PendingOrders
+};
+
+// ============================================================================
+// Re-export modular architecture types
+// ============================================================================
+
+// Event bus
+pub use event_bus::{EventBus, TradingEvent, EventSubscriber, LoggingSubscriber, MetricsSubscriber};
+
+// Order state machine
+pub use order_state_machine::{
+    OrderStateMachine, OrderState, OrderEvent, StateError, StateMachineConfig
+};
+
+// Trading state store
+pub use trading_state_store::{
+    TradingStateStore, TradingSnapshot, MarketData, RiskMetrics, OpenOrder
+};
+
+// Signal generator
+pub use signal_generator::{
+    HjbSignalGenerator, QuoteSignal, QuoteLevel, SignalMetadata
+};
+
+// Risk adjuster
+pub use risk_adjuster::{
+    RiskAdjuster, AdjustedSignal, AdjustedQuoteLevel, MarginCalculator
+};
+
+// Order executor
+pub use order_executor::{
+    OrderExecutor, ExecutionError
+};
+
+// Market data pipeline
+pub use market_data_pipeline::{
+    MarketDataPipeline, ProcessedMarketData, MarketDataProcessor,
+    ImbalanceProcessor, VolatilityProcessor, AdverseSelectionProcessor
 };
