@@ -46,6 +46,8 @@ pub mod robust_control;
 
 // Concrete implementations
 pub mod particle_filter_vol;
+pub mod ewma_vol;
+pub mod hybrid_vol;
 pub mod hawkes_fill_model;
 pub mod online_sgd_as;
 pub mod microprice_as;
@@ -57,6 +59,11 @@ pub mod order_churn_manager;
 // Order book analysis (supporting utilities)
 pub mod book_analyzer;
 
+// Auto-tuning infrastructure
+pub mod performance_tracker;
+pub mod parameter_transforms;
+pub mod multi_objective_tuner;
+
 // Re-export traits for convenience
 pub use volatility::VolatilityModel;
 pub use fill_model::FillModel;
@@ -67,6 +74,8 @@ pub use robust_control::{RobustControlModel, RobustParameters, ParameterUncertai
 
 // Re-export concrete implementations
 pub use particle_filter_vol::ParticleFilterVolModel;
+pub use ewma_vol::{EwmaVolatilityModel, EwmaVolConfig};
+pub use hybrid_vol::{HybridVolatilityModel, HybridVolConfig};
 pub use hawkes_fill_model::HawkesFillModelImpl;
 pub use online_sgd_as::OnlineSgdAsModel;
 pub use microprice_as::MicropriceAsModel;
@@ -77,3 +86,8 @@ pub use order_churn_manager::{OrderChurnManager, OrderChurnConfig, OrderMetadata
 
 // Re-export book analyzer types
 pub use book_analyzer::{BookAnalysis, OrderBook};
+
+// Re-export auto-tuning types
+pub use performance_tracker::{PerformanceTracker, PerformanceMetrics, MultiObjectiveWeights};
+pub use parameter_transforms::{StrategyTuningParams, StrategyConstrainedParams};
+pub use multi_objective_tuner::{MultiObjectiveTuner, TunerConfig, TuningHistory};

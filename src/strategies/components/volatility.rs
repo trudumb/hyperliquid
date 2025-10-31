@@ -53,7 +53,7 @@ use crate::strategy::MarketUpdate;
 ///
 /// The uncertainty quantification is crucial for robust control strategies
 /// that need to know "how confident are we in this volatility estimate?"
-pub trait VolatilityModel: Send {
+pub trait VolatilityModel: Send + Sync {
     /// Update the model with new market data.
     ///
     /// This method is called on every market update (L2 book, trades, mid-price).

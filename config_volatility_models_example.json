@@ -1,0 +1,269 @@
+{
+  "comment": "Example configuration showing different volatility model options",
+  "strategies": {
+    "HYPE_EWMA": {
+      "strategy_type": "hjb",
+      "strategy_params": {
+        "comment": "=== RECOMMENDED: EWMA Volatility Model for Tick Data ===",
+        "comment_2": "EWMA is simpler, faster, and better calibrated for high-frequency tick-by-tick updates",
+
+        "volatility_model_type": "ewma",
+        "ewma_vol_config": {
+          "comment": "High-frequency configuration (fast adaptation, robust outlier filtering)",
+          "half_life_seconds": 60.0,
+          "alpha": 0.1,
+          "outlier_threshold": 4.0,
+          "min_volatility_bps": 0.5,
+          "max_volatility_bps": 50.0,
+          "history_size": 100,
+          "use_absolute_returns": false,
+          "expected_tick_frequency_hz": 10.0
+        },
+
+        "max_absolute_position_size": 3.0,
+        "enable_multi_level": true,
+        "enable_robust_control": true,
+        "phi": 0.01,
+        "lambda_base": 1.0,
+        "maker_fee_bps": 1.5,
+        "taker_fee_bps": 4.5,
+        "leverage": 3,
+        "max_leverage": 50,
+        "margin_safety_buffer": 0.2,
+
+        "multi_level_config": {
+          "num_levels": 3,
+          "level_spacing_bps": 10.0,
+          "min_profitable_spread_bps": 3.0,
+          "volatility_to_spread_factor": 0.008,
+          "base_maker_size": 1.0,
+          "maker_aggression_decay": 0.5,
+          "taker_size_multiplier": 0.3,
+          "min_taker_rate_threshold": 0.1,
+          "enable_taker_mode": false
+        }
+      }
+    },
+
+    "HYPE_PARTICLE_FILTER": {
+      "strategy_type": "hjb",
+      "strategy_params": {
+        "comment": "=== ALTERNATIVE: Particle Filter (Advanced, for experts) ===",
+        "comment_2": "Particle filter provides uncertainty quantification but requires careful calibration",
+
+        "volatility_model_type": "particle_filter",
+        "comment_pf": "Particle filter parameters are hardcoded in hjb_strategy.rs initialization",
+        "comment_pf_2": "Default parameters: num_particles=1000, mu=-18.0 (recalibrated for tick-level)",
+
+        "max_absolute_position_size": 3.0,
+        "enable_multi_level": true,
+        "enable_robust_control": true,
+        "phi": 0.01,
+        "lambda_base": 1.0,
+        "maker_fee_bps": 1.5,
+        "taker_fee_bps": 4.5,
+        "leverage": 3,
+        "max_leverage": 50,
+        "margin_safety_buffer": 0.2,
+
+        "multi_level_config": {
+          "num_levels": 3,
+          "level_spacing_bps": 10.0,
+          "min_profitable_spread_bps": 3.0,
+          "volatility_to_spread_factor": 0.008,
+          "base_maker_size": 1.0,
+          "maker_aggression_decay": 0.5,
+          "taker_size_multiplier": 0.3,
+          "min_taker_rate_threshold": 0.1,
+          "enable_taker_mode": false
+        }
+      }
+    },
+
+    "HYPE_HYBRID": {
+      "strategy_type": "hjb",
+      "strategy_params": {
+        "comment": "=== HYBRID: Best of Both Worlds ===",
+        "comment_2": "Combines EWMA speed with Particle Filter stochastic baseline + bid-ask rate grounding",
+
+        "volatility_model_type": "hybrid",
+        "hybrid_vol_config": {
+          "comment": "Fast EWMA layer grounded to slower Particle Filter baseline",
+
+          "ewma_config": {
+            "half_life_seconds": 60.0,
+            "alpha": 0.1,
+            "outlier_threshold": 4.0,
+            "min_volatility_bps": 0.5,
+            "max_volatility_bps": 50.0,
+            "expected_tick_frequency_hz": 10.0
+          },
+
+          "num_particles": 1000,
+          "pf_mu": -18.0,
+          "pf_phi": 0.95,
+          "pf_sigma_eta": 0.5,
+          "pf_update_interval_ticks": 10,
+
+          "grounding_strength_base": 0.2,
+          "grounding_sensitivity": 0.5,
+          "min_grounding": 0.05,
+          "max_grounding": 0.5,
+          "enable_bid_ask_tracking": true
+        },
+
+        "max_absolute_position_size": 3.0,
+        "enable_multi_level": true,
+        "enable_robust_control": true,
+        "phi": 0.01,
+        "lambda_base": 1.0,
+        "maker_fee_bps": 1.5,
+        "taker_fee_bps": 4.5,
+        "leverage": 3,
+        "max_leverage": 50,
+        "margin_safety_buffer": 0.2,
+
+        "multi_level_config": {
+          "num_levels": 3,
+          "level_spacing_bps": 10.0,
+          "min_profitable_spread_bps": 3.0,
+          "volatility_to_spread_factor": 0.008,
+          "base_maker_size": 1.0,
+          "maker_aggression_decay": 0.5,
+          "taker_size_multiplier": 0.3,
+          "min_taker_rate_threshold": 0.1,
+          "enable_taker_mode": false
+        }
+      }
+    },
+
+    "HYPE_EWMA_LOW_FREQ": {
+      "strategy_type": "hjb",
+      "strategy_params": {
+        "comment": "=== EWMA for Low-Frequency Ticks (slower markets) ===",
+
+        "volatility_model_type": "ewma",
+        "ewma_vol_config": {
+          "comment": "Low-frequency configuration (slow adaptation, wider tolerance)",
+          "half_life_seconds": 600.0,
+          "alpha": 0.01,
+          "outlier_threshold": 6.0,
+          "min_volatility_bps": 0.5,
+          "max_volatility_bps": 100.0,
+          "history_size": 200,
+          "use_absolute_returns": false,
+          "expected_tick_frequency_hz": 0.1
+        },
+
+        "max_absolute_position_size": 3.0,
+        "enable_multi_level": true,
+        "enable_robust_control": true,
+        "phi": 0.01,
+        "lambda_base": 1.0,
+        "maker_fee_bps": 1.5,
+        "taker_fee_bps": 4.5,
+        "leverage": 3,
+        "max_leverage": 50,
+        "margin_safety_buffer": 0.2,
+
+        "multi_level_config": {
+          "num_levels": 3,
+          "level_spacing_bps": 10.0,
+          "min_profitable_spread_bps": 3.0,
+          "volatility_to_spread_factor": 0.008,
+          "base_maker_size": 1.0,
+          "maker_aggression_decay": 0.5,
+          "taker_size_multiplier": 0.3,
+          "min_taker_rate_threshold": 0.1,
+          "enable_taker_mode": false
+        }
+      }
+    }
+  },
+
+  "README": {
+    "overview": "Three volatility model options: EWMA (simple/fast), Particle Filter (advanced), and Hybrid (best of both)",
+
+    "volatility_models": {
+      "hybrid": {
+        "description": "Hybrid EWMA-ParticleFilter - Fast tracking grounded to stochastic baseline",
+        "best_for": "Production use when you want both speed AND stochastic modeling",
+        "pros": [
+          "Fast O(1) EWMA updates for tick-level tracking",
+          "Particle filter provides stochastic baseline (prevents EWMA drift)",
+          "Uncertainty quantification from PF for robust control",
+          "Bid-ask rate tracking for adaptive grounding",
+          "Best of both worlds: speed + theory"
+        ],
+        "cons": [
+          "More complex to configure than pure EWMA",
+          "Slightly slower than pure EWMA (but faster than pure PF)",
+          "Requires understanding of grounding parameters"
+        ],
+        "how_it_works": {
+          "fast_layer": "EWMA tracks tick-to-tick changes (updated every tick)",
+          "slow_layer": "Particle filter provides stochastic baseline (updated every N ticks)",
+          "grounding": "Hybrid vol = (1-λ) * EWMA + λ * PF, where λ is adaptive",
+          "bid_ask_rates": "Fill rate volatility modulates grounding strength (high activity → trust EWMA more)",
+          "typical_grounding": "λ ≈ 0.1-0.3 (mostly EWMA with PF anchor)"
+        },
+        "typical_values": {
+          "volatility": "1-20 bps (same as EWMA, but more stable)",
+          "grounding_strength": "0.05-0.5 (adaptive based on PF confidence and market activity)",
+          "pf_update_interval": "10-20 ticks (balance between accuracy and performance)"
+        }
+      },
+      "ewma": {
+        "description": "Exponentially Weighted Moving Average - Simple, robust, tick-aware",
+        "best_for": "High-frequency tick data, production use",
+        "pros": [
+          "Fast O(1) updates",
+          "Numerically stable",
+          "Easy to calibrate (just set half_life)",
+          "Built-in outlier filtering",
+          "Rational volatility estimates for tick data"
+        ],
+        "cons": [
+          "No uncertainty quantification (uses historical variance)",
+          "Less sophisticated than stochastic models"
+        ],
+        "typical_values": {
+          "volatility": "1-20 bps for most crypto pairs",
+          "half_life": "60-300 seconds depending on tick frequency"
+        }
+      },
+      "particle_filter": {
+        "description": "Stochastic Volatility with Particle Filter - Advanced Bayesian estimation",
+        "best_for": "Research, when you need uncertainty quantification",
+        "pros": [
+          "Provides uncertainty estimates for robust control",
+          "Models latent volatility dynamics",
+          "Theoretically elegant"
+        ],
+        "cons": [
+          "Slow O(N) updates (N=1000 particles)",
+          "Requires expert calibration for tick data",
+          "Can produce irrational values if miscalibrated",
+          "Numerical instability with tiny dt values"
+        ],
+        "calibration_notes": [
+          "mu=-18.0 for tick-level (was 0.0 originally, which caused 90 bps estimates)",
+          "Recalibrated parameters still experimental",
+          "Use EWMA unless you specifically need particle filter features"
+        ]
+      }
+    },
+    "volatility_sanity_bounds": {
+      "description": "The optimizer clamps volatility to [0.5, 50.0] bps to prevent irrational spreads",
+      "why": "90 bps volatility from particle filter was caused by parameter miscalibration",
+      "fix": "Recalibrated particle filter + added bounds + created EWMA alternative"
+    },
+    "migration_guide": {
+      "step1": "Add 'volatility_model_type': 'ewma' to your strategy_params",
+      "step2": "Optionally add 'ewma_vol_config' to customize parameters",
+      "step3": "Restart the market maker",
+      "step4": "Monitor logs for 'vol_smooth' values - should be 1-20 bps for most assets",
+      "step5": "If you see '[VOL SANITY] Clamping volatility' warnings, model needs tuning"
+    }
+  }
+}

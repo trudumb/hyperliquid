@@ -1,0 +1,326 @@
+{
+  "comment": "Example configuration with Multi-Objective Auto-Tuning enabled",
+  "strategies": {
+    "HYPE_AUTO_TUNED": {
+      "strategy_type": "hjb",
+      "strategy_params": {
+        "comment": "=== AUTO-TUNING ENABLED ===",
+        "comment_2": "This configuration enables online parameter optimization using SPSA + Adam",
+
+        "volatility_model_type": "hybrid",
+        "hybrid_vol_config": {
+          "ewma_config": {
+            "half_life_seconds": 60.0,
+            "alpha": 0.1,
+            "outlier_threshold": 4.0,
+            "min_volatility_bps": 0.5,
+            "max_volatility_bps": 50.0,
+            "expected_tick_frequency_hz": 10.0
+          },
+          "num_particles": 1000,
+          "pf_mu": -18.0,
+          "pf_phi": 0.95,
+          "pf_sigma_eta": 0.5,
+          "pf_update_interval_ticks": 10,
+          "grounding_strength_base": 0.2,
+          "grounding_sensitivity": 0.5,
+          "min_grounding": 0.05,
+          "max_grounding": 0.5,
+          "enable_bid_ask_tracking": true
+        },
+
+        "comment_tuning": "=== MULTI-OBJECTIVE AUTO-TUNING CONFIG ===",
+        "auto_tuning": {
+          "enabled": true,
+          "mode": "continuous",
+          "comment_mode": "Options: 'continuous' (every N episodes), 'scheduled' (every T seconds), 'adaptive' (on performance drop)",
+
+          "comment_episodes": "Episode = 500 market updates (L2 ticks)",
+          "episodes_per_update": 2,
+          "updates_per_episode": 500,
+
+          "comment_scheduled": "For scheduled mode: update every hour",
+          "update_interval_seconds": 3600.0,
+
+          "comment_adaptive": "For adaptive mode: trigger update when performance drops below 70% of best",
+          "adaptive_threshold": 0.7,
+
+          "comment_spsa": "=== SPSA Gradient Estimation ===",
+          "spsa_c": 0.1,
+          "comment_spsa_c": "Perturbation magnitude (larger = more exploration, smaller = finer tuning)",
+          "spsa_gamma": 0.101,
+          "comment_spsa_gamma": "Perturbation decay: c_k = c / k^gamma (0.101 is standard)",
+
+          "comment_adam": "=== Adam Optimizer Settings ===",
+          "adam_alpha": 0.001,
+          "comment_adam_alpha": "Learning rate (0.001 is conservative for production)",
+          "adam_beta1": 0.9,
+          "comment_adam_beta1": "Momentum decay (first moment)",
+          "adam_beta2": 0.999,
+          "comment_adam_beta2": "Variance decay (second moment)",
+          "adam_epsilon": 1e-8,
+          "learning_rate_decay": 0.0,
+          "comment_lr_decay": "Learning rate decay: alpha_k = alpha / (1 + decay * k). Set to 0.0 for no decay.",
+
+          "comment_constraints": "=== Safety Constraints ===",
+          "max_param_change": 1.0,
+          "comment_max_change": "Maximum L-infinity norm of parameter update (gradient clipping)",
+          "min_episodes_for_gradient": 20,
+          "comment_min_episodes": "Minimum data for reliable gradient estimation",
+
+          "comment_objectives": "=== Multi-Objective Weights ===",
+          "objective_weights": {
+            "profitability_weight": 0.4,
+            "risk_weight": 0.3,
+            "efficiency_weight": 0.2,
+            "model_quality_weight": 0.1,
+
+            "profitability": {
+              "pnl_weight": 0.4,
+              "sharpe_ratio_weight": 0.3,
+              "win_rate_weight": 0.2,
+              "profit_factor_weight": 0.1
+            },
+
+            "risk": {
+              "max_drawdown_weight": 0.4,
+              "inventory_volatility_weight": 0.3,
+              "margin_usage_weight": 0.3
+            },
+
+            "efficiency": {
+              "fill_rate_weight": 0.4,
+              "churn_rate_weight": 0.3,
+              "spread_capture_weight": 0.3
+            }
+          },
+
+          "verbose": true,
+          "comment_verbose": "Log all tuning actions (for monitoring/debugging)"
+        },
+
+        "comment_initial": "=== Initial Parameters (Starting Point for Tuning) ===",
+        "max_absolute_position_size": 3.0,
+        "enable_multi_level": true,
+        "enable_robust_control": true,
+        "phi": 0.01,
+        "lambda_base": 1.0,
+        "maker_fee_bps": 1.5,
+        "taker_fee_bps": 4.5,
+        "leverage": 3,
+        "max_leverage": 50,
+        "margin_safety_buffer": 0.2,
+
+        "multi_level_config": {
+          "num_levels": 3,
+          "level_spacing_bps": 10.0,
+          "min_profitable_spread_bps": 3.0,
+          "volatility_to_spread_factor": 0.008,
+          "base_maker_size": 1.0,
+          "maker_aggression_decay": 0.5,
+          "taker_size_multiplier": 0.3,
+          "min_taker_rate_threshold": 0.1,
+          "enable_taker_mode": false
+        }
+      }
+    },
+
+    "HYPE_NO_TUNING": {
+      "strategy_type": "hjb",
+      "strategy_params": {
+        "comment": "=== BASELINE: No Auto-Tuning (Fixed Parameters) ===",
+
+        "volatility_model_type": "hybrid",
+        "hybrid_vol_config": {
+          "ewma_config": {
+            "half_life_seconds": 60.0,
+            "alpha": 0.1,
+            "outlier_threshold": 4.0,
+            "min_volatility_bps": 0.5,
+            "max_volatility_bps": 50.0,
+            "expected_tick_frequency_hz": 10.0
+          },
+          "num_particles": 1000,
+          "pf_mu": -18.0,
+          "pf_phi": 0.95,
+          "pf_sigma_eta": 0.5,
+          "pf_update_interval_ticks": 10,
+          "grounding_strength_base": 0.2,
+          "grounding_sensitivity": 0.5,
+          "min_grounding": 0.05,
+          "max_grounding": 0.5,
+          "enable_bid_ask_tracking": true
+        },
+
+        "auto_tuning": {
+          "enabled": false
+        },
+
+        "max_absolute_position_size": 3.0,
+        "enable_multi_level": true,
+        "enable_robust_control": true,
+        "phi": 0.01,
+        "lambda_base": 1.0,
+        "maker_fee_bps": 1.5,
+        "taker_fee_bps": 4.5,
+        "leverage": 3,
+        "max_leverage": 50,
+        "margin_safety_buffer": 0.2,
+
+        "multi_level_config": {
+          "num_levels": 3,
+          "level_spacing_bps": 10.0,
+          "min_profitable_spread_bps": 3.0,
+          "volatility_to_spread_factor": 0.008,
+          "base_maker_size": 1.0,
+          "maker_aggression_decay": 0.5,
+          "taker_size_multiplier": 0.3,
+          "min_taker_rate_threshold": 0.1,
+          "enable_taker_mode": false
+        }
+      }
+    }
+  },
+
+  "README": {
+    "overview": "Multi-Objective Auto-Tuning for HJB Strategy",
+
+    "what_is_it": {
+      "description": "Automatically optimizes all 36+ strategy parameters in real-time during live trading",
+      "algorithm": "SPSA (gradient estimation) + Adam (adaptive learning rate)",
+      "objectives": "Profitability (0.4) + Risk Control (0.3) + Efficiency (0.2) + Model Quality (0.1)",
+      "parameter_space": "36-dimensional with smart constraints (sigmoid transforms ensure bounds)"
+    },
+
+    "how_it_works": {
+      "episode_based": "Every N market updates = 1 episode",
+      "candidate_evaluation": "Generates φ+ and φ- perturbations, evaluates both",
+      "gradient_estimation": "SPSA: ∇J ≈ [J(φ+) - J(φ-)] / (2c) · Δ⁻¹",
+      "parameter_update": "Adam: φ_new = φ_old + α·m / (√v + ε)",
+      "typical_cycle": "2 episodes (1000 ticks) → evaluate both candidates → update → repeat"
+    },
+
+    "tuning_modes": {
+      "continuous": {
+        "description": "Update every N episodes (recommended for production)",
+        "config": "episodes_per_update: 2",
+        "use_case": "Continuous adaptation to market regime changes"
+      },
+      "scheduled": {
+        "description": "Update at fixed time intervals",
+        "config": "update_interval_seconds: 3600",
+        "use_case": "Periodic reoptimization (e.g., hourly)"
+      },
+      "adaptive": {
+        "description": "Update when performance degrades",
+        "config": "adaptive_threshold: 0.7 (trigger at 70% of best score)",
+        "use_case": "React to sudden performance drops"
+      }
+    },
+
+    "safety_features": {
+      "bounded_parameters": "Sigmoid transforms ensure all parameters stay within safe ranges",
+      "gradient_clipping": "max_param_change limits L-infinity norm of updates",
+      "min_data_requirement": "min_episodes_for_gradient ensures statistical reliability",
+      "best_params_tracking": "Always stores best parameters found (can revert if needed)"
+    },
+
+    "what_gets_tuned": {
+      "core_hjb": [
+        "phi (risk aversion)",
+        "lambda_base (fill intensity)",
+        "max_position",
+        "fees",
+        "leverage",
+        "margin_safety"
+      ],
+      "multi_level": [
+        "num_levels",
+        "level_spacing_bps",
+        "min_spread_bps",
+        "vol_to_spread_factor",
+        "maker sizes and decay",
+        "taker thresholds"
+      ],
+      "volatility_models": [
+        "ewma_half_life",
+        "ewma_alpha",
+        "outlier_threshold",
+        "pf_mu",
+        "pf_phi",
+        "grounding strengths"
+      ]
+    },
+
+    "performance_metrics": {
+      "profitability": {
+        "pnl": "Total profit/loss",
+        "sharpe_ratio": "Risk-adjusted returns",
+        "win_rate": "Fraction of profitable trades",
+        "profit_factor": "Gross profit / gross loss"
+      },
+      "risk": {
+        "max_drawdown": "Largest peak-to-trough decline",
+        "inventory_volatility": "Position size variance",
+        "margin_usage": "Leverage utilization"
+      },
+      "efficiency": {
+        "fill_rate": "Orders filled / orders placed",
+        "churn_rate": "Cancellations / placements (lower is better)",
+        "spread_capture": "Realized spread / theoretical spread"
+      },
+      "model_quality": {
+        "vol_prediction_error": "Volatility forecast accuracy",
+        "as_prediction_error": "Adverse selection forecast accuracy"
+      }
+    },
+
+    "typical_learning_rates": {
+      "conservative": {
+        "adam_alpha": 0.0001,
+        "spsa_c": 0.05,
+        "description": "Slow, stable convergence (recommended for large accounts)"
+      },
+      "moderate": {
+        "adam_alpha": 0.001,
+        "spsa_c": 0.1,
+        "description": "Balanced exploration vs. exploitation (recommended for most users)"
+      },
+      "aggressive": {
+        "adam_alpha": 0.01,
+        "spsa_c": 0.2,
+        "description": "Fast adaptation (only for small accounts / testing)"
+      }
+    },
+
+    "monitoring": {
+      "log_messages": [
+        "[TUNER] Starting candidate evaluation",
+        "[TUNER] Plus candidate score: 0.723456",
+        "[TUNER] Minus candidate score: 0.698234",
+        "[TUNER] SPSA gradient norm: 2.341, score_diff: 0.025",
+        "[TUNER] Updated parameters (iteration 42), learning_rate: 0.001000, avg_score: 0.710845",
+        "[TUNER] New best score: 0.723456"
+      ],
+      "export_history": "Call tuner.export_history() to save tuning progress as JSON"
+    },
+
+    "getting_started": {
+      "step1": "Copy HYPE_AUTO_TUNED config section to your config.json",
+      "step2": "Set enabled: true in auto_tuning section",
+      "step3": "Choose tuning mode (continuous recommended)",
+      "step4": "Set episodes_per_update (2-5 typical, higher = more data per gradient estimate)",
+      "step5": "Start market maker and monitor [TUNER] logs",
+      "step6": "After 1 hour, check if parameters are improving (score increasing)",
+      "step7": "Adjust learning rates if needed (decrease if unstable, increase if too slow)"
+    },
+
+    "warnings": {
+      "paper_trading_first": "Test with paper trading before using real funds!",
+      "monitor_closely": "Watch first few hours to ensure parameters stay reasonable",
+      "learning_rate_matters": "Start conservative (alpha=0.0001) and increase if stable",
+      "objective_weights": "Adjust weights based on your priorities (profit vs. risk vs. efficiency)",
+      "not_magic": "Auto-tuning adapts to recent data - market regime changes may require manual intervention"
+    }
+  }
+}

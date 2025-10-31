@@ -34,6 +34,9 @@ pub mod components;
 // Private implementation module for HJB strategy
 mod hjb_impl;
 
+// Auto-tuner integration module
+pub mod tuner_integration;
+
 // Re-export core HJB types from the private implementation module
 // These are needed by users of the hjb_strategy and other modules
 pub use hjb_impl::{

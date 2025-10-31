@@ -44,7 +44,7 @@ use crate::strategy::{CurrentState, MarketUpdate, Strategy, StrategyAction, User
 use crate::{
     AssetType, ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest,
     HawkesFillModel, L2BookData, MultiLevelConfig,
-    OrderBook, OrderState, ParameterUncertainty, ParticleFilterState,
+    OrderBook, OrderState, ParameterUncertainty,
     TickLotValidator, Trade, TradeInfo,
 };
 use crate::strategies::components::{RobustConfig, InventorySkewConfig};
@@ -54,7 +54,13 @@ use crate::strategies::components::{
     HjbMultiLevelOptimizer, OptimizerInputs, OptimizerOutput,
     OrderChurnManager, OrderChurnConfig, OrderMetadata, MarketChurnState,
     MicropriceAsModel,
+    VolatilityModel, EwmaVolatilityModel, EwmaVolConfig, ParticleFilterVolModel,
+    HybridVolatilityModel, HybridVolConfig,
+    TunerConfig, StrategyTuningParams, MultiObjectiveWeights,
 };
+
+// Import auto-tuning integration
+use crate::strategies::tuner_integration::TunerIntegration;
 
 // ----------------------------------------------------------------------------
 // Import HJB implementation details from the sibling hjb_impl module
@@ -129,6 +135,18 @@ pub struct HjbStrategyConfig {
 
     /// Order churn management configuration
     pub order_churn_config: Option<OrderChurnConfig>,
+
+    /// Volatility model type: "particle_filter", "ewma", or "hybrid"
+    pub volatility_model_type: String,
+
+    /// EWMA volatility configuration (if using EWMA model)
+    pub ewma_vol_config: Option<Value>,
+
+    /// Hybrid volatility configuration (if using hybrid model)
+    pub hybrid_vol_config: Option<Value>,
+
+    /// Auto-tuning configuration (if enabled)
+    pub auto_tuning_config: Option<Value>,
 }
 
 impl HjbStrategyConfig {
@@ -203,6 +221,13 @@ impl HjbStrategyConfig {
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.2),
             order_churn_config,
+            volatility_model_type: params.get("volatility_model_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("ewma") // Default to EWMA for tick data
+                .to_string(),
+            ewma_vol_config: params.get("ewma_vol_config").cloned(),
+            hybrid_vol_config: params.get("hybrid_vol_config").cloned(),
+            auto_tuning_config: params.get("auto_tuning").cloned(),
         }
     }
 }
@@ -353,8 +378,8 @@ pub struct HjbStrategy {
     /// Hawkes process model for fill rate estimation
     hawkes_model: Arc<RwLock<HawkesFillModel>>,
 
-    /// Particle filter for stochastic volatility estimation
-    particle_filter: Arc<RwLock<ParticleFilterState>>,
+    /// Volatility model (swappable: EWMA or Particle Filter)
+    volatility_model: Box<dyn VolatilityModel>,
 
     /// Microprice-based adverse selection model (stable and production-ready)
     microprice_as_model: MicropriceAsModel,
@@ -412,6 +437,9 @@ pub struct HjbStrategy {
 
     /// The mid-price from the last *significant* re-quote
     last_z_quote_mid_price: f64,
+
+    /// Auto-tuning integration (None if disabled)
+    tuner_integration: Option<TunerIntegration>,
 }
 
 impl Strategy for HjbStrategy {
@@ -486,17 +514,39 @@ impl Strategy for HjbStrategy {
             tuning_params.clone(),
         );
 
-        // Initialize particle filter for stochastic volatility
-        // Parameters: num_particles, mu, phi, sigma_eta, initial_h, initial_h_std_dev, seed
-        let particle_filter = Arc::new(RwLock::new(ParticleFilterState::new(
-            1000, // num_particles
-            0.0,  // mu (mean reversion level)
-            0.98, // phi (persistence)
-            0.1,  // sigma_eta (volatility of volatility)
-            -5.0, // initial_h (log volatility squared)
-            0.5,  // initial_h_std_dev
-            12345 // seed
-        )));
+        // Initialize volatility model based on configuration
+        let volatility_model: Box<dyn VolatilityModel> = match strategy_config.volatility_model_type.as_str() {
+            "particle_filter" => {
+                info!("📊 Using Particle Filter volatility model");
+                Box::new(ParticleFilterVolModel::new(
+                    1000,   // num_particles
+                    -18.0,  // mu (recalibrated for tick-level: ln(σ²) where σ ≈ 3bps instantaneous)
+                    0.95,   // phi (high persistence for tick data)
+                    0.5,    // sigma_eta (moderate vol-of-vol)
+                    -18.5,  // initial_h (starting near mu)
+                    1.0,    // initial_h_std_dev (wider uncertainty)
+                    12345   // seed
+                ))
+            }
+            "hybrid" => {
+                info!("📊 Using Hybrid EWMA-ParticleFilter volatility model (grounded to stochastic baseline)");
+                if let Some(ref hybrid_config) = strategy_config.hybrid_vol_config {
+                    Box::new(HybridVolatilityModel::from_json(hybrid_config))
+                } else {
+                    // Default hybrid config for high-frequency ticks
+                    Box::new(HybridVolatilityModel::new(HybridVolConfig::high_frequency()))
+                }
+            }
+            "ewma" | _ => {
+                info!("📊 Using EWMA volatility model (tick-aware)");
+                if let Some(ref ewma_config) = strategy_config.ewma_vol_config {
+                    Box::new(EwmaVolatilityModel::from_json(ewma_config))
+                } else {
+                    // Default EWMA config for high-frequency ticks
+                    Box::new(EwmaVolatilityModel::new(EwmaVolConfig::high_frequency()))
+                }
+            }
+        };
 
         // Initialize cached volatility
         let cached_volatility = Arc::new(RwLock::new(CachedVolatilityEstimate::default()));
@@ -526,6 +576,9 @@ impl Strategy for HjbStrategy {
               strategy_config.leverage, strategy_config.margin_safety_buffer * 100.0);
         info!("📊 Using MicropriceAsModel for stable adverse selection estimation (no SGD/SPSA tuning)");
 
+        // Initialize auto-tuning if enabled
+        let tuner_integration = Self::initialize_tuner(&strategy_config);
+
         Self {
             config: strategy_config,
             tick_lot_validator,
@@ -534,7 +587,7 @@ impl Strategy for HjbStrategy {
             value_function,
             quote_optimizer,
             hawkes_model,
-            particle_filter,
+            volatility_model,
             microprice_as_model: MicropriceAsModel::with_params(0.15, 8.0),  // Smoother, capped at 8bps
             cached_volatility,
             robust_config,
@@ -555,20 +608,178 @@ impl Strategy for HjbStrategy {
             order_churn_manager,
 
             // --- EXPERT ADDITIONS ---
-            // Initialize smoothed vol to the particle filter's initial estimate
+            // Initialize smoothed vol to the initial estimate
             smoothed_volatility_bps: initial_volatility_bps,
             vol_ema_alpha: 0.1, // 10% weight on new observations (tunable)
             z_score_threshold: 1.0, // Only re-quote if price moves > 1.0 std dev
             last_z_quote_mid_price: 0.0,
+            tuner_integration,
         }
     }
+}
 
+// ============================================================================
+// Auto-Tuning Helper Methods
+// ============================================================================
+
+impl HjbStrategy {
+    /// Initialize auto-tuner if enabled in config
+    fn initialize_tuner(config: &HjbStrategyConfig) -> Option<TunerIntegration> {
+        let tuning_config = config.auto_tuning_config.as_ref()?;
+
+        // Check if enabled
+        let enabled = tuning_config.get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if !enabled {
+            info!("🎛️ Auto-tuning: DISABLED");
+            return None;
+        }
+
+        // Parse tuner config
+        let tuner_config = TunerConfig {
+            enabled: true,
+            mode: tuning_config.get("mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("continuous")
+                .to_string(),
+            episodes_per_update: tuning_config.get("episodes_per_update")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(2) as usize,
+            update_interval_seconds: tuning_config.get("update_interval_seconds")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(3600.0),
+            adaptive_threshold: tuning_config.get("adaptive_threshold")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.7),
+            spsa_c: tuning_config.get("spsa_c")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.1),
+            spsa_gamma: tuning_config.get("spsa_gamma")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.101),
+            adam_alpha: tuning_config.get("adam_alpha")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.001),
+            adam_beta1: tuning_config.get("adam_beta1")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.9),
+            adam_beta2: tuning_config.get("adam_beta2")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.999),
+            adam_epsilon: tuning_config.get("adam_epsilon")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1e-8),
+            learning_rate_decay: tuning_config.get("learning_rate_decay")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
+            max_param_change: tuning_config.get("max_param_change")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0),
+            min_episodes_for_gradient: tuning_config.get("min_episodes_for_gradient")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(20) as usize,
+            objective_weights: Self::parse_objective_weights(tuning_config),
+            verbose: tuning_config.get("verbose")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+        };
+
+        // Create initial parameters from current config
+        let initial_params = Self::config_to_tuning_params(config);
+
+        // Updates per episode (ticks per episode)
+        let updates_per_episode = tuning_config.get("updates_per_episode")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(500) as usize;
+
+        // Use timestamp as seed for reproducibility with some randomness
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        info!("🎛️ Auto-tuning: ENABLED (mode={}, episodes_per_update={}, updates_per_episode={}, learning_rate={:.6})",
+            tuner_config.mode, tuner_config.episodes_per_update, updates_per_episode, tuner_config.adam_alpha);
+
+        Some(TunerIntegration::new(
+            tuner_config,
+            initial_params,
+            updates_per_episode,
+            seed,
+        ))
+    }
+
+    /// Parse objective weights from config
+    fn parse_objective_weights(_tuning_config: &Value) -> MultiObjectiveWeights {
+        // For now, just use default MultiObjectiveWeights since the detailed
+        // weight parsing requires matching the PerformanceTracker config structure
+        MultiObjectiveWeights::default()
+    }
+
+    /// Convert current config to tuning parameters
+    fn config_to_tuning_params(_config: &HjbStrategyConfig) -> StrategyTuningParams {
+        // For now, just use defaults
+        // In the future, this should read actual config values and convert to φ space
+        StrategyTuningParams::default()
+    }
+
+    /// Apply new tuned parameters to strategy
+    fn apply_tuned_parameters(&mut self, params: crate::strategies::components::StrategyConstrainedParams) {
+        // Update HJB components
+        self.hjb_components.phi = params.phi;
+        self.hjb_components.lambda_base = params.lambda_base;
+        self.hjb_components.maker_fee_bps = params.maker_fee_bps;
+        self.hjb_components.taker_fee_bps = params.taker_fee_bps;
+
+        // Update config
+        self.config.phi = params.phi;
+        self.config.lambda_base = params.lambda_base;
+        self.config.max_absolute_position_size = params.max_absolute_position_size;
+        self.config.maker_fee_bps = params.maker_fee_bps;
+        self.config.taker_fee_bps = params.taker_fee_bps;
+        self.config.leverage = params.leverage as usize;
+        self.config.max_leverage = params.max_leverage as usize;
+        self.config.margin_safety_buffer = params.margin_safety_buffer;
+        self.config.enable_multi_level = params.enable_multi_level;
+        self.config.enable_robust_control = params.enable_robust_control;
+
+        // Update margin calculator
+        self.margin_calculator = MarginCalculator::new(
+            params.leverage as usize,
+            params.margin_safety_buffer,
+        );
+
+        // Update multi-level config if present
+        if let Some(ref mut ml_config) = self.config.multi_level_config {
+            ml_config.max_levels = params.num_levels;
+            ml_config.level_spacing_bps = params.level_spacing_bps;
+            ml_config.min_profitable_spread_bps = params.min_profitable_spread_bps;
+        }
+
+        // Log the parameter changes
+        info!("[HJB STRATEGY {}] 🎛️ Updated parameters: phi={:.4}, lambda={:.2}, max_pos={:.1}, leverage={}x",
+            self.config.asset, params.phi, params.lambda_base, params.max_absolute_position_size, params.leverage);
+
+        // Clear cached optimizer result to force recomputation with new params
+        self.cached_optimizer_result = None;
+    }
+}
+
+// Continue Strategy trait implementation
+impl Strategy for HjbStrategy {
     fn on_market_update(
         &mut self,
         state: &CurrentState,
         update: &MarketUpdate,
     ) -> Vec<StrategyAction> {
         debug!("[HJB STRATEGY {}] on_market_update called", self.config.asset);
+
+        // Track market update for auto-tuner
+        if let Some(ref mut tuner) = self.tuner_integration {
+            tuner.on_market_update();
+        }
 
         // --- EXPERT ADDITION: Z-Score Event Filter ---
         if let Some(mid_price) = update.mid_price.or(state.order_book.as_ref().map(|b| b.mid_price)) {
@@ -692,6 +903,14 @@ impl Strategy for HjbStrategy {
     fn on_tick(&mut self, state: &CurrentState) -> Vec<StrategyAction> {
         debug!("[HJB STRATEGY {}] on_tick called", self.config.asset);
 
+        // Check for parameter updates from auto-tuner
+        if let Some(ref mut tuner) = self.tuner_integration {
+            if let Some(new_params) = tuner.on_tick() {
+                info!("[HJB STRATEGY {}] 🎛️ Applying new tuned parameters", self.config.asset);
+                self.apply_tuned_parameters(new_params);
+            }
+        }
+
         // Check if trading is enabled
         if !self.trading_enabled {
             warn!("[HJB STRATEGY {}] Trading disabled, returning NoOp", self.config.asset);
@@ -759,6 +978,17 @@ impl Strategy for HjbStrategy {
 
     fn on_shutdown(&mut self, state: &CurrentState) -> Vec<StrategyAction> {
         info!("🛑 HJB Strategy shutting down...");
+
+        // Export auto-tuning history if enabled
+        if let Some(ref tuner) = self.tuner_integration {
+            if let Some(history) = tuner.export_history() {
+                info!("🎛️ Auto-tuning history:\n{}", history);
+            }
+            if let Some(best_params) = tuner.get_best_params() {
+                info!("🎛️ Best parameters found: phi={:.4}, lambda={:.2}, max_pos={:.1}",
+                    best_params.phi, best_params.lambda_base, best_params.max_absolute_position_size);
+            }
+        }
 
         // Cancel all open orders
         let mut actions = Vec::new();
@@ -878,12 +1108,27 @@ impl HjbStrategy {
 
     /// Handle mid-price updates
     fn handle_mid_price_update(&mut self, _state: &CurrentState, mid_price: f64) {
-        // Update particle filter with new price observation
-        let mut pf = self.particle_filter.write();
-        pf.update(mid_price);
-        drop(pf);
+        // Update volatility model with new price observation
+        let market_update = MarketUpdate {
+            asset: self.config.asset.clone(),
+            mid_price: Some(mid_price),
+            l2_book: None,
+            trades: vec![],
+            timestamp: chrono::Utc::now().timestamp_millis() as u64,
+        };
+        self.volatility_model.on_market_update(&market_update);
 
-        // Update uncertainty estimates from particle filter
+        // Update cached volatility from model
+        let new_vol_bps = self.volatility_model.get_volatility_bps();
+        let new_uncertainty_bps = self.volatility_model.get_uncertainty_bps();
+
+        {
+            let mut cached = self.cached_volatility.write();
+            cached.volatility_bps = new_vol_bps;
+            cached.volatility_std_dev_bps = new_uncertainty_bps;
+        }
+
+        // Update uncertainty estimates from volatility model
         self.update_uncertainty_estimates();
 
         // --- EXPERT ADDITION: Update Volatility EWMA ---
@@ -891,8 +1136,8 @@ impl HjbStrategy {
         self.smoothed_volatility_bps = (self.vol_ema_alpha * spot_volatility)
             + ((1.0 - self.vol_ema_alpha) * self.smoothed_volatility_bps);
 
-        debug!("[HJB STRATEGY] Volatility updated: Spot={:.2}bps, Smoothed={:.2}bps",
-            spot_volatility, self.smoothed_volatility_bps);
+        debug!("[HJB STRATEGY] Volatility updated: Spot={:.2}bps, Smoothed={:.2}bps, Uncertainty={:.2}bps",
+            spot_volatility, self.smoothed_volatility_bps, new_uncertainty_bps);
     }
 
     /// Handle fills (update Hawkes model and order churn manager)
@@ -986,15 +1231,30 @@ impl HjbStrategy {
         let as_conviction = self.microprice_as_model.get_adverse_selection_conviction();
         let confident_as_bps = microprice_as_bps * as_conviction;
 
-        debug!("[OPTIMIZER INPUTS {}] vol_spot={:.2}bps, vol_smooth={:.2}bps, vol_unc={:.2}bps, as_raw={:.2}bps, conviction={:.2}, as_final={:.2}bps, lob_imb={:.3}, pos={:.2}",
-            self.config.asset, volatility_bps_pf, self.smoothed_volatility_bps, vol_uncertainty_bps_pf,
+        // --- SANITY BOUNDS: Prevent irrational volatility values ---
+        // For tick-level data, volatility should be in range [0.5, 50] bps
+        // Higher values indicate model miscalibration
+        const MIN_VOL_BPS: f64 = 0.5;
+        const MAX_VOL_BPS: f64 = 50.0;
+        const MAX_VOL_UNCERTAINTY_BPS: f64 = 25.0;
+
+        let bounded_volatility_bps = self.smoothed_volatility_bps.clamp(MIN_VOL_BPS, MAX_VOL_BPS);
+        let bounded_vol_uncertainty_bps = vol_uncertainty_bps_pf.clamp(0.0, MAX_VOL_UNCERTAINTY_BPS);
+
+        if (bounded_volatility_bps - self.smoothed_volatility_bps).abs() > 0.1 {
+            warn!("[VOL SANITY] Clamping volatility: {:.2}bps -> {:.2}bps (model may need recalibration)",
+                self.smoothed_volatility_bps, bounded_volatility_bps);
+        }
+
+        debug!("[OPTIMIZER INPUTS {}] vol_spot={:.2}bps, vol_smooth={:.2}bps (bounded={:.2}bps), vol_unc={:.2}bps, as_raw={:.2}bps, conviction={:.2}, as_final={:.2}bps, lob_imb={:.3}, pos={:.2}",
+            self.config.asset, volatility_bps_pf, self.smoothed_volatility_bps, bounded_volatility_bps, vol_uncertainty_bps_pf,
             microprice_as_bps, as_conviction, confident_as_bps, self.state_vector.lob_imbalance, state.position);
 
         // Prepare optimizer inputs USING SMOOTHED VOLATILITY AND CONVICTION-SCALED AS
         let inputs = OptimizerInputs {
             current_time_sec: current_time,
-            volatility_bps: self.smoothed_volatility_bps, // USE SMOOTHED VOL (more stable)
-            vol_uncertainty_bps: vol_uncertainty_bps_pf, // USE PF UNCERTAINTY HERE
+            volatility_bps: bounded_volatility_bps, // USE BOUNDED VOL (prevent runaway spreads)
+            vol_uncertainty_bps: bounded_vol_uncertainty_bps, // USE BOUNDED UNCERTAINTY
             adverse_selection_bps: confident_as_bps, // USE CONVICTION-SCALED AS (more reliable)
             lob_imbalance: self.state_vector.lob_imbalance, // Keep LOB from state_vector
         };
@@ -1821,18 +2081,17 @@ impl HjbStrategy {
     /// Update uncertainty estimates from particle filter statistics.
     ///
     /// This method updates `current_uncertainty` with the latest parameter
-    /// uncertainty estimates from the particle filter and caches volatility
+    /// uncertainty estimates from the volatility model and caches volatility
     /// statistics for use in robust control.
     fn update_uncertainty_estimates(&mut self) {
-        let pf = self.particle_filter.read();
+        // Extract volatility statistics from the current model
+        let volatility_bps = self.volatility_model.get_volatility_bps();
+        let volatility_std_dev_bps = self.volatility_model.get_uncertainty_bps();
 
-        // Extract volatility statistics
-        let volatility_bps = pf.estimate_volatility_bps();
-        let vol_5th_percentile = pf.estimate_volatility_percentile_bps(0.05);
-        let vol_95th_percentile = pf.estimate_volatility_percentile_bps(0.95);
-
-        // Estimate parameter standard deviations from particle spread
-        let volatility_std_dev_bps = (vol_95th_percentile - vol_5th_percentile) / 3.29; // ~90% confidence interval / 3.29 ≈ std dev
+        // Estimate percentiles from mean ± std dev (approximate)
+        // Assumes normal distribution: 5th ≈ mean - 1.645*std, 95th ≈ mean + 1.645*std
+        let vol_5th_percentile = (volatility_bps - 1.645 * volatility_std_dev_bps).max(0.5);
+        let vol_95th_percentile = volatility_bps + 1.645 * volatility_std_dev_bps;
 
         // Update cached volatility with all fields
         let current_time = chrono::Utc::now().timestamp() as f64;
@@ -1851,8 +2110,6 @@ impl HjbStrategy {
 
         cached_vol.param_std_devs = (mu_uncertainty, sigma_uncertainty, kappa_uncertainty);
         drop(cached_vol);
-
-        drop(pf);
 
         // Update current_uncertainty for robust control
         self.current_uncertainty = ParameterUncertainty {
