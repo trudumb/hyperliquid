@@ -1,0 +1,24 @@
+{
+  "strategies": [
+    {
+      "asset": "HYPE",
+      "strategy_name": "hjb_v2",
+      "strategy_params": {
+        "max_absolute_position_size": 50.0,
+        "phi": 0.01,
+        "lambda_base": 1.0,
+        "maker_fee_bps": 1.5,
+        "taker_fee_bps": 4.5,
+        "leverage": 3,
+        "margin_safety_buffer": 0.2,
+        "requote_threshold_bps": 5.0,
+        "ewma_vol_config": {
+          "lookback_window_size": 100,
+          "alpha": 0.05,
+          "min_volatility_bps": 5.0,
+          "max_volatility_bps": 500.0
+        }
+      }
+    }
+  ]
+}
