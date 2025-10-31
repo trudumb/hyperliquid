@@ -248,11 +248,11 @@ impl Default for StateMachineConfig {
 
 /// A recorded state transition
 #[derive(Debug, Clone)]
-struct Transition {
-    from_state: String,
-    to_state: String,
-    event: String,
-    timestamp: Instant,
+pub struct Transition {
+    pub from_state: String,
+    pub to_state: String,
+    pub event: String,
+    pub timestamp: Instant,
 }
 
 impl OrderStateMachine {

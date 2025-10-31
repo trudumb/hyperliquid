@@ -43,8 +43,7 @@ use serde_json::Value;
 
 use crate::strategy::{CurrentState, MarketUpdate, Strategy, StrategyAction, UserUpdate};
 use crate::{
-    AssetType, ClientCancelRequest, HawkesFillModel, L2BookData, OrderState as LegacyOrderState,
-    TickLotValidator, Trade,
+    AssetType, ClientCancelRequest, HawkesFillModel,
 };
 
 // Import modular components
@@ -53,13 +52,13 @@ use crate::strategies::components::{
     EventBus, TradingEvent, LoggingSubscriber, MetricsSubscriber,
 
     // State management
-    TradingStateStore, TradingSnapshot, MarketData, RiskMetrics, OpenOrder,
+    TradingStateStore, TradingSnapshot, OpenOrder,
 
     // Signal generation
-    HjbSignalGenerator, QuoteSignal,
+    HjbSignalGenerator,
 
     // Risk management
-    RiskAdjuster, MarginCalculator, AdjustedSignal,
+    RiskAdjuster, MarginCalculator,
     PositionManager, PositionManagerConfig, PositionState,
 
     // Order execution
@@ -69,7 +68,7 @@ use crate::strategies::components::{
     MarketDataPipeline, ProcessedMarketData,
 
     // Order state machine
-    OrderStateMachine, StateMachineConfig, OrderState as ModularOrderState, OrderEvent,
+    OrderStateMachine, StateMachineConfig,
 
     // Volatility and optimizer
     VolatilityModel, EwmaVolatilityModel, EwmaVolConfig,
@@ -201,9 +200,6 @@ pub struct HjbStrategyV2 {
     position_manager: PositionManager,
     order_executor: OrderExecutor,
 
-    // Tick/lot validator
-    tick_lot_validator: TickLotValidator,
-
     // Metrics
     metrics_subscriber: Arc<MetricsSubscriber>,
 
@@ -313,13 +309,6 @@ impl HjbStrategyV2 {
             config.requote_threshold_bps,
         );
 
-        // Initialize tick/lot validator
-        let tick_lot_validator = TickLotValidator::new(
-            config.asset.clone(),
-            config.asset_type.clone(),
-            3, // sz_decimals - default to 3 for most assets
-        );
-
         Self {
             config,
             event_bus,
@@ -329,7 +318,6 @@ impl HjbStrategyV2 {
             risk_adjuster,
             position_manager,
             order_executor,
-            tick_lot_validator,
             metrics_subscriber,
             last_quote_time: 0.0,
         }

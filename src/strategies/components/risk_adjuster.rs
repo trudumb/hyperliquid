@@ -6,11 +6,11 @@
 // adjustments based on position state, margin constraints, and market
 // conditions. This is the layer that enforces risk limits.
 
-use log::{debug, info, warn};
+use log::{info, warn};
 
 use super::{
     PositionManager, AllowedAction, PositionState, PendingOrders,
-    signal_generator::{QuoteSignal, QuoteLevel},
+    signal_generator::QuoteSignal,
     trading_state_store::TradingSnapshot,
 };
 

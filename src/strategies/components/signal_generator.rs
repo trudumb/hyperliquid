@@ -10,7 +10,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use log::debug;
 
-use crate::{HawkesFillModel, MultiLevelConfig};
+use crate::HawkesFillModel;
 use crate::strategy::CurrentState;
 
 use super::{
@@ -98,23 +98,8 @@ pub struct HjbSignalGenerator {
     /// Volatility model
     volatility_model: Box<dyn VolatilityModel>,
 
-    /// Adverse selection model
-    microprice_as_model: MicropriceAsModel,
-
     /// Hawkes fill rate model
     hawkes_model: Arc<RwLock<HawkesFillModel>>,
-
-    /// Base fill rate (lambda_base)
-    lambda_base: f64,
-
-    /// Inventory aversion (phi)
-    phi: f64,
-
-    /// Maker fee (bps, negative = rebate)
-    maker_fee_bps: f64,
-
-    /// Taker fee (bps)
-    taker_fee_bps: f64,
 
     /// Cached signal (to avoid redundant calculations)
     cached_signal: Option<CachedSignal>,
@@ -150,22 +135,17 @@ impl HjbSignalGenerator {
     pub fn new(
         quote_optimizer: Box<dyn QuoteOptimizer>,
         volatility_model: Box<dyn VolatilityModel>,
-        microprice_as_model: MicropriceAsModel,
+        _microprice_as_model: MicropriceAsModel,
         hawkes_model: Arc<RwLock<HawkesFillModel>>,
-        lambda_base: f64,
-        phi: f64,
-        maker_fee_bps: f64,
-        taker_fee_bps: f64,
+        _lambda_base: f64,
+        _phi: f64,
+        _maker_fee_bps: f64,
+        _taker_fee_bps: f64,
     ) -> Self {
         Self {
             quote_optimizer,
             volatility_model,
-            microprice_as_model,
             hawkes_model,
-            lambda_base,
-            phi,
-            maker_fee_bps,
-            taker_fee_bps,
             cached_signal: None,
         }
     }
