@@ -27,6 +27,7 @@
 //    ```
 
 pub mod hjb_strategy;
+pub mod hjb_strategy_v2;
 
 // Component-based architecture for strategies
 pub mod components;
@@ -36,6 +37,10 @@ mod hjb_impl;
 
 // Auto-tuner integration module
 pub mod tuner_integration;
+
+// Re-export strategies
+pub use hjb_strategy::HjbStrategy;
+pub use hjb_strategy_v2::HjbStrategyV2;
 
 // Re-export core HJB types from the private implementation module
 // These are needed by users of the hjb_strategy and other modules

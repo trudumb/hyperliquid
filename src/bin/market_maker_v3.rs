@@ -21,7 +21,8 @@ use hyperliquid_rust_sdk::{
     Subscription, TickLotValidator, TradeInfo, UserData, ExecutorAction,
     ExecutorConfig, ExchangeResponseStatus, ExchangeDataStatus,
 };
-use hyperliquid_rust_sdk::strategies::hjb_strategy::{HjbStrategy, MarginCalculator};
+use hyperliquid_rust_sdk::strategies::{HjbStrategy, HjbStrategyV2};
+use hyperliquid_rust_sdk::strategies::hjb_strategy::MarginCalculator;
 // Import our new IPC message types
 use hyperliquid_rust_sdk::ipc::{
     AssetState, AuthoritativeStateUpdate, ExecuteActionsRequest, ExecuteActionsResponse,
@@ -1056,11 +1057,21 @@ impl StrategyRunnerActor {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         info!("[Runner {}] Initializing...", config.asset);
         let strategy: Box<dyn Strategy> = match config.strategy_name.as_str() {
-            "hjb_v1" => Box::new(HjbStrategy::new(
-                &config.asset,
-                &serde_json::json!({ "strategy_params": config.strategy_params }),
-            )),
-            _ => panic!("Unknown strategy: {}", config.strategy_name),
+            "hjb_v1" | "hjb" => {
+                info!("[Runner {}] Using HjbStrategy (original)", config.asset);
+                Box::new(HjbStrategy::new(
+                    &config.asset,
+                    &serde_json::json!({ "strategy_params": config.strategy_params }),
+                ))
+            }
+            "hjb_v2" => {
+                info!("[Runner {}] Using HjbStrategyV2 (modular)", config.asset);
+                Box::new(HjbStrategyV2::new(
+                    &config.asset,
+                    &serde_json::json!({ "strategy_params": config.strategy_params }),
+                ))
+            }
+            _ => panic!("Unknown strategy: {}. Available strategies: hjb_v1, hjb_v2", config.strategy_name),
         };
 
         let info_client = InfoClient::with_reconnect(None, Some(BaseUrl::Mainnet)).await?;

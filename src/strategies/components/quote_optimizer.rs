@@ -99,7 +99,7 @@ pub struct OptimizerInputs {
 ///
 /// The optimizer returns a list of (price, size) pairs for each side,
 /// supporting both single-level and multi-level quoting.
-pub trait QuoteOptimizer: Send {
+pub trait QuoteOptimizer: Send + Sync {
     /// Calculate the target bid and ask quotes (price, size).
     ///
     /// This is the core method where the optimization happens. Given:
