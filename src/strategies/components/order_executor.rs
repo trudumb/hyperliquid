@@ -89,7 +89,7 @@ impl OrderExecutor {
 
         // Reconcile bids
         let bid_actions = self.reconcile_side(
-            &signal.bid_levels.iter().map(|l| (l.offset_bps, l.size)).collect::<Vec<_>>(),
+            &signal.bid_levels.iter().map(|l| (l.price, l.size)).collect::<Vec<_>>(),
             true,
             snapshot,
         );
@@ -97,7 +97,7 @@ impl OrderExecutor {
 
         // Reconcile asks
         let ask_actions = self.reconcile_side(
-            &signal.ask_levels.iter().map(|l| (l.offset_bps, l.size)).collect::<Vec<_>>(),
+            &signal.ask_levels.iter().map(|l| (l.price, l.size)).collect::<Vec<_>>(),
             false,
             snapshot,
         );
@@ -120,7 +120,7 @@ impl OrderExecutor {
     /// Reconcile one side (bids or asks)
     fn reconcile_side(
         &self,
-        desired_levels: &[(f64, f64)], // (offset_bps, size)
+        desired_levels: &[(f64, f64)], // (price, size)
         is_bid: bool,
         snapshot: &TradingSnapshot,
     ) -> Vec<StrategyAction> {
@@ -132,23 +132,35 @@ impl OrderExecutor {
             .filter(|o| o.is_buy == is_bid)
             .collect();
 
-        // Calculate desired prices
-        let desired_prices: Vec<f64> = desired_levels.iter()
-            .map(|(offset_bps, _)| {
-                let offset = mid_price * offset_bps / 10000.0;
-                let price = if is_bid {
-                    mid_price + offset
-                } else {
-                    mid_price + offset
-                };
-                self.round_price(price)
-            })
-            .collect();
+        // Process desired levels: validate, round prices and sizes
+        let mut valid_levels: Vec<(f64, f64)> = Vec::new();
+        for &(price, size) in desired_levels {
+            // Validate and round the price
+            if !price.is_finite() || price <= 0.0 {
+                debug!("[ORDER EXECUTOR] Skipping invalid price: {}", price);
+                continue;
+            }
+
+            let rounded_price = self.round_price(price);
+            let rounded_size = self.round_size(size);
+
+            if rounded_size > 0.0 {
+                valid_levels.push((rounded_price, rounded_size));
+            }
+        }
+
+        // Calculate price tolerance for matching
+        // Use tick_size as minimum tolerance if mid_price is invalid
+        let price_tolerance = if mid_price > 0.0 {
+            mid_price * self.requote_threshold_bps / 10000.0
+        } else {
+            self.tick_size * 2.0  // Fallback to 2 ticks tolerance
+        };
 
         // Find orders to cancel (wrong price or size)
         for order in &existing_orders {
-            let should_cancel = !desired_prices.iter().any(|&dp| {
-                (dp - order.price).abs() < mid_price * self.requote_threshold_bps / 10000.0
+            let should_cancel = !valid_levels.iter().any(|(price, _size)| {
+                (price - order.price).abs() < price_tolerance
             });
 
             if should_cancel {
@@ -163,29 +175,26 @@ impl OrderExecutor {
         // Find prices that need new orders
         let existing_prices: Vec<f64> = existing_orders.iter().map(|o| o.price).collect();
 
-        for (i, &price) in desired_prices.iter().enumerate() {
+        for &(price, size) in &valid_levels {
             let has_order = existing_prices.iter().any(|&ep| {
-                (ep - price).abs() < mid_price * self.requote_threshold_bps / 10000.0
+                (ep - price).abs() < price_tolerance
             });
 
             if !has_order {
-                let size = self.round_size(desired_levels[i].1);
-                if size > 0.0 {
-                    debug!("[ORDER EXECUTOR] Creating {} order: price={:.4}, size={:.4}",
-                        if is_bid { "bid" } else { "ask" }, price, size);
+                debug!("[ORDER EXECUTOR] Creating {} order: price={:.4}, size={:.4}",
+                    if is_bid { "bid" } else { "ask" }, price, size);
 
-                    actions.push(StrategyAction::Place(ClientOrderRequest {
-                        asset: self.asset.clone(),
-                        is_buy: is_bid,
-                        limit_px: price,
-                        sz: size,
-                        order_type: ClientOrder::Limit(ClientLimit {
-                            tif: "Gtc".to_string(),
-                        }),
-                        reduce_only: false,
-                        cloid: None,
-                    }));
-                }
+                actions.push(StrategyAction::Place(ClientOrderRequest {
+                    asset: self.asset.clone(),
+                    is_buy: is_bid,
+                    limit_px: price,
+                    sz: size,
+                    order_type: ClientOrder::Limit(ClientLimit {
+                        tif: "Gtc".to_string(),
+                    }),
+                    reduce_only: false,
+                    cloid: None,
+                }));
             }
         }
 
@@ -194,11 +203,17 @@ impl OrderExecutor {
 
     /// Round price to tick size
     fn round_price(&self, price: f64) -> f64 {
+        if !price.is_finite() || price <= 0.0 || self.tick_size <= 0.0 {
+            return 0.0;  // Invalid input
+        }
         (price / self.tick_size).round() * self.tick_size
     }
 
     /// Round size to lot size
     fn round_size(&self, size: f64) -> f64 {
+        if !size.is_finite() || size <= 0.0 || self.lot_size <= 0.0 {
+            return 0.0;  // Invalid input
+        }
         (size / self.lot_size).round() * self.lot_size
     }
 }

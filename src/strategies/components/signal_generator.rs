@@ -51,8 +51,8 @@ pub struct QuoteSignal {
 /// A single quote level
 #[derive(Debug, Clone)]
 pub struct QuoteLevel {
-    /// Price offset from mid in bps
-    pub offset_bps: f64,
+    /// Absolute price (not offset)
+    pub price: f64,
 
     /// Size at this level
     pub size: f64,
@@ -223,26 +223,23 @@ impl HjbSignalGenerator {
         inventory: f64,
         computation_time_us: u64,
     ) -> QuoteSignal {
-        let mid_price = market_data.mid_price;
         let mut bid_levels = Vec::new();
         let mut ask_levels = Vec::new();
 
-        // Convert bid levels (price, size) to (offset_bps, size)
+        // Convert bid levels - store absolute prices directly
         for (price, size) in bid_quotes {
-            let offset_bps = ((price - mid_price) / mid_price) * 10000.0;
             bid_levels.push(QuoteLevel {
-                offset_bps,
+                price,
                 size,
                 urgency: 0.8, // Default urgency
                 is_bid: true,
             });
         }
 
-        // Convert ask levels
+        // Convert ask levels - store absolute prices directly
         for (price, size) in ask_quotes {
-            let offset_bps = ((price - mid_price) / mid_price) * 10000.0;
             ask_levels.push(QuoteLevel {
-                offset_bps,
+                price,
                 size,
                 urgency: 0.8, // Default urgency
                 is_bid: false,
@@ -332,14 +329,14 @@ impl QuoteSignal {
         self.bid_levels.is_empty() && self.ask_levels.is_empty()
     }
 
-    /// Get the best bid offset
-    pub fn best_bid_offset_bps(&self) -> Option<f64> {
-        self.bid_levels.first().map(|l| l.offset_bps)
+    /// Get the best bid price
+    pub fn best_bid_price(&self) -> Option<f64> {
+        self.bid_levels.first().map(|l| l.price)
     }
 
-    /// Get the best ask offset
-    pub fn best_ask_offset_bps(&self) -> Option<f64> {
-        self.ask_levels.first().map(|l| l.offset_bps)
+    /// Get the best ask price
+    pub fn best_ask_price(&self) -> Option<f64> {
+        self.ask_levels.first().map(|l| l.price)
     }
 
     /// Get total bid size
@@ -354,8 +351,13 @@ impl QuoteSignal {
 
     /// Calculate theoretical spread (best bid to best ask)
     pub fn theoretical_spread_bps(&self) -> f64 {
-        if let (Some(bid), Some(ask)) = (self.best_bid_offset_bps(), self.best_ask_offset_bps()) {
-            ask - bid
+        if let (Some(bid_price), Some(ask_price)) = (self.best_bid_price(), self.best_ask_price()) {
+            let mid = (bid_price + ask_price) / 2.0;
+            if mid > 0.0 {
+                ((ask_price - bid_price) / mid) * 10000.0
+            } else {
+                0.0
+            }
         } else {
             0.0
         }
@@ -371,13 +373,13 @@ mod tests {
         let signal = QuoteSignal {
             bid_levels: vec![
                 QuoteLevel {
-                    offset_bps: -5.0,
+                    price: 99.95,
                     size: 10.0,
                     urgency: 0.8,
                     is_bid: true,
                 },
                 QuoteLevel {
-                    offset_bps: -10.0,
+                    price: 99.90,
                     size: 5.0,
                     urgency: 0.5,
                     is_bid: true,
@@ -385,7 +387,7 @@ mod tests {
             ],
             ask_levels: vec![
                 QuoteLevel {
-                    offset_bps: 5.0,
+                    price: 100.05,
                     size: 10.0,
                     urgency: 0.8,
                     is_bid: false,
@@ -405,8 +407,9 @@ mod tests {
             },
         };
 
-        assert_eq!(signal.best_bid_offset_bps(), Some(-5.0));
-        assert_eq!(signal.best_ask_offset_bps(), Some(5.0));
+        // Test that we have bid and ask levels with correct prices
+        assert_eq!(signal.best_bid_price(), Some(99.95));
+        assert_eq!(signal.best_ask_price(), Some(100.05));
         assert_eq!(signal.total_bid_size(), 15.0);
         assert_eq!(signal.total_ask_size(), 10.0);
         assert_eq!(signal.theoretical_spread_bps(), 10.0);
