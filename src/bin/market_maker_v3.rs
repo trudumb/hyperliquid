@@ -97,13 +97,16 @@ struct StateManagerActor {
     /// Tracks which assets have received their initial UserFills snapshot (to ignore historical data)
     snapshot_received: HashMap<String, bool>,
     /// Margin calculator instance
+    #[allow(dead_code)]
     margin_calculator: MarginCalculator,
     /// Configurable safety buffer (e.g., 0.1 for 10%)
+    #[allow(dead_code)]
     safety_buffer: f64,
     /// Leverage (assuming consistent across strategies for now)
     #[allow(dead_code)]
     leverage: usize,
     /// Max position size (from config)
+    #[allow(dead_code)]
     max_position_size: f64,
 }
 

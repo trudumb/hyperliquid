@@ -6,16 +6,13 @@
 // Reconciles desired state (from adjusted signals) with actual state
 // (open orders on exchange).
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
-use log::{debug, warn};
+use log::debug;
 
 use crate::strategy::StrategyAction;
 use crate::{ClientLimit, ClientOrder, ClientOrderRequest, ClientCancelRequest};
 
 use super::risk_adjuster::AdjustedSignal;
-use super::trading_state_store::{TradingStateStore, TradingSnapshot};
-use super::event_bus::EventBus;
+use super::trading_state_store::TradingSnapshot;
 
 // ============================================================================
 // Execution Error
@@ -48,34 +45,11 @@ impl std::fmt::Display for ExecutionError {
 impl std::error::Error for ExecutionError {}
 
 // ============================================================================
-// Order Reconciliation
-// ============================================================================
-
-/// Tracks which orders need to be added/removed/kept
-#[derive(Debug)]
-struct OrderReconciliation {
-    /// Orders to cancel (order IDs)
-    to_cancel: Vec<u64>,
-
-    /// Orders to create (price, size, is_buy)
-    to_create: Vec<(f64, f64, bool)>,
-
-    /// Orders to keep (order IDs)
-    to_keep: Vec<u64>,
-}
-
-// ============================================================================
 // Order Executor
 // ============================================================================
 
 /// Executes orders based on adjusted signals
 pub struct OrderExecutor {
-    /// State store for tracking orders
-    state_store: Arc<TradingStateStore>,
-
-    /// Event bus for publishing events
-    event_bus: Arc<EventBus>,
-
     /// Minimum price difference to requote (bps)
     requote_threshold_bps: f64,
 
@@ -92,16 +66,14 @@ pub struct OrderExecutor {
 impl OrderExecutor {
     /// Create a new order executor
     pub fn new(
-        state_store: Arc<TradingStateStore>,
-        event_bus: Arc<EventBus>,
+        _state_store: std::sync::Arc<super::trading_state_store::TradingStateStore>,
+        _event_bus: std::sync::Arc<super::event_bus::EventBus>,
         asset: String,
         tick_size: f64,
         lot_size: f64,
         requote_threshold_bps: f64,
     ) -> Self {
         Self {
-            state_store,
-            event_bus,
             requote_threshold_bps,
             asset,
             tick_size,
@@ -237,6 +209,9 @@ mod tests {
 
     #[test]
     fn test_price_rounding() {
+        use std::sync::Arc;
+        use super::super::{TradingStateStore, EventBus};
+
         let state_store = Arc::new(TradingStateStore::new(Arc::new(EventBus::new())));
         let event_bus = Arc::new(EventBus::new());
         let executor = OrderExecutor::new(
