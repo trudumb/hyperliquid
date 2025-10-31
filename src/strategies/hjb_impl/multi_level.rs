@@ -574,7 +574,7 @@ impl MultiLevelOptimizer {
 
         // --- INTELLIGENT LEVEL CONSOLIDATION ---
         // Calculate optimal number of levels based on budget and minimum notional
-        const MIN_NOTIONAL: f64 = 10.0;
+        const MIN_NOTIONAL: f64 = 5.0; // Reduced for small accounts
         let mid_price = state.mid_price.max(1.0); // Prevent division by zero
         let min_size_per_level = MIN_NOTIONAL / mid_price;
 

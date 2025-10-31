@@ -234,13 +234,28 @@ impl HjbStrategyV2 {
         // Initialize state store
         let state_store = Arc::new(TradingStateStore::new(event_bus.clone()));
 
-        // Initialize market data pipeline
-        let market_pipeline = MarketDataPipeline::new();
+        // Initialize market data pipeline with processors
+        use crate::strategies::components::{
+            RobustConfig, InventorySkewConfig,
+            VolatilityProcessor, ImbalanceProcessor, AdverseSelectionProcessor
+        };
+
+        let mut market_pipeline = MarketDataPipeline::new();
+
+        // Create volatility model for the pipeline
+        let pipeline_vol_model: Box<dyn VolatilityModel> = Box::new(
+            EwmaVolatilityModel::new(config.ewma_vol_config.clone())
+        );
+
+        // Add processors to pipeline
+        market_pipeline.add_processor(Box::new(VolatilityProcessor::new(pipeline_vol_model)));
+        market_pipeline.add_processor(Box::new(ImbalanceProcessor::new()));
+        market_pipeline.add_processor(Box::new(AdverseSelectionProcessor::new()));
 
         // Initialize signal generator
         use crate::{MultiLevelConfig, TuningParams};
-        use crate::strategies::components::{RobustConfig, InventorySkewConfig};
 
+        // Create separate volatility model for signal generator (for getter methods)
         let volatility_model: Box<dyn VolatilityModel> = Box::new(
             EwmaVolatilityModel::new(config.ewma_vol_config.clone())
         );
