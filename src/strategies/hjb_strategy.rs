@@ -579,6 +579,22 @@ impl Strategy for HjbStrategy {
         // Initialize auto-tuning if enabled
         let tuner_integration = Self::initialize_tuner(&strategy_config);
 
+        // Read auto-tuning parameters from config (or use defaults)
+        let (vol_ema_alpha, z_score_threshold) = if let Some(ref auto_tuning) = strategy_config.auto_tuning_config {
+            let vol_alpha = auto_tuning.get("vol_ema_alpha")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.1);
+            let z_threshold = auto_tuning.get("z_score_threshold")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0);
+            (vol_alpha, z_threshold)
+        } else {
+            (0.1, 1.0)  // Default values
+        };
+
+        info!("🎯 Auto-tuning params: vol_ema_alpha={:.3}, z_score_threshold={:.2}",
+              vol_ema_alpha, z_score_threshold);
+
         Self {
             config: strategy_config,
             tick_lot_validator,
@@ -610,8 +626,8 @@ impl Strategy for HjbStrategy {
             // --- EXPERT ADDITIONS ---
             // Initialize smoothed vol to the initial estimate
             smoothed_volatility_bps: initial_volatility_bps,
-            vol_ema_alpha: 0.1, // 10% weight on new observations (tunable)
-            z_score_threshold: 1.0, // Only re-quote if price moves > 1.0 std dev
+            vol_ema_alpha,
+            z_score_threshold,
             last_z_quote_mid_price: 0.0,
             tuner_integration,
         }
