@@ -724,33 +724,49 @@ impl Strategy for HjbStrategy {
         debug!("[HJB STRATEGY {}] Target quotes: {} bids, {} asks",
             self.config.asset, target_bids.len(), target_asks.len());
 
-        // --- NEW TIERED LOGIC ---
+        // --- FIXED TIERED LOGIC: Choose ONE path based on liquidation mode ---
 
-        // 1. Always reconcile MAKER orders.
-        //    (The aggressive skew from `calculate_aggression` is already in target_bids/target_asks)
-        let mut actions = self.reconcile_orders(state, target_bids, target_asks);
-
-        // 2. Check if the optimizer *also* requested TAKER orders (Tier 3)
-        let (taker_buy_rate, taker_sell_rate) = self.cached_optimizer_result
+        // Check if optimizer signaled liquidation mode
+        let (taker_buy_rate, taker_sell_rate, liquidate_flag) = self.cached_optimizer_result
             .as_ref()
-            .map(|cached| (cached.output.taker_buy_rate, cached.output.taker_sell_rate))
-            .unwrap_or((0.0, 0.0));
+            .map(|cached| (cached.output.taker_buy_rate, cached.output.taker_sell_rate, cached.output.liquidate))
+            .unwrap_or((0.0, 0.0, false));
 
-        // 3. If TAKER orders are requested, add them (and cancel all existing orders for safety)
-        if taker_buy_rate > 0.0 || taker_sell_rate > 0.0 {
-            warn!("[HJB STRATEGY {}] 🚨 TAKER URGENCY: Adding taker orders to actions (buy_rate={:.4}, sell_rate={:.4})",
+        let in_liquidation = liquidate_flag || taker_buy_rate > 0.0 || taker_sell_rate > 0.0;
+
+        if in_liquidation {
+            // === LIQUIDATION MODE: ONLY place reduce-only taker orders, NO maker quotes ===
+            warn!("[HJB STRATEGY {}] 🚨 LIQUIDATION MODE: Skipping maker quotes, using ONLY taker orders (buy_rate={:.4}, sell_rate={:.4})",
                 self.config.asset, taker_buy_rate, taker_sell_rate);
 
-            // Add actions to cancel *all* existing orders
+            let mut actions = Vec::new();
+
+            // Cancel all existing maker orders first
             actions.extend(self.create_cancel_all_orders(state));
 
-            // Add the new TAKER orders
-            // (Use the consolidated logic from the previous fix to avoid notional value errors)
-            actions.extend(self.create_taker_liquidation_orders(state, taker_buy_rate, taker_sell_rate));
+            // Only place taker liquidation orders (reduce-only) after cancels would clear
+            // Check if we have pending cancels that need to complete first
+            let has_pending_cancels = state.open_bids.iter().any(|o| o.state == OrderState::PendingCancel)
+                || state.open_asks.iter().any(|o| o.state == OrderState::PendingCancel);
+
+            let has_open_orders = !state.open_bids.is_empty() || !state.open_asks.is_empty();
+
+            if !has_open_orders || !has_pending_cancels {
+                // Safe to place reduce-only orders now
+                actions.extend(self.create_taker_liquidation_orders(state, taker_buy_rate, taker_sell_rate));
+            } else {
+                debug!("[HJB STRATEGY {}] Waiting for cancels to clear before placing liquidation orders", self.config.asset);
+            }
+
+            return actions;
         }
 
+        // === NORMAL MODE: Place maker quotes only ===
+        // The aggressive skew from `calculate_aggression` is already in target_bids/target_asks
+        let actions = self.reconcile_orders(state, target_bids, target_asks);
+
         actions // Return all actions
-        // --- END NEW TIERED LOGIC ---
+        // --- END FIXED TIERED LOGIC ---
     }
 
     fn on_user_update(
@@ -812,31 +828,47 @@ impl Strategy for HjbStrategy {
             info!("[HJB STRATEGY {}] Generated {} target bids, {} target asks",
                 self.config.asset, target_bids.len(), target_asks.len());
 
-            // --- NEW TIERED LOGIC (same as on_market_update) ---
+            // --- FIXED TIERED LOGIC (same as on_market_update) ---
 
-            // 1. Always reconcile MAKER orders
-            let mut actions = self.reconcile_orders(state, target_bids, target_asks);
-
-            // 2. Check if the optimizer also requested TAKER orders (Tier 3)
-            let (taker_buy_rate, taker_sell_rate) = self.cached_optimizer_result
+            // Check if optimizer signaled liquidation mode
+            let (taker_buy_rate, taker_sell_rate, liquidate_flag) = self.cached_optimizer_result
                 .as_ref()
-                .map(|cached| (cached.output.taker_buy_rate, cached.output.taker_sell_rate))
-                .unwrap_or((0.0, 0.0));
+                .map(|cached| (cached.output.taker_buy_rate, cached.output.taker_sell_rate, cached.output.liquidate))
+                .unwrap_or((0.0, 0.0, false));
 
-            // 3. If TAKER orders are requested, add them
-            if taker_buy_rate > 0.0 || taker_sell_rate > 0.0 {
-                warn!("[HJB STRATEGY {}] on_tick: TAKER URGENCY detected (buy_rate={:.4}, sell_rate={:.4})",
+            let in_liquidation = liquidate_flag || taker_buy_rate > 0.0 || taker_sell_rate > 0.0;
+
+            if in_liquidation {
+                // === LIQUIDATION MODE: ONLY place reduce-only taker orders, NO maker quotes ===
+                warn!("[HJB STRATEGY {}] on_tick: 🚨 LIQUIDATION MODE: Skipping maker quotes, using ONLY taker orders (buy_rate={:.4}, sell_rate={:.4})",
                     self.config.asset, taker_buy_rate, taker_sell_rate);
 
-                // Cancel all existing orders for safety
+                let mut actions = Vec::new();
+
+                // Cancel all existing maker orders first
                 actions.extend(self.create_cancel_all_orders(state));
 
-                // Add taker orders
-                actions.extend(self.create_taker_liquidation_orders(state, taker_buy_rate, taker_sell_rate));
+                // Only place taker liquidation orders (reduce-only) after cancels would clear
+                let has_pending_cancels = state.open_bids.iter().any(|o| o.state == OrderState::PendingCancel)
+                    || state.open_asks.iter().any(|o| o.state == OrderState::PendingCancel);
+
+                let has_open_orders = !state.open_bids.is_empty() || !state.open_asks.is_empty();
+
+                if !has_open_orders || !has_pending_cancels {
+                    // Safe to place reduce-only orders now
+                    actions.extend(self.create_taker_liquidation_orders(state, taker_buy_rate, taker_sell_rate));
+                } else {
+                    debug!("[HJB STRATEGY {}] on_tick: Waiting for cancels to clear before placing liquidation orders", self.config.asset);
+                }
+
+                return actions;
             }
 
+            // === NORMAL MODE: Place maker quotes only ===
+            let actions = self.reconcile_orders(state, target_bids, target_asks);
+
             return actions;
-            // --- END NEW TIERED LOGIC ---
+            // --- END FIXED TIERED LOGIC ---
         }
 
         // Periodic cleanup and updates for existing orders
@@ -1250,6 +1282,11 @@ impl HjbStrategy {
                 self.latest_taker_buy_rate = cached.output.taker_buy_rate;
                 self.latest_taker_sell_rate = cached.output.taker_sell_rate;
 
+                // Return empty quotes if in liquidation mode (cached result)
+                if cached.output.liquidate {
+                    return (vec![], vec![]);
+                }
+
                 return (cached.output.target_bids.clone(), cached.output.target_asks.clone());
             }
         }
@@ -1325,13 +1362,14 @@ impl HjbStrategy {
             log::warn!("🚨 Liquidation mode triggered by optimizer!");
             log::info!("   Taker rates: buy={:.4}, sell={:.4}",
                   self.latest_taker_buy_rate, self.latest_taker_sell_rate);
+            log::info!("   Clearing maker quotes - will use ONLY reduce-only taker orders");
         }
 
         // --- PERFORMANCE METRICS ---
         let elapsed = start.elapsed();
         self.total_optimization_time_us += elapsed.as_micros() as u64;
         let avg_time_us = self.total_optimization_time_us / self.optimization_call_count;
-        
+
         debug!(
             "[MULTI-LEVEL OPTIMIZE] Time: {}μs (avg: {}μs), Bids: {}, Asks: {}, Cache hit rate: {:.1}%",
             elapsed.as_micros(),
@@ -1341,7 +1379,18 @@ impl HjbStrategy {
             100.0 * self.optimization_cache_hits as f64 / self.optimization_call_count as f64
         );
 
+        // --- LIQUIDATION MODE FIX: Return empty quotes when in liquidation ---
+        // This ensures the strategy doesn't try to place maker orders while liquidating
+        let (final_bids, final_asks) = if output.liquidate {
+            log::info!("   Returning empty maker quotes (liquidation mode)");
+            (vec![], vec![])
+        } else {
+            (output.target_bids.clone(), output.target_asks.clone())
+        };
+
         // --- CACHE UPDATE ---
+        // IMPORTANT: Cache the original output (with quotes) for metadata,
+        // but we'll return empty quotes above when in liquidation mode
         self.cached_optimizer_result = Some(CachedOptimizerResult {
             output: output.clone(),
             timestamp: current_time,
@@ -1377,7 +1426,7 @@ impl HjbStrategy {
             }
         }
 
-        (output.target_bids, output.target_asks)
+        (final_bids, final_asks)
     }
     
     /// Compute a hash of the current state for cache invalidation.

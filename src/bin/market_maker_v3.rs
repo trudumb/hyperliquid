@@ -992,6 +992,73 @@ impl StateManagerActor {
             return (true, String::new());
         }
 
+        // --- STEP 3.5: LIQUIDATION FIX - Allow reduce-only orders when over limit ---
+        // Check if we're currently over the position limit
+        let current_abs_position = (current_position + pending_exposure).abs();
+        let is_over_limit = current_abs_position > self.max_position_size;
+
+        if is_over_limit {
+            // Check if we have reduce-only orders in this batch
+            let has_reduce_only = actions.iter().any(|action| {
+                match action {
+                    StrategyAction::Place(order) => order.reduce_only,
+                    StrategyAction::BatchPlace(orders) => orders.iter().any(|o| o.reduce_only),
+                    _ => false,
+                }
+            });
+
+            if has_reduce_only {
+                // Verify that all reduce-only orders actually reduce position
+                let mut all_reduce_correctly = true;
+                for action in actions {
+                    match action {
+                        StrategyAction::Place(order) if order.reduce_only => {
+                            let reduces_position =
+                                (current_position > 0.0 && !order.is_buy) ||  // Long position, selling
+                                (current_position < 0.0 && order.is_buy);      // Short position, buying
+
+                            if !reduces_position {
+                                all_reduce_correctly = false;
+                                warn!(
+                                    "[State Manager] ❌ Reduce-only order doesn't reduce position: pos={:.4}, is_buy={}",
+                                    current_position, order.is_buy
+                                );
+                                break;
+                            }
+                        }
+                        StrategyAction::BatchPlace(orders) => {
+                            for order in orders {
+                                if order.reduce_only {
+                                    let reduces_position =
+                                        (current_position > 0.0 && !order.is_buy) ||
+                                        (current_position < 0.0 && order.is_buy);
+
+                                    if !reduces_position {
+                                        all_reduce_correctly = false;
+                                        warn!(
+                                            "[State Manager] ❌ Reduce-only order doesn't reduce position: pos={:.4}, is_buy={}",
+                                            current_position, order.is_buy
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                if all_reduce_correctly {
+                    info!(
+                        "[State Manager] ✅ Validation PASSED for [{}]: Over limit ({:.4} > {:.4}) but allowing reduce-only orders",
+                        asset_name, current_abs_position, self.max_position_size
+                    );
+                    return (true, String::new());
+                }
+            }
+        }
+        // --- END STEP 3.5 ---
+
         // --- STEP 4: Position Check (for exposure-increasing batches only) ---
         let final_potential_position = current_position + adjusted_pending_exposure + net_size_change_from_new_orders;
 
