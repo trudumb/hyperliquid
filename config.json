@@ -2,7 +2,7 @@
   "strategies": [
     {
       "asset": "HYPE",
-      "strategy_name": "hjb_v1",
+      "strategy_name": "hjb_v2",
       "strategy_params": {
         "max_absolute_position_size": 10.0,
         "leverage": 3,
