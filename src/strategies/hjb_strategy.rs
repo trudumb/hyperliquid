@@ -616,159 +616,6 @@ impl Strategy for HjbStrategy {
             tuner_integration,
         }
     }
-}
-
-// ============================================================================
-// Auto-Tuning Helper Methods
-// ============================================================================
-
-impl HjbStrategy {
-    /// Initialize auto-tuner if enabled in config
-    fn initialize_tuner(config: &HjbStrategyConfig) -> Option<TunerIntegration> {
-        let tuning_config = config.auto_tuning_config.as_ref()?;
-
-        // Check if enabled
-        let enabled = tuning_config.get("enabled")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        if !enabled {
-            info!("🎛️ Auto-tuning: DISABLED");
-            return None;
-        }
-
-        // Parse tuner config
-        let tuner_config = TunerConfig {
-            enabled: true,
-            mode: tuning_config.get("mode")
-                .and_then(|v| v.as_str())
-                .unwrap_or("continuous")
-                .to_string(),
-            episodes_per_update: tuning_config.get("episodes_per_update")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(2) as usize,
-            update_interval_seconds: tuning_config.get("update_interval_seconds")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(3600.0),
-            adaptive_threshold: tuning_config.get("adaptive_threshold")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.7),
-            spsa_c: tuning_config.get("spsa_c")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.1),
-            spsa_gamma: tuning_config.get("spsa_gamma")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.101),
-            adam_alpha: tuning_config.get("adam_alpha")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.001),
-            adam_beta1: tuning_config.get("adam_beta1")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.9),
-            adam_beta2: tuning_config.get("adam_beta2")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.999),
-            adam_epsilon: tuning_config.get("adam_epsilon")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(1e-8),
-            learning_rate_decay: tuning_config.get("learning_rate_decay")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0),
-            max_param_change: tuning_config.get("max_param_change")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(1.0),
-            min_episodes_for_gradient: tuning_config.get("min_episodes_for_gradient")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(20) as usize,
-            objective_weights: Self::parse_objective_weights(tuning_config),
-            verbose: tuning_config.get("verbose")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true),
-        };
-
-        // Create initial parameters from current config
-        let initial_params = Self::config_to_tuning_params(config);
-
-        // Updates per episode (ticks per episode)
-        let updates_per_episode = tuning_config.get("updates_per_episode")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(500) as usize;
-
-        // Use timestamp as seed for reproducibility with some randomness
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        info!("🎛️ Auto-tuning: ENABLED (mode={}, episodes_per_update={}, updates_per_episode={}, learning_rate={:.6})",
-            tuner_config.mode, tuner_config.episodes_per_update, updates_per_episode, tuner_config.adam_alpha);
-
-        Some(TunerIntegration::new(
-            tuner_config,
-            initial_params,
-            updates_per_episode,
-            seed,
-        ))
-    }
-
-    /// Parse objective weights from config
-    fn parse_objective_weights(_tuning_config: &Value) -> MultiObjectiveWeights {
-        // For now, just use default MultiObjectiveWeights since the detailed
-        // weight parsing requires matching the PerformanceTracker config structure
-        MultiObjectiveWeights::default()
-    }
-
-    /// Convert current config to tuning parameters
-    fn config_to_tuning_params(_config: &HjbStrategyConfig) -> StrategyTuningParams {
-        // For now, just use defaults
-        // In the future, this should read actual config values and convert to φ space
-        StrategyTuningParams::default()
-    }
-
-    /// Apply new tuned parameters to strategy
-    fn apply_tuned_parameters(&mut self, params: crate::strategies::components::StrategyConstrainedParams) {
-        // Update HJB components
-        self.hjb_components.phi = params.phi;
-        self.hjb_components.lambda_base = params.lambda_base;
-        self.hjb_components.maker_fee_bps = params.maker_fee_bps;
-        self.hjb_components.taker_fee_bps = params.taker_fee_bps;
-
-        // Update config
-        self.config.phi = params.phi;
-        self.config.lambda_base = params.lambda_base;
-        self.config.max_absolute_position_size = params.max_absolute_position_size;
-        self.config.maker_fee_bps = params.maker_fee_bps;
-        self.config.taker_fee_bps = params.taker_fee_bps;
-        self.config.leverage = params.leverage as usize;
-        self.config.max_leverage = params.max_leverage as usize;
-        self.config.margin_safety_buffer = params.margin_safety_buffer;
-        self.config.enable_multi_level = params.enable_multi_level;
-        self.config.enable_robust_control = params.enable_robust_control;
-
-        // Update margin calculator
-        self.margin_calculator = MarginCalculator::new(
-            params.leverage as usize,
-            params.margin_safety_buffer,
-        );
-
-        // Update multi-level config if present
-        if let Some(ref mut ml_config) = self.config.multi_level_config {
-            ml_config.max_levels = params.num_levels;
-            ml_config.level_spacing_bps = params.level_spacing_bps;
-            ml_config.min_profitable_spread_bps = params.min_profitable_spread_bps;
-        }
-
-        // Log the parameter changes
-        info!("[HJB STRATEGY {}] 🎛️ Updated parameters: phi={:.4}, lambda={:.2}, max_pos={:.1}, leverage={}x",
-            self.config.asset, params.phi, params.lambda_base, params.max_absolute_position_size, params.leverage);
-
-        // Clear cached optimizer result to force recomputation with new params
-        self.cached_optimizer_result = None;
-    }
-}
-
-// Continue Strategy trait implementation
-impl Strategy for HjbStrategy {
     fn on_market_update(
         &mut self,
         state: &CurrentState,
@@ -1064,6 +911,155 @@ impl Strategy for HjbStrategy {
 
     fn get_max_position_size(&self) -> f64 {
         self.config.max_absolute_position_size
+    }
+}
+
+// ============================================================================
+// Auto-Tuning Helper Methods
+// ============================================================================
+
+impl HjbStrategy {
+    /// Initialize auto-tuner if enabled in config
+    fn initialize_tuner(config: &HjbStrategyConfig) -> Option<TunerIntegration> {
+        let tuning_config = config.auto_tuning_config.as_ref()?;
+
+        // Check if enabled
+        let enabled = tuning_config.get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if !enabled {
+            info!("🎛️ Auto-tuning: DISABLED");
+            return None;
+        }
+
+        // Parse tuner config
+        let tuner_config = TunerConfig {
+            enabled: true,
+            mode: tuning_config.get("mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("continuous")
+                .to_string(),
+            episodes_per_update: tuning_config.get("episodes_per_update")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(2) as usize,
+            update_interval_seconds: tuning_config.get("update_interval_seconds")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(3600.0),
+            adaptive_threshold: tuning_config.get("adaptive_threshold")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.7),
+            spsa_c: tuning_config.get("spsa_c")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.1),
+            spsa_gamma: tuning_config.get("spsa_gamma")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.101),
+            adam_alpha: tuning_config.get("adam_alpha")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.001),
+            adam_beta1: tuning_config.get("adam_beta1")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.9),
+            adam_beta2: tuning_config.get("adam_beta2")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.999),
+            adam_epsilon: tuning_config.get("adam_epsilon")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1e-8),
+            learning_rate_decay: tuning_config.get("learning_rate_decay")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
+            max_param_change: tuning_config.get("max_param_change")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0),
+            min_episodes_for_gradient: tuning_config.get("min_episodes_for_gradient")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(20) as usize,
+            objective_weights: Self::parse_objective_weights(tuning_config),
+            verbose: tuning_config.get("verbose")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+        };
+
+        // Create initial parameters from current config
+        let initial_params = Self::config_to_tuning_params(config);
+
+        // Updates per episode (ticks per episode)
+        let updates_per_episode = tuning_config.get("updates_per_episode")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(500) as usize;
+
+        // Use timestamp as seed for reproducibility with some randomness
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        info!("🎛️ Auto-tuning: ENABLED (mode={}, episodes_per_update={}, updates_per_episode={}, learning_rate={:.6})",
+            tuner_config.mode, tuner_config.episodes_per_update, updates_per_episode, tuner_config.adam_alpha);
+
+        Some(TunerIntegration::new(
+            tuner_config,
+            initial_params,
+            updates_per_episode,
+            seed,
+        ))
+    }
+
+    /// Parse objective weights from config
+    fn parse_objective_weights(_tuning_config: &Value) -> MultiObjectiveWeights {
+        // For now, just use default MultiObjectiveWeights since the detailed
+        // weight parsing requires matching the PerformanceTracker config structure
+        MultiObjectiveWeights::default()
+    }
+
+    /// Convert current config to tuning parameters
+    fn config_to_tuning_params(_config: &HjbStrategyConfig) -> StrategyTuningParams {
+        // For now, just use defaults
+        // In the future, this should read actual config values and convert to φ space
+        StrategyTuningParams::default()
+    }
+
+    /// Apply new tuned parameters to strategy
+    fn apply_tuned_parameters(&mut self, params: crate::strategies::components::StrategyConstrainedParams) {
+        // Update HJB components
+        self.hjb_components.phi = params.phi;
+        self.hjb_components.lambda_base = params.lambda_base;
+        self.hjb_components.maker_fee_bps = params.maker_fee_bps;
+        self.hjb_components.taker_fee_bps = params.taker_fee_bps;
+
+        // Update config
+        self.config.phi = params.phi;
+        self.config.lambda_base = params.lambda_base;
+        self.config.max_absolute_position_size = params.max_absolute_position_size;
+        self.config.maker_fee_bps = params.maker_fee_bps;
+        self.config.taker_fee_bps = params.taker_fee_bps;
+        self.config.leverage = params.leverage as usize;
+        self.config.max_leverage = params.max_leverage as usize;
+        self.config.margin_safety_buffer = params.margin_safety_buffer;
+        self.config.enable_multi_level = params.enable_multi_level;
+        self.config.enable_robust_control = params.enable_robust_control;
+
+        // Update margin calculator
+        self.margin_calculator = MarginCalculator::new(
+            params.leverage as usize,
+            params.margin_safety_buffer,
+        );
+
+        // Update multi-level config if present
+        if let Some(ref mut ml_config) = self.config.multi_level_config {
+            ml_config.max_levels = params.num_levels;
+            ml_config.level_spacing_bps = params.level_spacing_bps;
+            ml_config.min_profitable_spread_bps = params.min_profitable_spread_bps;
+        }
+
+        // Log the parameter changes
+        info!("[HJB STRATEGY {}] 🎛️ Updated parameters: phi={:.4}, lambda={:.2}, max_pos={:.1}, leverage={}x",
+            self.config.asset, params.phi, params.lambda_base, params.max_absolute_position_size, params.leverage);
+
+        // Clear cached optimizer result to force recomputation with new params
+        self.cached_optimizer_result = None;
     }
 }
 
