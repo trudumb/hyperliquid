@@ -57,6 +57,7 @@ use crate::strategies::components::{
     VolatilityModel, EwmaVolatilityModel, EwmaVolConfig, ParticleFilterVolModel,
     HybridVolatilityModel, HybridVolConfig,
     TunerConfig, StrategyTuningParams, MultiObjectiveWeights,
+    PositionManager, AllowedAction, PendingOrders,
 };
 
 // Import auto-tuning integration
@@ -426,6 +427,9 @@ pub struct HjbStrategy {
     /// Intelligent order churn manager
     order_churn_manager: OrderChurnManager,
 
+    /// Position manager (centralized position state and constraints)
+    position_manager: PositionManager,
+
     // --- EXPERT ADDITIONS ---
     /// Smoothed volatility (EWMA) for robust spread calculation
     smoothed_volatility_bps: f64,
@@ -596,6 +600,9 @@ impl Strategy for HjbStrategy {
         info!("🎯 Auto-tuning params: vol_ema_alpha={:.3}, z_score_threshold={:.2}",
               vol_ema_alpha, z_score_threshold);
 
+        // Extract max position before moving strategy_config
+        let max_position = strategy_config.max_absolute_position_size;
+
         Self {
             config: strategy_config,
             tick_lot_validator,
@@ -623,6 +630,9 @@ impl Strategy for HjbStrategy {
             total_optimization_time_us: 0,
             margin_calculator,
             order_churn_manager,
+
+            // Initialize position manager with default config
+            position_manager: PositionManager::with_max_position(max_position),
 
             // --- EXPERT ADDITIONS ---
             // Initialize smoothed vol to the initial estimate
@@ -718,55 +728,50 @@ impl Strategy for HjbStrategy {
         debug!("[HJB STRATEGY {}] Calculating multi-level targets (mid=${:.3}, pos={:.2})",
             self.config.asset, state.l2_mid_price, state.position);
 
-        // Calculate optimal quotes using multi-level optimization
-        let (target_bids, target_asks) = self.calculate_multi_level_targets(state);
+        // --- NEW POSITION MANAGER LOGIC ---
+        // Get position state and allowed actions from centralized manager
+        let pos_state = self.position_manager.get_state(state.position);
+        let pending_orders = PendingOrders::from_orders(&state.open_bids, &state.open_asks);
+        let allowed = self.position_manager.get_allowed_action(
+            pos_state.clone(),
+            state.position,
+            &pending_orders,
+        );
 
-        debug!("[HJB STRATEGY {}] Target quotes: {} bids, {} asks",
-            self.config.asset, target_bids.len(), target_asks.len());
+        debug!("[HJB STRATEGY {}] Position state: {:?}, Allowed action: {:?}",
+            self.config.asset, pos_state, allowed);
 
-        // --- FIXED TIERED LOGIC: Choose ONE path based on liquidation mode ---
-
-        // Check if optimizer signaled liquidation mode
-        let (taker_buy_rate, taker_sell_rate, liquidate_flag) = self.cached_optimizer_result
-            .as_ref()
-            .map(|cached| (cached.output.taker_buy_rate, cached.output.taker_sell_rate, cached.output.liquidate))
-            .unwrap_or((0.0, 0.0, false));
-
-        let in_liquidation = liquidate_flag || taker_buy_rate > 0.0 || taker_sell_rate > 0.0;
-
-        if in_liquidation {
-            // === LIQUIDATION MODE: ONLY place reduce-only taker orders, NO maker quotes ===
-            warn!("[HJB STRATEGY {}] 🚨 LIQUIDATION MODE: Skipping maker quotes, using ONLY taker orders (buy_rate={:.4}, sell_rate={:.4})",
-                self.config.asset, taker_buy_rate, taker_sell_rate);
-
-            let mut actions = Vec::new();
-
-            // Cancel all existing maker orders first
-            actions.extend(self.create_cancel_all_orders(state));
-
-            // Only place taker liquidation orders (reduce-only) after cancels would clear
-            // Check if we have pending cancels that need to complete first
-            let has_pending_cancels = state.open_bids.iter().any(|o| o.state == OrderState::PendingCancel)
-                || state.open_asks.iter().any(|o| o.state == OrderState::PendingCancel);
-
-            let has_open_orders = !state.open_bids.is_empty() || !state.open_asks.is_empty();
-
-            if !has_open_orders || !has_pending_cancels {
-                // Safe to place reduce-only orders now
-                actions.extend(self.create_taker_liquidation_orders(state, taker_buy_rate, taker_sell_rate));
-            } else {
-                debug!("[HJB STRATEGY {}] Waiting for cancels to clear before placing liquidation orders", self.config.asset);
+        // Execute appropriate strategy based on position state
+        match allowed {
+            AllowedAction::FullTrading { max_buy, max_sell } => {
+                // Normal trading - calculate and place optimal quotes
+                let (target_bids, target_asks) = self.calculate_multi_level_targets(state);
+                self.generate_normal_quotes(state, target_bids, target_asks, max_buy, max_sell)
             }
 
-            return actions;
+            AllowedAction::ReducedTrading { max_buy, max_sell } => {
+                // Warning state - use more conservative quotes
+                let (target_bids, target_asks) = self.calculate_multi_level_targets(state);
+                warn!("[HJB STRATEGY {}] ⚠️  WARNING STATE: Reducing trading aggressiveness (max_buy={:.2}, max_sell={:.2})",
+                    self.config.asset, max_buy, max_sell);
+                self.generate_conservative_quotes(state, target_bids, target_asks, max_buy, max_sell)
+            }
+
+            AllowedAction::ReduceOnly { reduce_size } => {
+                // Critical state - only reduce position
+                warn!("[HJB STRATEGY {}] 🚨 CRITICAL STATE: Reduce-only mode (target reduction: {:.2})",
+                    self.config.asset, reduce_size);
+                self.generate_reduce_only_orders(state, reduce_size)
+            }
+
+            AllowedAction::EmergencyLiquidation { full_size } => {
+                // Emergency state - liquidate entire position
+                warn!("[HJB STRATEGY {}] 🆘 EMERGENCY LIQUIDATION: Closing entire position ({:.2})",
+                    self.config.asset, full_size);
+                self.generate_emergency_liquidation(state, full_size)
+            }
         }
-
-        // === NORMAL MODE: Place maker quotes only ===
-        // The aggressive skew from `calculate_aggression` is already in target_bids/target_asks
-        let actions = self.reconcile_orders(state, target_bids, target_asks);
-
-        actions // Return all actions
-        // --- END FIXED TIERED LOGIC ---
+        // --- END POSITION MANAGER LOGIC ---
     }
 
     fn on_user_update(
@@ -822,53 +827,37 @@ impl Strategy for HjbStrategy {
             info!("[HJB STRATEGY {}] No open orders, placing initial orders (mid: ${:.3})",
                 self.config.asset, state.l2_mid_price);
 
-            // Calculate optimal quotes
-            let (target_bids, target_asks) = self.calculate_multi_level_targets(state);
+            // --- USE POSITION MANAGER (same pattern as on_market_update) ---
+            let pos_state = self.position_manager.get_state(state.position);
+            let pending_orders = PendingOrders::from_orders(&state.open_bids, &state.open_asks);
+            let allowed = self.position_manager.get_allowed_action(
+                pos_state.clone(),
+                state.position,
+                &pending_orders,
+            );
 
-            info!("[HJB STRATEGY {}] Generated {} target bids, {} target asks",
-                self.config.asset, target_bids.len(), target_asks.len());
+            info!("[HJB STRATEGY {}] on_tick: Position state: {:?}", self.config.asset, pos_state);
 
-            // --- FIXED TIERED LOGIC (same as on_market_update) ---
-
-            // Check if optimizer signaled liquidation mode
-            let (taker_buy_rate, taker_sell_rate, liquidate_flag) = self.cached_optimizer_result
-                .as_ref()
-                .map(|cached| (cached.output.taker_buy_rate, cached.output.taker_sell_rate, cached.output.liquidate))
-                .unwrap_or((0.0, 0.0, false));
-
-            let in_liquidation = liquidate_flag || taker_buy_rate > 0.0 || taker_sell_rate > 0.0;
-
-            if in_liquidation {
-                // === LIQUIDATION MODE: ONLY place reduce-only taker orders, NO maker quotes ===
-                warn!("[HJB STRATEGY {}] on_tick: 🚨 LIQUIDATION MODE: Skipping maker quotes, using ONLY taker orders (buy_rate={:.4}, sell_rate={:.4})",
-                    self.config.asset, taker_buy_rate, taker_sell_rate);
-
-                let mut actions = Vec::new();
-
-                // Cancel all existing maker orders first
-                actions.extend(self.create_cancel_all_orders(state));
-
-                // Only place taker liquidation orders (reduce-only) after cancels would clear
-                let has_pending_cancels = state.open_bids.iter().any(|o| o.state == OrderState::PendingCancel)
-                    || state.open_asks.iter().any(|o| o.state == OrderState::PendingCancel);
-
-                let has_open_orders = !state.open_bids.is_empty() || !state.open_asks.is_empty();
-
-                if !has_open_orders || !has_pending_cancels {
-                    // Safe to place reduce-only orders now
-                    actions.extend(self.create_taker_liquidation_orders(state, taker_buy_rate, taker_sell_rate));
-                } else {
-                    debug!("[HJB STRATEGY {}] on_tick: Waiting for cancels to clear before placing liquidation orders", self.config.asset);
+            return match allowed {
+                AllowedAction::FullTrading { max_buy, max_sell } => {
+                    let (target_bids, target_asks) = self.calculate_multi_level_targets(state);
+                    self.generate_normal_quotes(state, target_bids, target_asks, max_buy, max_sell)
                 }
 
-                return actions;
-            }
+                AllowedAction::ReducedTrading { max_buy, max_sell } => {
+                    let (target_bids, target_asks) = self.calculate_multi_level_targets(state);
+                    self.generate_conservative_quotes(state, target_bids, target_asks, max_buy, max_sell)
+                }
 
-            // === NORMAL MODE: Place maker quotes only ===
-            let actions = self.reconcile_orders(state, target_bids, target_asks);
+                AllowedAction::ReduceOnly { reduce_size } => {
+                    self.generate_reduce_only_orders(state, reduce_size)
+                }
 
-            return actions;
-            // --- END FIXED TIERED LOGIC ---
+                AllowedAction::EmergencyLiquidation { full_size } => {
+                    self.generate_emergency_liquidation(state, full_size)
+                }
+            };
+            // --- END POSITION MANAGER LOGIC ---
         }
 
         // Periodic cleanup and updates for existing orders
@@ -1950,6 +1939,10 @@ impl HjbStrategy {
     ///
     /// This is Tier 3 of the liquidation logic - aggressive taker orders
     /// used only when inventory exceeds the urgency threshold (e.g., > 90%).
+    ///
+    /// NOTE: This method is kept for backwards compatibility but is no longer used.
+    /// Use generate_emergency_liquidation() instead.
+    #[allow(dead_code)]
     fn create_taker_liquidation_orders(
         &self,
         state: &CurrentState,
@@ -2320,6 +2313,154 @@ impl HjbStrategy {
         } else {
             self.last_taker_sell_time = current_time;
         }
+    }
+
+    // ========================================================================
+    // POSITION MANAGER HELPER METHODS
+    // ========================================================================
+    // These methods provide clean separation of logic for each position state
+
+    /// Generate normal quotes (PositionState::Normal)
+    fn generate_normal_quotes(
+        &mut self,
+        state: &CurrentState,
+        target_bids: Vec<(f64, f64)>,
+        target_asks: Vec<(f64, f64)>,
+        _max_buy: f64,
+        _max_sell: f64,
+    ) -> Vec<StrategyAction> {
+        // Normal trading - just reconcile orders as usual
+        // The target quotes from optimizer already respect position limits
+        self.reconcile_orders(state, target_bids, target_asks)
+    }
+
+    /// Generate conservative quotes (PositionState::Warning)
+    fn generate_conservative_quotes(
+        &mut self,
+        state: &CurrentState,
+        target_bids: Vec<(f64, f64)>,
+        target_asks: Vec<(f64, f64)>,
+        max_buy: f64,
+        max_sell: f64,
+    ) -> Vec<StrategyAction> {
+        // Reduce quote sizes to be more conservative
+        let conservative_bids: Vec<(f64, f64)> = target_bids
+            .into_iter()
+            .map(|(price, size)| {
+                let reduced_size = size.min(max_buy);
+                (price, reduced_size)
+            })
+            .filter(|(_, size)| *size > 0.0)
+            .collect();
+
+        let conservative_asks: Vec<(f64, f64)> = target_asks
+            .into_iter()
+            .map(|(price, size)| {
+                let reduced_size = size.min(max_sell);
+                (price, reduced_size)
+            })
+            .filter(|(_, size)| *size > 0.0)
+            .collect();
+
+        self.reconcile_orders(state, conservative_bids, conservative_asks)
+    }
+
+    /// Generate reduce-only orders (PositionState::Critical)
+    fn generate_reduce_only_orders(
+        &self,
+        state: &CurrentState,
+        reduce_size: f64,
+    ) -> Vec<StrategyAction> {
+        let mut actions = Vec::new();
+
+        // Cancel all existing orders first
+        actions.extend(self.create_cancel_all_orders(state));
+
+        // Wait for cancels to clear before placing reduce-only orders
+        let has_pending_cancels = state.open_bids.iter().any(|o| o.state == OrderState::PendingCancel)
+            || state.open_asks.iter().any(|o| o.state == OrderState::PendingCancel);
+
+        if has_pending_cancels {
+            debug!("[HJB STRATEGY {}] Waiting for cancels before placing reduce-only orders", self.config.asset);
+            return actions;
+        }
+
+        // Place reduce-only order to reduce position
+        if reduce_size > 0.0 {
+            let is_long = state.position > 0.0;
+            let best_price = if is_long {
+                // Long position - need to sell, use best bid
+                state.order_book.as_ref()
+                    .and_then(|b| b.best_bid())
+                    .unwrap_or(state.l2_mid_price * 0.999)
+            } else {
+                // Short position - need to buy, use best ask
+                state.order_book.as_ref()
+                    .and_then(|b| b.best_ask())
+                    .unwrap_or(state.l2_mid_price * 1.001)
+            };
+
+            // Validate size
+            let min_size_step = 10f64.powi(-(self.tick_lot_validator.sz_decimals as i32));
+            let adjusted_size = (reduce_size / min_size_step).floor() * min_size_step;
+
+            if adjusted_size >= min_size_step {
+                actions.push(StrategyAction::Place(ClientOrderRequest {
+                    asset: self.config.asset.clone(),
+                    is_buy: !is_long,  // Opposite direction of position
+                    reduce_only: true,
+                    limit_px: best_price,
+                    sz: adjusted_size,
+                    cloid: Some(uuid::Uuid::new_v4()),
+                    order_type: ClientOrder::Limit(ClientLimit {
+                        tif: "Ioc".to_string(),  // Immediate-or-cancel for urgency
+                    }),
+                }));
+
+                info!("[HJB STRATEGY {}] Placed reduce-only order: {} {:.4} @ {:.2}",
+                    self.config.asset,
+                    if is_long { "SELL" } else { "BUY" },
+                    adjusted_size,
+                    best_price
+                );
+            }
+        }
+
+        actions
+    }
+
+    /// Generate emergency liquidation orders (PositionState::OverLimit)
+    fn generate_emergency_liquidation(
+        &self,
+        state: &CurrentState,
+        full_size: f64,
+    ) -> Vec<StrategyAction> {
+        let mut actions = Vec::new();
+
+        // Cancel all existing orders immediately
+        actions.extend(self.create_cancel_all_orders(state));
+
+        // Wait for cancels to clear
+        let has_pending_cancels = state.open_bids.iter().any(|o| o.state == OrderState::PendingCancel)
+            || state.open_asks.iter().any(|o| o.state == OrderState::PendingCancel);
+
+        if has_pending_cancels {
+            warn!("[HJB STRATEGY {}] Emergency liquidation waiting for cancels", self.config.asset);
+            return actions;
+        }
+
+        // Place aggressive liquidation orders
+        if full_size > 0.0 {
+            if state.position > 0.0 {
+                // Long position - aggressive sell
+                self.place_aggressive_sell_orders(state, full_size, &mut actions);
+            } else if state.position < 0.0 {
+                // Short position - aggressive buy
+                self.place_aggressive_buy_orders(state, full_size, &mut actions);
+            }
+        }
+
+        actions
     }
 
 }
