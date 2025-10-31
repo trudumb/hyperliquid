@@ -4,7 +4,7 @@
       "asset": "HYPE",
       "strategy_name": "hjb_v1",
       "strategy_params": {
-        "max_absolute_position_size": 3.0,
+        "max_absolute_position_size": 10.0,
         "leverage": 3,
         "max_leverage": 10,
         "margin_safety_buffer": 0.2,
@@ -20,7 +20,7 @@
           "max_levels": 5,
           "min_profitable_spread_bps": 6.0,
           "level_spacing_bps": 3.0,
-          "total_size_per_side": 1.0,
+          "total_size_per_side": 3.0,
           "base_maker_size": 3.0,
           "inventory_risk_limit": 0.7,
           "directional_aggression": 2.0,
