@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::RestingOrder;
 
 /// Position state based on inventory ratio relative to max position
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PositionState {
     /// < 70% of max position - normal trading allowed
     Normal,
