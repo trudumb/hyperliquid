@@ -7,6 +7,7 @@
 // (open orders on exchange).
 
 use log::debug;
+use uuid::Uuid;
 
 use crate::strategy::StrategyAction;
 use crate::{ClientLimit, ClientOrder, ClientOrderRequest, ClientCancelRequest};
@@ -181,8 +182,9 @@ impl OrderExecutor {
             });
 
             if !has_order {
-                debug!("[ORDER EXECUTOR] Creating {} order: price={:.4}, size={:.4}",
-                    if is_bid { "bid" } else { "ask" }, price, size);
+                let cloid = Uuid::new_v4();
+                debug!("[ORDER EXECUTOR] Creating {} order: price={:.4}, size={:.4}, cloid={}",
+                    if is_bid { "bid" } else { "ask" }, price, size, cloid);
 
                 actions.push(StrategyAction::Place(ClientOrderRequest {
                     asset: self.asset.clone(),
@@ -193,7 +195,7 @@ impl OrderExecutor {
                         tif: "Gtc".to_string(),
                     }),
                     reduce_only: false,
-                    cloid: None,
+                    cloid: Some(cloid),
                 }));
             }
         }
