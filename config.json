@@ -5,7 +5,7 @@
       "strategy_name": "hjb_v2",
       "strategy_params": {
         "max_absolute_position_size": 10.0,
-        "leverage": 3,
+        "leverage": 10,
         "max_leverage": 10,
         "margin_safety_buffer": 0.2,
         "enable_multi_level": true,
