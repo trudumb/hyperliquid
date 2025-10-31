@@ -46,8 +46,8 @@ pub struct AdjustedSignal {
 /// A quote level after risk adjustments
 #[derive(Debug, Clone)]
 pub struct AdjustedQuoteLevel {
-    /// Price offset from mid in bps
-    pub offset_bps: f64,
+    /// Absolute price (not offset)
+    pub price: f64,
 
     /// Adjusted size
     pub size: f64,
@@ -250,7 +250,7 @@ impl RiskAdjuster {
 
                     if adjusted_size >= self.min_order_size {
                         bid_levels.push(AdjustedQuoteLevel {
-                            offset_bps: level.offset_bps,
+                            price: level.price,
                             size: adjusted_size,
                             priority: level.urgency,
                             is_bid: true,
@@ -275,7 +275,7 @@ impl RiskAdjuster {
 
                     if adjusted_size >= self.min_order_size {
                         ask_levels.push(AdjustedQuoteLevel {
-                            offset_bps: level.offset_bps,
+                            price: level.price,
                             size: adjusted_size,
                             priority: level.urgency,
                             is_bid: false,
@@ -296,7 +296,7 @@ impl RiskAdjuster {
                     let reduced_size = level.size.min(max_buy);
                     if reduced_size >= self.min_order_size {
                         bid_levels.push(AdjustedQuoteLevel {
-                            offset_bps: level.offset_bps,
+                            price: level.price,
                             size: reduced_size,
                             priority: level.urgency,
                             is_bid: true,
@@ -311,7 +311,7 @@ impl RiskAdjuster {
                     let reduced_size = level.size.min(max_sell);
                     if reduced_size >= self.min_order_size {
                         ask_levels.push(AdjustedQuoteLevel {
-                            offset_bps: level.offset_bps,
+                            price: level.price,
                             size: reduced_size,
                             priority: level.urgency,
                             is_bid: false,
@@ -363,7 +363,7 @@ impl RiskAdjuster {
                 let reduced_size = level.size * 0.5; // More conservative
                 if reduced_size >= self.min_order_size {
                     ask_levels.push(AdjustedQuoteLevel {
-                        offset_bps: level.offset_bps,
+                        price: level.price,
                         size: reduced_size,
                         priority: level.urgency,
                         is_bid: false,
@@ -378,7 +378,7 @@ impl RiskAdjuster {
                 let reduced_size = level.size * 0.5; // More conservative
                 if reduced_size >= self.min_order_size {
                     bid_levels.push(AdjustedQuoteLevel {
-                        offset_bps: level.offset_bps,
+                        price: level.price,
                         size: reduced_size,
                         priority: level.urgency,
                         is_bid: true,
@@ -409,26 +409,31 @@ impl RiskAdjuster {
         let mut ask_levels = Vec::new();
 
         // Quote aggressively on the reducing side
-        if position > 0.0 {
-            // Need to sell
-            ask_levels.push(AdjustedQuoteLevel {
-                offset_bps: -2.0, // Very aggressive (inside spread)
-                size: reduction_size,
-                priority: 1.0,
-                is_bid: false,
-                original_size: reduction_size,
-                size_adjustment_reason: Some("Critical: forcing reduction".to_string()),
-            });
-        } else {
-            // Need to buy
-            bid_levels.push(AdjustedQuoteLevel {
-                offset_bps: 2.0, // Very aggressive (inside spread)
-                size: reduction_size,
-                priority: 1.0,
-                is_bid: true,
-                original_size: reduction_size,
-                size_adjustment_reason: Some("Critical: forcing reduction".to_string()),
-            });
+        let mid_price = snapshot.market_data.mid_price;
+        if mid_price > 0.0 {
+            if position > 0.0 {
+                // Need to sell - price inside spread
+                let aggressive_price = mid_price * (1.0 - 2.0 / 10000.0);
+                ask_levels.push(AdjustedQuoteLevel {
+                    price: aggressive_price,
+                    size: reduction_size,
+                    priority: 1.0,
+                    is_bid: false,
+                    original_size: reduction_size,
+                    size_adjustment_reason: Some("Critical: forcing reduction".to_string()),
+                });
+            } else {
+                // Need to buy - price inside spread
+                let aggressive_price = mid_price * (1.0 + 2.0 / 10000.0);
+                bid_levels.push(AdjustedQuoteLevel {
+                    price: aggressive_price,
+                    size: reduction_size,
+                    priority: 1.0,
+                    is_bid: true,
+                    original_size: reduction_size,
+                    size_adjustment_reason: Some("Critical: forcing reduction".to_string()),
+                });
+            }
         }
 
         AdjustedSignal {
