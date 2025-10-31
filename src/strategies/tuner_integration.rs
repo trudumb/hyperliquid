@@ -68,6 +68,7 @@ enum EvaluationPhase {
     EvaluatingMinus,
 
     /// Ready to update parameters
+    #[allow(dead_code)]
     ReadyToUpdate,
 }
 

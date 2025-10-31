@@ -126,6 +126,7 @@ impl Default for PerformanceMetrics {
 #[derive(Debug, Clone)]
 struct TradeRecord {
     pnl: f64,
+    #[allow(dead_code)]
     timestamp_ms: u64,
 }
 
@@ -134,17 +135,24 @@ struct TradeRecord {
 struct QuoteRecord {
     bid_price: f64,
     ask_price: f64,
+    #[allow(dead_code)]
     bid_size: f64,
+    #[allow(dead_code)]
     ask_size: f64,
+    #[allow(dead_code)]
     timestamp_ms: u64,
 }
 
 /// Fill record for fill rate tracking
 #[derive(Debug, Clone)]
 struct FillRecord {
+    #[allow(dead_code)]
     is_bid: bool,
+    #[allow(dead_code)]
     price: f64,
+    #[allow(dead_code)]
     size: f64,
+    #[allow(dead_code)]
     timestamp_ms: u64,
 }
 
@@ -152,6 +160,7 @@ struct FillRecord {
 #[derive(Debug, Clone)]
 struct InventorySnapshot {
     position: f64,
+    #[allow(dead_code)]
     timestamp_ms: u64,
 }
 
@@ -160,6 +169,7 @@ struct InventorySnapshot {
 struct PredictionError {
     predicted: f64,
     realized: f64,
+    #[allow(dead_code)]
     timestamp_ms: u64,
 }
 

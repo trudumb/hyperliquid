@@ -4,7 +4,7 @@ use alloy::{
     primitives::{keccak256, Address, Signature, B256},
     signers::local::PrivateKeySigner,
 };
-use log::{debug, info};
+use log::debug;
 use reqwest::Client;
 use serde::{ser::SerializeStruct, Deserialize, Serialize, Serializer};
 
