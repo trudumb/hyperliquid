@@ -64,6 +64,9 @@ pub mod performance_tracker;
 pub mod parameter_transforms;
 pub mod multi_objective_tuner;
 
+// Position management
+pub mod position_manager;
+
 // Re-export traits for convenience
 pub use volatility::VolatilityModel;
 pub use fill_model::FillModel;
@@ -91,3 +94,8 @@ pub use book_analyzer::{BookAnalysis, OrderBook};
 pub use performance_tracker::{PerformanceTracker, PerformanceMetrics, MultiObjectiveWeights};
 pub use parameter_transforms::{StrategyTuningParams, StrategyConstrainedParams};
 pub use multi_objective_tuner::{MultiObjectiveTuner, TunerConfig, TuningHistory};
+
+// Re-export position manager types
+pub use position_manager::{
+    PositionManager, PositionManagerConfig, PositionState, AllowedAction, PendingOrders
+};

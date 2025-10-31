@@ -819,211 +819,90 @@ impl StateManagerActor {
         self.broadcast_state().await;
     }
 
-    /// Validates actions against authoritative state to ensure position and margin limits.
+    /// Validates actions with simple checks.
     ///
-    /// CRITICAL FIX: This version calculates the net effect of cancels AND new orders.
-    /// If the batch is net-reducing (or neutral), it always passes validation,
-    /// preventing the validation-rejection deadlock loop.
+    /// NOTE: Position state management is now handled by the PositionManager in the strategy.
+    /// This validation only performs basic sanity checks on individual orders.
     fn validate_actions(
         &self,
-        global_state: &GlobalAccountState,
+        _global_state: &GlobalAccountState,
         asset_state: Option<&AssetState>,
         actions: &[StrategyAction],
         asset_name: &str,
     ) -> (bool, String) {
-        debug!(
-            "[State Manager] Validating actions for {}: Current Margin Used: {:.2}, Equity: {:.2}",
-            asset_name, global_state.margin_used, global_state.account_equity
-        );
-
         let current_position = asset_state.map_or(0.0, |s| s.position);
 
-        // Get the *actual* pending exposure from orders already on the exchange book
-        let pending_exposure = asset_state.map_or(0.0, |s| {
-            let bid_exposure: f64 = s.open_bids.iter().map(|o| o.size).sum();
-            let ask_exposure: f64 = s.open_asks.iter().map(|o| o.size).sum();
-            bid_exposure - ask_exposure
-        });
-
-        debug!(
-            "[State Manager] Validation Check [{}]: Current Position: {:.4}, Pending Orders: {:.4}, Max Position: {:.4}",
-            asset_name, current_position, pending_exposure, self.max_position_size
-        );
-
-        // --- STEP 1: Calculate exposure being removed by cancels ---
-        let mut cancel_exposure = 0.0;
-        if let Some(state) = asset_state {
-            for action in actions {
-                match action {
-                    StrategyAction::Cancel(cancel) => {
-                        // Find this order and calculate its contribution to exposure
-                        if let Some(order) = state.open_bids.iter().find(|o| o.oid == Some(cancel.oid)) {
-                            cancel_exposure += order.size; // Bids add positive exposure
-                        } else if let Some(order) = state.open_asks.iter().find(|o| o.oid == Some(cancel.oid)) {
-                            cancel_exposure -= order.size; // Asks add negative exposure
-                        }
-                    }
-                    StrategyAction::BatchCancel(cancels) => {
-                        for cancel in cancels {
-                            if let Some(order) = state.open_bids.iter().find(|o| o.oid == Some(cancel.oid)) {
-                                cancel_exposure += order.size;
-                            } else if let Some(order) = state.open_asks.iter().find(|o| o.oid == Some(cancel.oid)) {
-                                cancel_exposure -= order.size;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // --- STEP 2: Calculate exposure being added by new orders ---
-        let mut net_size_change_from_new_orders = 0.0;
-        let mut estimated_margin_increase = 0.0;
-
-        // Start from current position + pending orders (AFTER cancels) to get true exposure
-        let adjusted_pending_exposure = pending_exposure - cancel_exposure;
-        let mut cumulative_pos_for_margin = current_position + adjusted_pending_exposure;
-
+        // Simple validation - position management is now handled by PositionManager in strategy
         for action in actions {
             match action {
                 StrategyAction::Place(order) => {
-                    let position_delta = if order.is_buy { order.sz } else { -order.sz };
+                    // Basic sanity checks
+                    if order.sz <= 0.0 {
+                        let msg = format!("Invalid order size: {:.4}", order.sz);
+                        warn!("[State Manager] ❌ VALIDATION FAILED for [{}]: {}", asset_name, msg);
+                        return (false, msg);
+                    }
 
-                    // --- ADD THIS NEW VALIDATION BLOCK ---
+                    if order.limit_px <= 0.0 {
+                        let msg = format!("Invalid order price: {:.4}", order.limit_px);
+                        warn!("[State Manager] ❌ VALIDATION FAILED for [{}]: {}", asset_name, msg);
+                        return (false, msg);
+                    }
+
+                    // If reduce_only, verify it actually reduces position
                     if order.reduce_only {
-                        // Use the authoritative position for this check
-                        let authoritative_position = cumulative_pos_for_margin;
+                        let reduces_position =
+                            (current_position > 0.0 && !order.is_buy) ||  // Long position, selling
+                            (current_position < 0.0 && order.is_buy);      // Short position, buying
 
-                        let next_potential_pos = authoritative_position + position_delta;
-
-                        // Check if the order would flip the position's sign
-                        // (and the new position isn't just closing to 0.0)
-                        if authoritative_position.signum() != 0.0
-                           && authoritative_position.signum() != next_potential_pos.signum()
-                           && next_potential_pos.abs() > 1e-9 // Not a close-to-zero order
-                        {
+                        if !reduces_position && current_position.abs() > 1e-9 {
                             let msg = format!(
-                                "ReduceOnly order rejected: would flip position from {:.4} to {:.4}",
-                                authoritative_position, next_potential_pos
+                                "Reduce-only order doesn't reduce position (pos={:.4}, is_buy={})",
+                                current_position, order.is_buy
                             );
                             warn!("[State Manager] ❌ VALIDATION FAILED for [{}]: {}", asset_name, msg);
-                            return (false, msg); // Reject the action
+                            return (false, msg);
                         }
-                    }
-                    // --- END NEW VALIDATION BLOCK ---
-
-                    net_size_change_from_new_orders += position_delta;
-
-                    if !order.reduce_only {
-                        let next_potential_pos = cumulative_pos_for_margin + position_delta;
-                        if next_potential_pos.abs() > cumulative_pos_for_margin.abs() {
-                            let size_increase = next_potential_pos.abs() - cumulative_pos_for_margin.abs();
-                            estimated_margin_increase += self.margin_calculator.initial_margin_required(size_increase, order.limit_px);
-                        }
-                        cumulative_pos_for_margin = next_potential_pos;
-                    } else {
-                        cumulative_pos_for_margin += position_delta;
                     }
                 }
+
                 StrategyAction::BatchPlace(orders) => {
                     for order in orders {
-                        let position_delta = if order.is_buy { order.sz } else { -order.sz };
+                        if order.sz <= 0.0 {
+                            let msg = format!("Invalid order size: {:.4}", order.sz);
+                            warn!("[State Manager] ❌ VALIDATION FAILED for [{}]: {}", asset_name, msg);
+                            return (false, msg);
+                        }
 
-                        // --- ADD THIS NEW VALIDATION BLOCK ---
+                        if order.limit_px <= 0.0 {
+                            let msg = format!("Invalid order price: {:.4}", order.limit_px);
+                            warn!("[State Manager] ❌ VALIDATION FAILED for [{}]: {}", asset_name, msg);
+                            return (false, msg);
+                        }
+
                         if order.reduce_only {
-                            // Use the authoritative position for this check
-                            let authoritative_position = cumulative_pos_for_margin;
+                            let reduces_position =
+                                (current_position > 0.0 && !order.is_buy) ||
+                                (current_position < 0.0 && order.is_buy);
 
-                            let next_potential_pos = authoritative_position + position_delta;
-
-                            // Check if the order would flip the position's sign
-                            // (and the new position isn't just closing to 0.0)
-                            if authoritative_position.signum() != 0.0
-                               && authoritative_position.signum() != next_potential_pos.signum()
-                               && next_potential_pos.abs() > 1e-9 // Not a close-to-zero order
-                            {
+                            if !reduces_position && current_position.abs() > 1e-9 {
                                 let msg = format!(
-                                    "ReduceOnly order rejected: would flip position from {:.4} to {:.4}",
-                                    authoritative_position, next_potential_pos
+                                    "Reduce-only order doesn't reduce position (pos={:.4}, is_buy={})",
+                                    current_position, order.is_buy
                                 );
                                 warn!("[State Manager] ❌ VALIDATION FAILED for [{}]: {}", asset_name, msg);
-                                return (false, msg); // Reject the action
+                                return (false, msg);
                             }
-                        }
-                        // --- END NEW VALIDATION BLOCK ---
-
-                        net_size_change_from_new_orders += position_delta;
-
-                        if !order.reduce_only {
-                            let next_potential_pos = cumulative_pos_for_margin + position_delta;
-                            if next_potential_pos.abs() > cumulative_pos_for_margin.abs() {
-                                let size_increase = next_potential_pos.abs() - cumulative_pos_for_margin.abs();
-                                estimated_margin_increase += self.margin_calculator.initial_margin_required(size_increase, order.limit_px);
-                            }
-                            cumulative_pos_for_margin = next_potential_pos;
-                        } else {
-                            cumulative_pos_for_margin += position_delta;
                         }
                     }
                 }
-                // Cancels already processed above
+
+                // Cancels and NoOps are always valid
                 StrategyAction::Cancel(_) | StrategyAction::BatchCancel(_) | StrategyAction::NoOp => {}
             }
         }
 
-        // --- STEP 3: DEADLOCK FIX - Allow batches that reduce or maintain exposure ---
-        // Calculate the net change in total exposure
-        let current_total_exposure = (current_position + pending_exposure).abs();
-        let final_total_exposure = (current_position + adjusted_pending_exposure + net_size_change_from_new_orders).abs();
-        let net_exposure_change = final_total_exposure - current_total_exposure;
-
-        debug!(
-            "[State Manager] Exposure analysis [{}]: Current Total={:.4}, Cancel={:.4}, New={:.4}, Final Total={:.4}, Net Change={:.4}",
-            asset_name, current_total_exposure, cancel_exposure.abs(), net_size_change_from_new_orders.abs(), final_total_exposure, net_exposure_change
-        );
-
-        // If this batch reduces or maintains total exposure, ALWAYS allow it (prevents deadlock)
-        if net_exposure_change <= 1e-9 {
-            info!(
-                "[State Manager] ✅ Validation PASSED for [{}]: Batch is net-reducing/neutral (Change: {:.4})",
-                asset_name, net_exposure_change
-            );
-            return (true, String::new());
-        }
-
-        // --- STEP 4: Position Check (for exposure-increasing batches only) ---
-        let final_potential_position = current_position + adjusted_pending_exposure + net_size_change_from_new_orders;
-
-        debug!(
-            "[State Manager] Position limit check: Current={:.4}, Pending={:.4}, Cancel={:.4}, New={:.4}, Final={:.4}, Max={:.4}",
-            current_position, pending_exposure, cancel_exposure, net_size_change_from_new_orders, final_potential_position, self.max_position_size
-        );
-
-        if final_potential_position.abs() > self.max_position_size + 1e-9 {
-            let msg = format!(
-                "Exceeds position limit (Current: {:.4}, Pending: {:.4}, Cancel: {:.4}, New: {:.4}, Final: {:.4}, Max: {:.4})",
-                current_position, pending_exposure, cancel_exposure, net_size_change_from_new_orders, final_potential_position, self.max_position_size
-            );
-            return (false, msg);
-        }
-
-        // --- STEP 5: Margin Check (for exposure-increasing batches only) ---
-        let potential_margin_used = global_state.margin_used + estimated_margin_increase;
-        let max_allowed_margin = global_state.account_equity * (1.0 - self.safety_buffer);
-
-        if potential_margin_used > max_allowed_margin + 1e-9 {
-            let msg = format!(
-                "Insufficient margin (Current Used: {:.2}, Est. Increase: {:.2}, Potential Used: {:.2}, Max Allowed: {:.2}, Equity: {:.2})",
-                global_state.margin_used, estimated_margin_increase, potential_margin_used, max_allowed_margin, global_state.account_equity
-            );
-            return (false, msg);
-        }
-
-        info!(
-            "[State Manager] ✅ Validation PASSED for {}: Current={:.4}, Pending={:.4}, Cancel={:.4}, New={:.4}, Final={:.4}, Margin Increase={:.2}",
-            asset_name, current_position, pending_exposure, cancel_exposure, net_size_change_from_new_orders, final_potential_position, estimated_margin_increase
-        );
+        debug!("[State Manager] ✅ Validation PASSED for [{}]: Basic checks passed", asset_name);
         (true, String::new())
     }
 
