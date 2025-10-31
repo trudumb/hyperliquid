@@ -417,6 +417,11 @@ impl OrderStateMachine {
                 })
             }
 
+            // Open -> Tick (no timeout for open orders, just stay in same state)
+            (OrderState::Open { .. }, OrderEvent::Tick) => {
+                Ok(self.state.clone())
+            }
+
             // PendingCancel -> Canceled
             (OrderState::PendingCancel { order_id, original_size, .. }, OrderEvent::CancelConfirmed { filled_size }) => {
                 if *filled_size > 0.0 && *filled_size < *original_size {
