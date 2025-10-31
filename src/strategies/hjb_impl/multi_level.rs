@@ -279,8 +279,10 @@ impl MultiLevelOptimizer {
         );
 
         // 4. Build bid levels with aggression and momentum
+        // ✅ FIX: Use bid_sizes.len() instead of num_levels to prevent index out of bounds
+        // allocate_sizes() may return fewer levels than requested due to budget constraints
         let mut bid_levels = Vec::new();
-        for level in 0..num_levels {
+        for level in 0..bid_sizes.len() {
             let level_offset = level as f64 * self.config.level_spacing_bps;
             let base_offset = base_half_spread_safe.max(self.config.min_profitable_spread_bps / 2.0);
 
@@ -302,8 +304,9 @@ impl MultiLevelOptimizer {
         }
 
         // 5. Build ask levels
+        // ✅ FIX: Use ask_sizes.len() instead of num_levels to prevent index out of bounds
         let mut ask_levels = Vec::new();
-        for level in 0..num_levels {
+        for level in 0..ask_sizes.len() {
             let level_offset = level as f64 * self.config.level_spacing_bps;
             let base_offset = base_half_spread_safe.max(self.config.min_profitable_spread_bps / 2.0);
 
