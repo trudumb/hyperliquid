@@ -644,35 +644,6 @@ impl Strategy for HjbStrategy {
             tuner.on_market_update();
         }
 
-        // --- EXPERT ADDITION: Z-Score Event Filter ---
-        if let Some(mid_price) = update.mid_price.or(state.order_book.as_ref().map(|b| b.mid_price)) {
-            if self.last_z_quote_mid_price > 0.0 && self.smoothed_volatility_bps > 0.0 {
-                // Calculate volatility in absolute price terms
-                let vol_as_price = (self.smoothed_volatility_bps / 10000.0) * mid_price;
-
-                // Calculate Z-Score of the price move
-                let price_delta = (mid_price - self.last_z_quote_mid_price).abs();
-                let z_score = price_delta / vol_as_price.max(1e-6);
-
-                if z_score < self.z_score_threshold {
-                    // Price move is NOT statistically significant.
-                    // DO NOT re-quote. This is just noise.
-                    debug!("[HJB STRATEGY {}] Market update skipped (Z-Score: {:.2} < {:.2})",
-                           self.config.asset, z_score, self.z_score_threshold);
-                    return vec![StrategyAction::NoOp];
-                }
-
-                // Price move IS significant. Update our anchor price.
-                debug!("[HJB STRATEGY {}] Z-Score threshold breached (Z-Score: {:.2}). Re-quoting.",
-                       self.config.asset, z_score);
-                self.last_z_quote_mid_price = mid_price;
-            } else if mid_price > 0.0 {
-                // Initialize the anchor price on the first valid mid-price
-                self.last_z_quote_mid_price = mid_price;
-            }
-        }
-        // --- End Z-Score Filter ---
-
         // Check if trading is enabled
         if !self.trading_enabled {
             debug!("[HJB STRATEGY {}] Trading disabled, returning NoOp", self.config.asset);
@@ -683,6 +654,7 @@ impl Strategy for HjbStrategy {
         self.sync_state_vector(state);
 
         // Handle different types of market updates
+        // IMPORTANT: Always update state (volatility model, L2 book, etc.) regardless of Z-Score filter
         if let Some(ref l2_book) = update.l2_book {
             debug!("[HJB STRATEGY {}] Processing L2 book update", self.config.asset);
             self.handle_l2_book_update(state, l2_book);
@@ -709,6 +681,38 @@ impl Strategy for HjbStrategy {
                 self.config.asset, update.mid_price.unwrap());
             self.handle_mid_price_update(state, update.mid_price.unwrap());
         }
+
+        // --- EXPERT ADDITION: Z-Score Event Filter ---
+        // NOTE: This filter is placed AFTER state updates so that volatility model always updates.
+        // It only controls whether we re-quote, not whether we update internal state.
+        if let Some(mid_price) = update.mid_price.or(state.order_book.as_ref().map(|b| b.mid_price)) {
+            if self.last_z_quote_mid_price > 0.0 && self.smoothed_volatility_bps > 0.0 {
+                // Calculate volatility in absolute price terms
+                let vol_as_price = (self.smoothed_volatility_bps / 10000.0) * mid_price;
+
+                // Calculate Z-Score of the price move
+                let price_delta = (mid_price - self.last_z_quote_mid_price).abs();
+                let z_score = price_delta / vol_as_price.max(1e-6);
+
+                if z_score < self.z_score_threshold {
+                    // Price move is NOT statistically significant.
+                    // DO NOT re-quote. This is just noise.
+                    // (But we already updated volatility and state above)
+                    debug!("[HJB STRATEGY {}] Market update skipped (Z-Score: {:.2} < {:.2})",
+                           self.config.asset, z_score, self.z_score_threshold);
+                    return vec![StrategyAction::NoOp];
+                }
+
+                // Price move IS significant. Update our anchor price.
+                debug!("[HJB STRATEGY {}] Z-Score threshold breached (Z-Score: {:.2}). Re-quoting.",
+                       self.config.asset, z_score);
+                self.last_z_quote_mid_price = mid_price;
+            } else if mid_price > 0.0 {
+                // Initialize the anchor price on the first valid mid-price
+                self.last_z_quote_mid_price = mid_price;
+            }
+        }
+        // --- End Z-Score Filter ---
 
         debug!("[HJB STRATEGY {}] Calculating multi-level targets (mid=${:.3}, pos={:.2})",
             self.config.asset, state.l2_mid_price, state.position);
