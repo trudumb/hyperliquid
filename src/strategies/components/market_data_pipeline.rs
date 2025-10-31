@@ -70,11 +70,8 @@ pub struct ProcessedMarketData {
 impl ProcessedMarketData {
     /// Create from raw market update
     pub fn from_update(update: MarketUpdate) -> Self {
-        let book_data = if let MarketUpdate::L2Book(ref book) = update {
-            Some(book.clone())
-        } else {
-            None
-        };
+        // Extract L2 book from update if available
+        let book_data = update.l2_book.clone();
 
         let (mid_price, best_bid, best_ask, spread_bps) = if let Some(ref book) = book_data {
             // book.levels is Vec<Vec<BookLevel>> where [0] is bids, [1] is asks

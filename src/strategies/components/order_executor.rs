@@ -181,7 +181,7 @@ impl OrderExecutor {
 
             if should_cancel {
                 debug!("[ORDER EXECUTOR] Canceling order {} (price mismatch)", order.order_id);
-                actions.push(StrategyAction::CancelOrder(ClientCancelRequest {
+                actions.push(StrategyAction::Cancel(ClientCancelRequest {
                     asset: self.asset.clone(),
                     oid: order.order_id,
                 }));
@@ -202,12 +202,14 @@ impl OrderExecutor {
                     debug!("[ORDER EXECUTOR] Creating {} order: price={:.4}, size={:.4}",
                         if is_bid { "bid" } else { "ask" }, price, size);
 
-                    actions.push(StrategyAction::PlaceOrder(ClientOrderRequest {
+                    actions.push(StrategyAction::Place(ClientOrderRequest {
                         asset: self.asset.clone(),
                         is_buy: is_bid,
                         limit_px: price,
                         sz: size,
-                        order_type: ClientOrder::Limit(ClientLimit::Gtc),
+                        order_type: ClientOrder::Limit(ClientLimit {
+                            tif: "Gtc".to_string(),
+                        }),
                         reduce_only: false,
                         cloid: None,
                     }));

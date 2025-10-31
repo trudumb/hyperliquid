@@ -208,6 +208,7 @@ impl std::error::Error for StateError {}
 // ============================================================================
 
 /// State machine for managing order lifecycle
+#[derive(Debug, Clone)]
 pub struct OrderStateMachine {
     /// Current state
     state: OrderState,

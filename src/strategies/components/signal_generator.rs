@@ -11,8 +11,10 @@ use parking_lot::RwLock;
 use log::debug;
 
 use crate::{HawkesFillModel, MultiLevelConfig};
+use crate::strategy::CurrentState;
+
 use super::{
-    HjbMultiLevelOptimizer, OptimizerInputs, OptimizerOutput,
+    QuoteOptimizer, OptimizerInputs,
     VolatilityModel, MicropriceAsModel,
 };
 use super::trading_state_store::MarketData;
@@ -90,8 +92,8 @@ pub struct SignalMetadata {
 
 /// Pure signal generation using HJB optimization
 pub struct HjbSignalGenerator {
-    /// Quote optimizer
-    quote_optimizer: HjbMultiLevelOptimizer,
+    /// Quote optimizer (trait object for flexibility)
+    quote_optimizer: Box<dyn QuoteOptimizer>,
 
     /// Volatility model
     volatility_model: Box<dyn VolatilityModel>,
@@ -146,7 +148,7 @@ impl CacheKey {
 impl HjbSignalGenerator {
     /// Create a new signal generator
     pub fn new(
-        quote_optimizer: HjbMultiLevelOptimizer,
+        quote_optimizer: Box<dyn QuoteOptimizer>,
         volatility_model: Box<dyn VolatilityModel>,
         microprice_as_model: MicropriceAsModel,
         hawkes_model: Arc<RwLock<HawkesFillModel>>,
@@ -172,14 +174,14 @@ impl HjbSignalGenerator {
     pub fn generate_quotes(
         &mut self,
         market_data: &MarketData,
-        inventory: f64,
+        current_state: &CurrentState,
     ) -> QuoteSignal {
         let start_time = std::time::Instant::now();
 
         // Check cache
         let cache_key = CacheKey::from_state(
             market_data.mid_price,
-            inventory,
+            current_state.position,
             market_data.volatility_bps,
         );
 
@@ -193,22 +195,32 @@ impl HjbSignalGenerator {
             }
         }
 
-        // Build optimizer inputs
+        // Build optimizer inputs (using correct field names from OptimizerInputs)
         let optimizer_inputs = OptimizerInputs {
-            mid_price: market_data.mid_price,
-            inventory,
+            current_time_sec: market_data.timestamp,
             volatility_bps: market_data.volatility_bps,
-            imbalance: market_data.imbalance,
-            adverse_selection: market_data.adverse_selection,
-            spread_bps: market_data.spread_bps,
-            timestamp: market_data.timestamp,
+            vol_uncertainty_bps: market_data.vol_uncertainty_bps,
+            adverse_selection_bps: market_data.adverse_selection,
+            lob_imbalance: market_data.imbalance,
         };
 
-        // Run optimizer
-        let output = self.quote_optimizer.optimize(optimizer_inputs);
+        // Run optimizer (uses QuoteOptimizer trait)
+        let hawkes = self.hawkes_model.read();
+        let (bid_quotes, ask_quotes) = self.quote_optimizer.calculate_target_quotes(
+            &optimizer_inputs,
+            current_state,
+            &hawkes,
+        );
+        drop(hawkes);
 
         // Convert optimizer output to quote signal
-        let signal = self.convert_output_to_signal(output, market_data, inventory);
+        let signal = self.convert_quotes_to_signal(
+            bid_quotes,
+            ask_quotes,
+            market_data,
+            current_state.position,
+            start_time.elapsed().as_micros() as u64,
+        );
 
         // Update cache
         self.cached_signal = Some(CachedSignal {
@@ -223,31 +235,36 @@ impl HjbSignalGenerator {
     }
 
     /// Convert optimizer output to quote signal
-    fn convert_output_to_signal(
+    fn convert_quotes_to_signal(
         &self,
-        output: OptimizerOutput,
+        bid_quotes: Vec<(f64, f64)>,  // (price, size)
+        ask_quotes: Vec<(f64, f64)>,  // (price, size)
         market_data: &MarketData,
         inventory: f64,
+        computation_time_us: u64,
     ) -> QuoteSignal {
+        let mid_price = market_data.mid_price;
         let mut bid_levels = Vec::new();
         let mut ask_levels = Vec::new();
 
-        // Convert bid levels
-        for level in output.bid_levels {
+        // Convert bid levels (price, size) to (offset_bps, size)
+        for (price, size) in bid_quotes {
+            let offset_bps = ((price - mid_price) / mid_price) * 10000.0;
             bid_levels.push(QuoteLevel {
-                offset_bps: level.offset_bps,
-                size: level.size,
-                urgency: level.urgency,
+                offset_bps,
+                size,
+                urgency: 0.8, // Default urgency
                 is_bid: true,
             });
         }
 
         // Convert ask levels
-        for level in output.ask_levels {
+        for (price, size) in ask_quotes {
+            let offset_bps = ((price - mid_price) / mid_price) * 10000.0;
             ask_levels.push(QuoteLevel {
-                offset_bps: level.offset_bps,
-                size: level.size,
-                urgency: level.urgency,
+                offset_bps,
+                size,
+                urgency: 0.8, // Default urgency
                 is_bid: false,
             });
         }
@@ -259,15 +276,15 @@ impl HjbSignalGenerator {
             bid_levels,
             ask_levels,
             urgency,
-            taker_buy_rate: output.taker_buy_rate,
-            taker_sell_rate: output.taker_sell_rate,
+            taker_buy_rate: 0.0,  // TODO: compute from optimizer if supported
+            taker_sell_rate: 0.0,
             timestamp: market_data.timestamp,
             metadata: SignalMetadata {
                 mid_price: market_data.mid_price,
                 volatility_bps: market_data.volatility_bps,
                 adverse_selection: market_data.adverse_selection,
                 inventory,
-                optimizer_time_us: output.computation_time_us,
+                optimizer_time_us: computation_time_us,
                 was_cached: false,
             },
         }
@@ -299,7 +316,7 @@ impl HjbSignalGenerator {
     /// Update Hawkes model with fill
     pub fn update_hawkes_model(&mut self, is_buy: bool, level: usize, timestamp: f64) {
         let mut hawkes = self.hawkes_model.write();
-        hawkes.record_fill(is_buy, level, timestamp);
+        hawkes.record_fill(level, is_buy, timestamp);
     }
 
     /// Get current volatility estimate

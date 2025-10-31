@@ -9,7 +9,7 @@
 use log::{debug, info, warn};
 
 use super::{
-    PositionManager, AllowedAction, PositionState,
+    PositionManager, AllowedAction, PositionState, PendingOrders,
     signal_generator::{QuoteSignal, QuoteLevel},
     trading_state_store::TradingSnapshot,
 };
@@ -224,71 +224,113 @@ impl RiskAdjuster {
         let mut ask_levels = Vec::new();
         let mut was_modified = false;
 
-        // Check what actions are allowed
-        let allowed_action = self.position_manager.check_allowed_action(
+        // Get position state and allowed action
+        let pos_state = self.position_manager.get_state(snapshot.risk_metrics.position);
+        let pending_orders = PendingOrders {
+            total_buy_size: snapshot.total_buy_size,
+            total_sell_size: snapshot.total_sell_size,
+        };
+
+        let allowed_action = self.position_manager.get_allowed_action(
+            pos_state,
             snapshot.risk_metrics.position,
+            &pending_orders,
         );
 
-        // Adjust bid levels
-        if allowed_action == AllowedAction::BuyOnly || allowed_action == AllowedAction::Both {
-            for level in signal.bid_levels {
-                let (adjusted_size, reason) = self.adjust_size_for_constraints(
-                    level.size,
-                    snapshot.risk_metrics.position,
-                    &snapshot.risk_metrics,
-                    true,
-                );
+        match allowed_action {
+            AllowedAction::FullTrading { max_buy, max_sell } => {
+                // Adjust bid levels
+                for level in signal.bid_levels {
+                    let (adjusted_size, reason) = self.adjust_size_for_constraints(
+                        level.size.min(max_buy),
+                        snapshot.risk_metrics.position,
+                        &snapshot.risk_metrics,
+                        true,
+                    );
 
-                if adjusted_size >= self.min_order_size {
-                    bid_levels.push(AdjustedQuoteLevel {
-                        offset_bps: level.offset_bps,
-                        size: adjusted_size,
-                        priority: level.urgency,
-                        is_bid: true,
-                        original_size: level.size,
-                        size_adjustment_reason: reason.clone(),
-                    });
+                    if adjusted_size >= self.min_order_size {
+                        bid_levels.push(AdjustedQuoteLevel {
+                            offset_bps: level.offset_bps,
+                            size: adjusted_size,
+                            priority: level.urgency,
+                            is_bid: true,
+                            original_size: level.size,
+                            size_adjustment_reason: reason.clone(),
+                        });
 
-                    if reason.is_some() {
+                        if reason.is_some() {
+                            was_modified = true;
+                        }
+                    }
+                }
+
+                // Adjust ask levels
+                for level in signal.ask_levels {
+                    let (adjusted_size, reason) = self.adjust_size_for_constraints(
+                        level.size.min(max_sell),
+                        snapshot.risk_metrics.position,
+                        &snapshot.risk_metrics,
+                        false,
+                    );
+
+                    if adjusted_size >= self.min_order_size {
+                        ask_levels.push(AdjustedQuoteLevel {
+                            offset_bps: level.offset_bps,
+                            size: adjusted_size,
+                            priority: level.urgency,
+                            is_bid: false,
+                            original_size: level.size,
+                            size_adjustment_reason: reason.clone(),
+                        });
+
+                        if reason.is_some() {
+                            was_modified = true;
+                        }
+                    }
+                }
+            }
+
+            AllowedAction::ReducedTrading { max_buy, max_sell } => {
+                // Similar to FullTrading but with reduced sizes
+                for level in signal.bid_levels {
+                    let reduced_size = level.size.min(max_buy);
+                    if reduced_size >= self.min_order_size {
+                        bid_levels.push(AdjustedQuoteLevel {
+                            offset_bps: level.offset_bps,
+                            size: reduced_size,
+                            priority: level.urgency,
+                            is_bid: true,
+                            original_size: level.size,
+                            size_adjustment_reason: Some("Reduced trading mode".to_string()),
+                        });
+                        was_modified = true;
+                    }
+                }
+
+                for level in signal.ask_levels {
+                    let reduced_size = level.size.min(max_sell);
+                    if reduced_size >= self.min_order_size {
+                        ask_levels.push(AdjustedQuoteLevel {
+                            offset_bps: level.offset_bps,
+                            size: reduced_size,
+                            priority: level.urgency,
+                            is_bid: false,
+                            original_size: level.size,
+                            size_adjustment_reason: Some("Reduced trading mode".to_string()),
+                        });
                         was_modified = true;
                     }
                 }
             }
-        } else {
-            was_modified = true;
-        }
 
-        // Adjust ask levels
-        if allowed_action == AllowedAction::SellOnly || allowed_action == AllowedAction::Both {
-            for level in signal.ask_levels {
-                let (adjusted_size, reason) = self.adjust_size_for_constraints(
-                    level.size,
-                    snapshot.risk_metrics.position,
-                    &snapshot.risk_metrics,
-                    false,
-                );
-
-                if adjusted_size >= self.min_order_size {
-                    ask_levels.push(AdjustedQuoteLevel {
-                        offset_bps: level.offset_bps,
-                        size: adjusted_size,
-                        priority: level.urgency,
-                        is_bid: false,
-                        original_size: level.size,
-                        size_adjustment_reason: reason.clone(),
-                    });
-
-                    if reason.is_some() {
-                        was_modified = true;
-                    }
-                }
+            AllowedAction::ReduceOnly { .. } | AllowedAction::EmergencyLiquidation { .. } => {
+                // These are handled by the position state logic below
+                was_modified = true;
             }
-        } else {
-            was_modified = true;
         }
 
         let adjustment_reason = if was_modified {
-            format!("Normal adjustments applied (allowed: {:?})", allowed_action)
+            format!("Normal adjustments applied (state: {:?})", pos_state)
         } else {
             "No adjustments needed".to_string()
         };
@@ -451,21 +493,21 @@ impl RiskAdjuster {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::{PositionLimits, PendingOrders};
+    use super::super::PositionManagerConfig;
     use super::super::trading_state_store::{RiskMetrics, MarketData};
     use super::super::signal_generator::{SignalMetadata};
     use std::collections::BTreeMap;
 
     #[test]
     fn test_normal_adjustments() {
-        let limits = PositionLimits {
-            soft_limit: 50.0,
-            hard_limit: 60.0,
-            warning_threshold: 40.0,
-            critical_threshold: 55.0,
+        let config = PositionManagerConfig {
+            warning_threshold: 0.7,
+            critical_threshold: 0.85,
+            warning_reduction_factor: 0.5,
+            critical_reduction_percentage: 0.3,
         };
 
-        let position_manager = PositionManager::new(limits);
+        let position_manager = PositionManager::new(50.0, config);
         let margin_calculator = MarginCalculator::new(5, 0.2);
         let adjuster = RiskAdjuster::new(position_manager, margin_calculator, 0.01);
 
@@ -522,14 +564,14 @@ mod tests {
 
     #[test]
     fn test_warning_adjustments() {
-        let limits = PositionLimits {
-            soft_limit: 50.0,
-            hard_limit: 60.0,
-            warning_threshold: 40.0,
-            critical_threshold: 55.0,
+        let config = PositionManagerConfig {
+            warning_threshold: 0.7,
+            critical_threshold: 0.85,
+            warning_reduction_factor: 0.5,
+            critical_reduction_percentage: 0.3,
         };
 
-        let position_manager = PositionManager::new(limits);
+        let position_manager = PositionManager::new(50.0, config);
         let margin_calculator = MarginCalculator::new(5, 0.2);
         let adjuster = RiskAdjuster::new(position_manager, margin_calculator, 0.01);
 
