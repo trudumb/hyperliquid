@@ -546,17 +546,6 @@ impl MultiLevelOptimizer {
     ) -> (Vec<f64>, Vec<f64>) {
         // Base allocation (more size on inner levels)
         let base_allocations = vec![0.45, 0.30, 0.15, 0.07, 0.03];
-        let mut bid_alloc = base_allocations[..num_levels.min(5)].to_vec();
-        let mut ask_alloc = bid_alloc.clone();
-
-        // Normalize
-        let sum: f64 = bid_alloc.iter().sum();
-        for x in &mut bid_alloc {
-            *x /= sum;
-        }
-        for x in &mut ask_alloc {
-            *x /= sum;
-        }
 
         // Calculate available inventory with proper position limit enforcement
         // SAFETY FIX: Ensure we never exceed max_position even with inventory_risk_limit
@@ -579,6 +568,61 @@ impl MultiLevelOptimizer {
 
         let bid_budget = kelly_adjusted_size.min(max_buy);
         let ask_budget = kelly_adjusted_size.min(max_sell);
+
+        // --- INTELLIGENT LEVEL CONSOLIDATION ---
+        // Calculate optimal number of levels based on budget and minimum notional
+        const MIN_NOTIONAL: f64 = 10.0;
+        let mid_price = state.mid_price.max(1.0); // Prevent division by zero
+        let min_size_per_level = MIN_NOTIONAL / mid_price;
+
+        // Determine how many levels we can actually support
+        let effective_levels = if bid_budget > 0.0 {
+            let mut supported_levels = 0;
+
+            for i in 0..num_levels.min(5) {
+                let alloc_fraction = base_allocations[i];
+                let level_size = bid_budget * alloc_fraction;
+
+                if level_size >= min_size_per_level {
+                    supported_levels += 1;
+                } else {
+                    // This level and all smaller ones won't meet minimum notional
+                    break;
+                }
+            }
+
+            if supported_levels == 0 {
+                // Even L1 doesn't meet minimum - consolidate everything into 1 level
+                log::warn!(
+                    "⚠️  Budget too small for multi-level: {:.2} units @ ${:.2} = ${:.2} total. Using 1 level.",
+                    bid_budget, mid_price, bid_budget * mid_price
+                );
+                1
+            } else if supported_levels < num_levels {
+                log::info!(
+                    "📊 Consolidating from {} to {} levels (budget={:.2}, min_size={:.3})",
+                    num_levels, supported_levels, bid_budget, min_size_per_level
+                );
+                supported_levels
+            } else {
+                num_levels
+            }
+        } else {
+            1 // Fallback to 1 level if no budget
+        };
+
+        // Use the effective number of levels
+        let mut bid_alloc = base_allocations[..effective_levels.min(5)].to_vec();
+        let mut ask_alloc = bid_alloc.clone();
+
+        // Normalize
+        let sum: f64 = bid_alloc.iter().sum();
+        for x in &mut bid_alloc {
+            *x /= sum;
+        }
+        for x in &mut ask_alloc {
+            *x /= sum;
+        }
 
         // Log position limit constraints for debugging
         if bid_budget < self.config.total_size_per_side * 0.5 {
