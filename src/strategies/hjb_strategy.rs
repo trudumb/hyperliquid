@@ -388,6 +388,7 @@ pub struct HjbStrategy {
     cached_volatility: Arc<RwLock<CachedVolatilityEstimate>>,
 
     /// Robust control configuration
+    #[allow(dead_code)]
     robust_config: RobustConfig,
 
     /// Current parameter uncertainty estimates
@@ -1157,7 +1158,7 @@ impl HjbStrategy {
     }
 
     /// Handle fills (update Hawkes model and order churn manager)
-    fn handle_fills(&mut self, _state: &CurrentState, fills: &[(TradeInfo, Option<usize>)]) {
+    fn handle_fills(&mut self, state: &CurrentState, fills: &[(TradeInfo, Option<usize>)]) {
         let current_time = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
         let current_time_ms = (current_time * 1000.0) as u64;
 
@@ -1191,6 +1192,26 @@ impl HjbStrategy {
                 estimated_placement_time_ms,
                 current_time_ms,
             );
+
+            // Track fill in performance tracker for auto-tuning
+            if let Some(ref mut tuner) = self.tuner_integration {
+                if let Some(tracker) = tuner.performance_tracker() {
+                    // Parse fill price and size
+                    if let (Ok(fill_price), Ok(fill_size)) = (fill.px.parse::<f64>(), fill.sz.parse::<f64>()) {
+                        tracker.on_fill(is_bid_fill, fill_price, fill_size);
+
+                        // Estimate PnL from this fill
+                        let pnl = if is_bid_fill {
+                            // Bought at fill_price, current mid is state.l2_mid_price
+                            (state.l2_mid_price - fill_price) * fill_size
+                        } else {
+                            // Sold at fill_price, current mid is state.l2_mid_price
+                            (fill_price - state.l2_mid_price) * fill_size
+                        };
+                        tracker.on_trade(pnl);
+                    }
+                }
+            }
 
             debug!("Hawkes model updated: level={}, is_bid={}, time={:.2}", level, is_bid_fill, current_time);
             debug!("Churn manager fill recorded: level={}, is_bid={}", level, is_bid_fill);
@@ -1262,9 +1283,12 @@ impl HjbStrategy {
                 self.smoothed_volatility_bps, bounded_volatility_bps);
         }
 
-        debug!("[OPTIMIZER INPUTS {}] vol_spot={:.2}bps, vol_smooth={:.2}bps (bounded={:.2}bps), vol_unc={:.2}bps, as_raw={:.2}bps, conviction={:.2}, as_final={:.2}bps, lob_imb={:.3}, pos={:.2}",
+        // Calculate inventory penalty using value function for monitoring
+        let inventory_penalty = self.get_inventory_penalty();
+
+        debug!("[OPTIMIZER INPUTS {}] vol_spot={:.2}bps, vol_smooth={:.2}bps (bounded={:.2}bps), vol_unc={:.2}bps, as_raw={:.2}bps, conviction={:.2}, as_final={:.2}bps, lob_imb={:.3}, pos={:.2}, inv_penalty={:.4}",
             self.config.asset, volatility_bps_pf, self.smoothed_volatility_bps, bounded_volatility_bps, vol_uncertainty_bps_pf,
-            microprice_as_bps, as_conviction, confident_as_bps, self.state_vector.lob_imbalance, state.position);
+            microprice_as_bps, as_conviction, confident_as_bps, self.state_vector.lob_imbalance, state.position, inventory_penalty);
 
         // Prepare optimizer inputs USING SMOOTHED VOLATILITY AND CONVICTION-SCALED AS
         let inputs = OptimizerInputs {
@@ -1323,6 +1347,35 @@ impl HjbStrategy {
             timestamp: current_time,
             state_hash,
         });
+
+        // --- PERFORMANCE TRACKING FOR AUTO-TUNING ---
+        if let Some(ref mut tuner) = self.tuner_integration {
+            if let Some(tracker) = tuner.performance_tracker() {
+                // Track quotes being generated
+                if !output.target_bids.is_empty() && !output.target_asks.is_empty() {
+                    tracker.on_quote(
+                        output.target_bids[0].0,  // best bid price
+                        output.target_asks[0].0,  // best ask price
+                        output.target_bids[0].1,  // best bid size
+                        output.target_asks[0].1,  // best ask size
+                    );
+                }
+
+                // Track inventory
+                tracker.on_inventory_update(state.position);
+
+                // Track margin usage
+                let margin_used = self.margin_calculator.initial_margin_required(
+                    state.position.abs(),
+                    state.l2_mid_price
+                );
+                let margin_available = state.account_equity;
+                tracker.on_margin_update(margin_used, margin_available);
+
+                // Increment tick counter
+                tracker.tick();
+            }
+        }
 
         (output.target_bids, output.target_asks)
     }

@@ -20,7 +20,7 @@ pub mod multi_level;
 pub use cache::CachedVolatilityEstimate;
 pub use models::{ControlVector, HJBComponents, OnlineAdverseSelectionModel, ValueFunction};
 pub use state::StateVector;
-pub use tuning::{AdamOptimizerState, ConstrainedTuningParams, TuningParams};
+pub use tuning::{ConstrainedTuningParams, TuningParams};
 
 // Re-export hawkes and multi-level types for convenience
 pub use hawkes::{FillHistory, HawkesFillModel, HawkesParams};

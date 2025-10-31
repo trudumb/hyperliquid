@@ -64,12 +64,12 @@ use std::collections::VecDeque;
 use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use log::{debug, info, warn};
+use log::{debug, warn};
 
 use crate::strategy::MarketUpdate;
 use super::volatility::VolatilityModel;
 use super::ewma_vol::{EwmaVolatilityModel, EwmaVolConfig};
-use super::particle_filter_vol::{ParticleFilterVolModel, ParticleFilterState};
+use super::particle_filter_vol::ParticleFilterState;
 
 /// Configuration for hybrid volatility model
 #[derive(Debug, Clone, Serialize, Deserialize)]

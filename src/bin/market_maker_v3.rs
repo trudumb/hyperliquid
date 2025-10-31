@@ -100,6 +100,7 @@ struct StateManagerActor {
     /// Configurable safety buffer (e.g., 0.1 for 10%)
     safety_buffer: f64,
     /// Leverage (assuming consistent across strategies for now)
+    #[allow(dead_code)]
     leverage: usize,
     /// Max position size (from config)
     max_position_size: f64,

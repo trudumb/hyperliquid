@@ -69,6 +69,7 @@ impl AdamOptimizerState {
         }
     }
 
+    #[allow(dead_code)]
     pub fn compute_update(&mut self, gradient_vector: &[f64]) -> Vec<f64> {
         assert_eq!(gradient_vector.len(), 8, "Gradient vector must have 8 elements");
         self.t += 1;
