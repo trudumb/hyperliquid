@@ -642,7 +642,7 @@ impl MultiLevelOptimizer {
         let mut bid_sizes = Vec::new();
         let mut ask_sizes = Vec::new();
 
-        for level in 0..num_levels {
+        for level in 0..effective_levels {
             let bid_excitement = state.hawkes_model.excitation_multiplier(level, true, state.current_time);
             let ask_excitement = state.hawkes_model.excitation_multiplier(level, false, state.current_time);
 
