@@ -17,6 +17,15 @@
           "alpha": 0.05,
           "min_volatility_bps": 5.0,
           "max_volatility_bps": 500.0
+        },
+        "inventory_markout_config": {
+          "linear_penalty_per_unit": 0.01,
+          "quadratic_coefficient": 0.0002,
+          "cubic_coefficient": 0.000005,
+          "volatility_scaling": 0.8,
+          "enable_urgency": true,
+          "urgency_threshold": 0.7,
+          "urgency_multiplier": 4.0
         }
       }
     }
