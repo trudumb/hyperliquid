@@ -500,7 +500,7 @@ mod tests {
     use super::*;
     use super::super::PositionManagerConfig;
     use super::super::trading_state_store::{RiskMetrics, MarketData};
-    use super::super::signal_generator::{SignalMetadata};
+    use super::super::signal_generator::{SignalMetadata, QuoteLevel, QuoteSignal};
     use std::collections::BTreeMap;
 
     #[test]
@@ -518,13 +518,13 @@ mod tests {
 
         let signal = QuoteSignal {
             bid_levels: vec![QuoteLevel {
-                offset_bps: -5.0,
+                price: 95.0,
                 size: 10.0,
                 urgency: 0.8,
                 is_bid: true,
             }],
             ask_levels: vec![QuoteLevel {
-                offset_bps: 5.0,
+                price: 105.0,
                 size: 10.0,
                 urgency: 0.8,
                 is_bid: false,
@@ -582,13 +582,13 @@ mod tests {
 
         let signal = QuoteSignal {
             bid_levels: vec![QuoteLevel {
-                offset_bps: -5.0,
+                price: 95.0,
                 size: 10.0,
                 urgency: 0.8,
                 is_bid: true,
             }],
             ask_levels: vec![QuoteLevel {
-                offset_bps: 5.0,
+                price: 105.0,
                 size: 10.0,
                 urgency: 0.8,
                 is_bid: false,
@@ -601,7 +601,7 @@ mod tests {
                 mid_price: 100.0,
                 volatility_bps: 20.0,
                 adverse_selection: 0.0,
-                inventory: 45.0, // In warning zone
+                inventory: 40.0, // In warning zone (35.0-42.5)
                 optimizer_time_us: 100,
                 was_cached: false,
             },
@@ -610,7 +610,7 @@ mod tests {
         let snapshot = TradingSnapshot {
             market_data: MarketData::default(),
             risk_metrics: RiskMetrics {
-                position: 45.0, // Warning zone
+                position: 40.0, // Warning zone (70% = 35.0, 85% = 42.5, so 40.0 is in warning)
                 account_equity: 10000.0,
                 margin_used: 1000.0,
                 margin_available: 7000.0,

@@ -95,6 +95,7 @@ impl PendingOrders {
 }
 
 /// Position Manager - Central authority for position state and constraints
+#[derive(Debug)]
 pub struct PositionManager {
     max_position: f64,
     config: PositionManagerConfig,
@@ -175,7 +176,7 @@ impl PositionManager {
     }
 
     /// Calculate maximum buy size allowed (considering pending orders)
-    fn calculate_max_buy(&self, current_pos: f64, pending: &PendingOrders) -> f64 {
+    pub fn calculate_max_buy(&self, current_pos: f64, pending: &PendingOrders) -> f64 {
         // Effective long position = current + pending buys
         let effective_long = current_pos + pending.total_buy_size;
 
@@ -184,7 +185,7 @@ impl PositionManager {
     }
 
     /// Calculate maximum sell size allowed (considering pending orders)
-    fn calculate_max_sell(&self, current_pos: f64, pending: &PendingOrders) -> f64 {
+    pub fn calculate_max_sell(&self, current_pos: f64, pending: &PendingOrders) -> f64 {
         // Effective short position = current - pending sells
         let effective_short = current_pos - pending.total_sell_size;
 

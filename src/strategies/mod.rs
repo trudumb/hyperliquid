@@ -38,6 +38,9 @@ mod hjb_impl;
 // Auto-tuner integration module
 pub mod tuner_integration;
 
+// Async tuner actor for non-blocking parameter optimization
+pub mod async_tuner_actor;
+
 // Re-export strategies
 pub use hjb_strategy::HjbStrategy;
 pub use hjb_strategy_v2::HjbStrategyV2;

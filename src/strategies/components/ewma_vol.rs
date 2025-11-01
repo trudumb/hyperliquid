@@ -449,15 +449,8 @@ mod tests {
         let mut model = EwmaVolatilityModel::with_half_life(60.0);
 
         // Create a simple market update
-        let update1 = MarketUpdate {
-            mid_price: Some(100.0),
-            ..Default::default()
-        };
-
-        let update2 = MarketUpdate {
-            mid_price: Some(100.5),
-            ..Default::default()
-        };
+        let update1 = MarketUpdate::from_mid_price("TEST".to_string(), 100.0);
+        let update2 = MarketUpdate::from_mid_price("TEST".to_string(), 100.5);
 
         model.on_market_update(&update1);
         assert_eq!(model.update_count, 0); // First update just sets prev_mid
@@ -480,10 +473,7 @@ mod tests {
         // Normal updates
         let mut price = 100.0;
         for _ in 0..20 {
-            let update = MarketUpdate {
-                mid_price: Some(price),
-                ..Default::default()
-            };
+            let update = MarketUpdate::from_mid_price("TEST".to_string(), price);
             model.on_market_update(&update);
             price += 0.01; // Small moves
         }
@@ -491,10 +481,7 @@ mod tests {
         let vol_before = model.get_volatility_bps();
 
         // Flash crash (huge move)
-        let crash_update = MarketUpdate {
-            mid_price: Some(price * 0.8), // 20% drop
-            ..Default::default()
-        };
+        let crash_update = MarketUpdate::from_mid_price("TEST".to_string(), price * 0.8); // 20% drop
         model.on_market_update(&crash_update);
 
         let vol_after = model.get_volatility_bps();

@@ -128,6 +128,11 @@ impl StandardInventorySkew {
     pub fn new(config: InventorySkewConfig) -> Self {
         Self { config }
     }
+
+    /// Get a mutable reference to the config (for parameter updates)
+    pub fn config_mut(&mut self) -> &mut InventorySkewConfig {
+        &mut self.config
+    }
 }
 
 impl InventorySkewModel for StandardInventorySkew {

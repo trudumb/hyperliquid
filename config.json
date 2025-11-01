@@ -20,8 +20,8 @@
           "max_levels": 5,
           "min_profitable_spread_bps": 6.0,
           "level_spacing_bps": 3.0,
-          "total_size_per_side": 3.0,
-          "base_maker_size": 3.0,
+          "total_size_per_side": 1.5,
+          "base_maker_size": 1.5,
           "inventory_risk_limit": 0.7,
           "directional_aggression": 2.0,
           "momentum_threshold": 1.3,
@@ -37,8 +37,45 @@
         },
         "auto_tuning": {
           "enabled": true,
-          "z_score_threshold": 0.0,
-          "vol_ema_alpha": 0.1
+          "updates_per_episode": 100
+        },
+        "auto_tuning_config": {
+          "enabled": true,
+          "mode": "continuous",
+          "episodes_per_update": 50,
+          "update_interval_seconds": 1800.0,
+          "adaptive_threshold": 0.7,
+          "spsa_c": 0.05,
+          "spsa_gamma": 0.101,
+          "adam_alpha": 0.0005,
+          "adam_beta1": 0.9,
+          "adam_beta2": 0.999,
+          "adam_epsilon": 1e-8,
+          "learning_rate_decay": 0.0,
+          "max_param_change": 0.5,
+          "min_episodes_for_gradient": 20,
+          "verbose": true,
+          "objective_weights": {
+            "profitability_weight": 0.4,
+            "risk_weight": 0.3,
+            "efficiency_weight": 0.2,
+            "model_quality_weight": 0.1,
+            "profitability": {
+              "sharpe_weight": 0.5,
+              "win_rate_weight": 0.3,
+              "pnl_per_trade_weight": 0.2
+            },
+            "risk": {
+              "drawdown_weight": 0.4,
+              "inventory_vol_weight": 0.3,
+              "margin_weight": 0.3
+            },
+            "efficiency": {
+              "fill_rate_weight": 0.4,
+              "churn_weight": 0.3,
+              "spread_capture_weight": 0.3
+            }
+          }
         }
       }
     }

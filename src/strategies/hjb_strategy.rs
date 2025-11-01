@@ -67,7 +67,7 @@ use crate::strategies::tuner_integration::TunerIntegration;
 // Import HJB implementation details from the sibling hjb_impl module
 // ----------------------------------------------------------------------------
 use super::hjb_impl::{
-    CachedVolatilityEstimate, ConstrainedTuningParams, HJBComponents,
+    CachedVolatilityEstimate, HJBComponents,
     StateVector, ValueFunction,
 };
 
@@ -396,7 +396,8 @@ pub struct HjbStrategy {
     current_uncertainty: ParameterUncertainty,
 
     /// Fixed tuning parameters (no online learning/tuning)
-    tuning_params: ConstrainedTuningParams,
+    /// Now using the new StrategyConstrainedParams type
+    tuning_params: super::components::parameter_transforms::StrategyConstrainedParams,
 
     /// Trading enabled flag
     trading_enabled: bool,
@@ -491,23 +492,10 @@ impl Strategy for HjbStrategy {
         let multi_level_config = strategy_config.multi_level_config.clone()
             .unwrap_or_else(|| MultiLevelConfig::default());
 
-        // ✅ TUNED: More conservative defaults to prevent spread crossing
-        // Initialize fixed tuning parameters (sensible defaults, no online learning)
-        let tuning_params = ConstrainedTuningParams {
-            // ✅ REDUCED: Was 0.5, now 0.3 for gentler inventory management
-            skew_adjustment_factor: 0.3,
-            // ✅ REDUCED: Was 0.3, now 0.2 for less AS sensitivity
-            adverse_selection_adjustment_factor: 0.2,  // Lower since microprice AS is stable
-            adverse_selection_lambda: 0.1,
-            // ✅ INCREASED: Was 0.7, now 0.85 to delay liquidation mode
-            inventory_urgency_threshold: 0.85,
-            liquidation_rate_multiplier: 10.0,
-            // ✅ INCREASED: Was 0.2, now 0.5 for stricter minimum spreads
-            min_spread_base_ratio: 0.5,
-            // ✅ REDUCED: Was 50.0, now 30.0 for less AS amplification
-            adverse_selection_spread_scale: 30.0,  // Lower since microprice AS is stable
-            control_gap_threshold: 0.1,
-        };
+        // Use new parameter system (StrategyTuningParams -> StrategyConstrainedParams)
+        // The legacy tuning parameters are now handled internally by the optimizer
+        use super::components::parameter_transforms::StrategyTuningParams;
+        let tuning_params = StrategyTuningParams::default().get_constrained();
 
         // Initialize the component-based quote optimizer
         let quote_optimizer = HjbMultiLevelOptimizer::new(
@@ -1138,7 +1126,11 @@ impl HjbStrategy {
     /// Handle trade flow updates
     fn handle_trades_update(&mut self, _state: &CurrentState, trades: &[Trade]) {
         let trades_vec = trades.to_vec();
-        self.state_vector.update_trade_flow_ema(&trades_vec, &self.tuning_params);
+
+        // Convert new params to legacy format for StateVector
+        // (StateVector still uses old ConstrainedTuningParams)
+        let legacy_params = HjbMultiLevelOptimizer::to_legacy_params(&self.tuning_params);
+        self.state_vector.update_trade_flow_ema(&trades_vec, &legacy_params);
 
         // Update microprice model with trade flow (no order book here, just trades)
         self.microprice_as_model.update(None, trades);

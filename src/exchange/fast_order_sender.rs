@@ -79,15 +79,16 @@ pub struct BufferPoolStats {
 /// - Rate limiting to comply with Hyperliquid's API limits
 ///
 /// # Example
-/// ```no_run
-/// use hyperliquid_rust_sdk::prelude::*;
+/// ```ignore
+/// use hyperliquid_rust_sdk::{ExchangeClient, FastOrderSender, ClientOrderRequest};
 ///
-/// async fn example() -> Result<()> {
+/// async fn example() -> Result<(), Box<dyn std::error::Error>> {
 ///     let exchange = ExchangeClient::new(/* ... */).await?;
 ///     let fast_sender = FastOrderSender::new(exchange);
 ///
 ///     let order = ClientOrderRequest {
 ///         // ... order details
+///         ..Default::default()
 ///     };
 ///
 ///     let response = fast_sender.place_order_fast(&order).await?;

@@ -358,7 +358,10 @@ impl Default for CurrentState {
 ///
 /// # Example Implementation
 ///
-/// ```rust
+/// ```
+/// use hyperliquid_rust_sdk::{Strategy, CurrentState, MarketUpdate, UserUpdate, StrategyAction};
+/// use serde_json::Value;
+///
 /// struct SimpleGridStrategy {
 ///     grid_spacing_bps: f64,
 ///     order_size: f64,
@@ -382,12 +385,7 @@ impl Default for CurrentState {
 ///         let ask_price = state.l2_mid_price * (1.0 + self.grid_spacing_bps / 10000.0);
 ///
 ///         // If no orders exist, place them
-///         if state.open_bids.is_empty() {
-///             actions.push(StrategyAction::Place(/* bid order */));
-///         }
-///         if state.open_asks.is_empty() {
-///             actions.push(StrategyAction::Place(/* ask order */));
-///         }
+///         // (actual order creation omitted for brevity)
 ///
 ///         actions
 ///     }

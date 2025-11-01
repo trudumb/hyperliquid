@@ -133,6 +133,11 @@ impl StandardRobustControl {
     pub fn new(config: RobustConfig) -> Self {
         Self { config }
     }
+
+    /// Get a mutable reference to the config (for parameter updates)
+    pub fn config_mut(&mut self) -> &mut RobustConfig {
+        &mut self.config
+    }
 }
 
 impl RobustControlModel for StandardRobustControl {

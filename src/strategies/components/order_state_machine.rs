@@ -29,6 +29,7 @@ pub enum OrderState {
     Open {
         confirmed_at: Instant,
         order_id: u64,
+        original_size: f64,
         remaining_size: f64,
         price: f64,
         is_buy: bool,
@@ -290,6 +291,7 @@ impl OrderStateMachine {
             state: OrderState::Open {
                 confirmed_at: Instant::now(),
                 order_id,
+                original_size: size,
                 remaining_size: size,
                 price,
                 is_buy,
@@ -351,6 +353,7 @@ impl OrderStateMachine {
                     Ok(OrderState::Open {
                         confirmed_at: Instant::now(),
                         order_id: *order_id,
+                        original_size: *size,
                         remaining_size: *size,
                         price: *price,
                         is_buy: *is_buy,
@@ -387,10 +390,11 @@ impl OrderStateMachine {
             }
 
             // Open -> PartialFill (stays Open with updated size)
-            (OrderState::Open { order_id, price, is_buy, .. }, OrderEvent::PartialFill { remaining_size, .. }) => {
+            (OrderState::Open { order_id, original_size, price, is_buy, .. }, OrderEvent::PartialFill { remaining_size, .. }) => {
                 Ok(OrderState::Open {
                     confirmed_at: Instant::now(),
                     order_id: *order_id,
+                    original_size: *original_size,
                     remaining_size: *remaining_size,
                     price: *price,
                     is_buy: *is_buy,
@@ -408,11 +412,11 @@ impl OrderStateMachine {
             }
 
             // Open -> PendingCancel
-            (OrderState::Open { order_id, remaining_size, .. }, OrderEvent::CancelRequested) => {
+            (OrderState::Open { order_id, original_size, remaining_size, .. }, OrderEvent::CancelRequested) => {
                 Ok(OrderState::PendingCancel {
                     requested_at: Instant::now(),
                     order_id: *order_id,
-                    original_size: *remaining_size,
+                    original_size: *original_size,
                     remaining_size: *remaining_size,
                 })
             }

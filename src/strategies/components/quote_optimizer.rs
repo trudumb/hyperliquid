@@ -143,4 +143,22 @@ pub trait QuoteOptimizer: Send + Sync {
         state: &CurrentState,
         fill_model: &HawkesFillModel,
     ) -> (Vec<(f64, f64)>, Vec<(f64, f64)>);
+
+    /// Apply updated tuning parameters from the auto-tuner
+    ///
+    /// This method is called when the auto-tuning system has optimized parameters
+    /// and wants to apply them to the optimizer. The default implementation does
+    /// nothing, but optimizers that support parameter updates should override this.
+    ///
+    /// # Arguments
+    /// - `params`: New constrained parameters from the tuner
+    ///
+    /// # Notes
+    /// - This is called from the main trading thread, so it should be fast
+    /// - Parameters are already constrained to valid ranges
+    /// - The optimizer should update its internal state to use the new parameters
+    #[allow(unused_variables)]
+    fn apply_tuning_params(&mut self, params: &super::StrategyConstrainedParams) {
+        // Default implementation: do nothing (for optimizers that don't support tuning)
+    }
 }

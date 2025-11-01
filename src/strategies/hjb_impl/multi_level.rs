@@ -187,22 +187,39 @@ pub struct OptimizationState<'a> {
     pub volatility_bps: f64,
     pub current_time: f64,
     pub hawkes_model: &'a HawkesFillModel,
+    /// Open bid orders (for position limit calculation)
+    pub open_bids: &'a [crate::RestingOrder],
+    /// Open ask orders (for position limit calculation)
+    pub open_asks: &'a [crate::RestingOrder],
 }
 
 /// Multi-level optimizer
 #[derive(Debug)]
 pub struct MultiLevelOptimizer {
     config: MultiLevelConfig,
+    position_manager: crate::strategies::components::PositionManager,
 }
 
 impl MultiLevelOptimizer {
     pub fn new(config: MultiLevelConfig) -> Self {
-        Self { config }
+        // Initialize with a default max position (will be updated via tuning)
+        let position_manager = crate::strategies::components::PositionManager::with_max_position(10.0);
+        Self { config, position_manager }
     }
 
     /// Get a reference to the config
     pub fn config(&self) -> &MultiLevelConfig {
         &self.config
+    }
+
+    /// Get a mutable reference to the config (for parameter updates)
+    pub fn config_mut(&mut self) -> &mut MultiLevelConfig {
+        &mut self.config
+    }
+
+    /// Update max position (e.g., when tuning parameters change)
+    pub fn update_max_position(&mut self, new_max: f64) {
+        self.position_manager.update_max_position(new_max);
     }
 
     /// Optimize multi-level quotes
@@ -526,14 +543,24 @@ impl MultiLevelOptimizer {
         let kelly_fraction = odds;
 
         // Scale back size as inventory grows (to reduce risk)
-        let inventory_scalar = (1.0 - inventory_ratio).powi(2);
+        // IMPORTANT: When over position limit (ratio >= 1.0), maintain reasonable sizing
+        // to allow efficient unwinding via tight spreads, rather than crushing size to zero
+        let inventory_scalar = if inventory_ratio >= 1.0 {
+            // Over limit: maintain 50% sizing factor to unwind efficiently
+            // This allows the inventory skew and aggression to work properly
+            0.5
+        } else {
+            // Normal operation: apply quadratic penalty with a floor
+            // Floor prevents going to zero, maintaining minimum liquidity
+            (1.0 - inventory_ratio).powi(2).max(0.1)
+        };
 
         // Final factor: Kelly fraction * inventory scalar, capped at 1.0
         let sizing_factor = (kelly_fraction * inventory_scalar).min(1.0).max(0.0);
 
         log::debug!(
-            "[Kelly Sizing] Edge: {:.2}bps, Risk (Vol): {:.2}bps, Odds: {:.3}, InvRatio: {:.2}, Factor: {:.3}",
-            edge_bps, risk_bps, odds, inventory_ratio, sizing_factor
+            "[Kelly Sizing] Edge: {:.2}bps, Risk (Vol): {:.2}bps, Odds: {:.3}, InvRatio: {:.2}, Scalar: {:.2}, Factor: {:.3}",
+            edge_bps, risk_bps, odds, inventory_ratio, inventory_scalar, sizing_factor
         );
 
         sizing_factor
@@ -550,33 +577,97 @@ impl MultiLevelOptimizer {
         // Base allocation (more size on inner levels)
         let base_allocations = vec![0.45, 0.30, 0.15, 0.07, 0.03];
 
-        // Calculate available inventory with proper position limit enforcement
-        // SAFETY FIX: Ensure we never exceed max_position even with inventory_risk_limit
-        let inventory_capacity = state.max_position * self.config.inventory_risk_limit;
+        // Use PositionManager to calculate max buy/sell with pending order accounting
+        // This prevents position limit breaches from simultaneous fills
+        use crate::strategies::components::PendingOrders;
 
-        // Max buy: How much we can buy before hitting our long limit
-        // Considers both the risk-adjusted capacity AND the absolute max position
-        let max_buy_risk_adjusted = (inventory_capacity - state.inventory).max(0.0);
-        let max_buy_absolute = (state.max_position - state.inventory).max(0.0);
-        let max_buy = max_buy_risk_adjusted.min(max_buy_absolute);
+        let pending_orders = PendingOrders::from_orders(state.open_bids, state.open_asks);
 
-        // Max sell: How much we can sell before hitting our short limit
-        // Considers both the risk-adjusted capacity AND the absolute max position
-        let max_sell_risk_adjusted = (inventory_capacity + state.inventory).max(0.0);
-        let max_sell_absolute = (state.max_position + state.inventory).max(0.0);
-        let max_sell = max_sell_risk_adjusted.min(max_sell_absolute);
+        // Get position state to check if we're over limit
+        let position_state = self.position_manager.get_state(state.inventory);
+
+        // Calculate max buy/sell using PositionManager (accounts for pending orders)
+        let max_buy_absolute = self.position_manager.calculate_max_buy(state.inventory, &pending_orders);
+        let max_sell_absolute = self.position_manager.calculate_max_sell(state.inventory, &pending_orders);
+
+        // For two-sided quoting: use absolute limits (PositionManager already prevents breaches)
+        // The inventory_risk_limit is meant to slow accumulation during normal trading,
+        // but shouldn't completely block one side when within absolute limits
+        let max_buy = max_buy_absolute;
+        let max_sell = max_sell_absolute;
+
+        // Log position state warnings
+        use crate::strategies::components::PositionState;
+        match position_state {
+            PositionState::OverLimit => {
+                log::warn!(
+                    "⚠️  POSITION OVER LIMIT: {:.2} (max={:.2}). REDUCE-ONLY MODE ACTIVE.",
+                    state.inventory.abs(), state.max_position
+                );
+            }
+            PositionState::Critical => {
+                log::warn!(
+                    "⚠️  POSITION CRITICAL: {:.2}/{:.2} ({:.0}%). Reducing order sizes.",
+                    state.inventory.abs(), state.max_position,
+                    (state.inventory.abs() / state.max_position) * 100.0
+                );
+            }
+            _ => {}
+        }
 
         // Apply Kelly factor to the base size, then constrain by margin/position limits
         let kelly_adjusted_size = self.config.total_size_per_side * kelly_sizing_factor;
 
-        let bid_budget = kelly_adjusted_size.min(max_buy);
-        let ask_budget = kelly_adjusted_size.min(max_sell);
+        // Handle over-limit state: only allow reduce-only orders
+        let (mut bid_budget, mut ask_budget) = match position_state {
+            PositionState::OverLimit => {
+                // Reduce-only mode
+                if state.inventory > 0.0 {
+                    // Long position: only allow sells to reduce
+                    (0.0, kelly_adjusted_size.min(max_sell))
+                } else if state.inventory < 0.0 {
+                    // Short position: only allow buys to reduce
+                    (kelly_adjusted_size.min(max_buy), 0.0)
+                } else {
+                    // Flat: no orders
+                    (0.0, 0.0)
+                }
+            }
+            _ => {
+                // Normal mode: both sides constrained by limits
+                (kelly_adjusted_size.min(max_buy), kelly_adjusted_size.min(max_sell))
+            }
+        };
 
         // --- INTELLIGENT LEVEL CONSOLIDATION ---
         // Calculate optimal number of levels based on budget and minimum notional
         const MIN_NOTIONAL: f64 = 10.0; // Exchange minimum requirement
         let mid_price = state.mid_price.max(1.0); // Prevent division by zero
         let min_size_per_level = MIN_NOTIONAL / mid_price;
+
+        // --- DEADLOCK PREVENTION: Clamp reduce-only orders to MIN_NOTIONAL ---
+        // When over-limit with budget below MIN_NOTIONAL, we face a deadlock:
+        // - Can't place limit orders (filtered by MIN_NOTIONAL check)
+        // - Position never reduces
+        // Solution: Clamp budget UP to minimum viable size to allow emergency unwinding
+        if matches!(position_state, PositionState::OverLimit) {
+            if bid_budget > 0.0 && bid_budget < min_size_per_level {
+                let original_budget = bid_budget;
+                bid_budget = min_size_per_level;
+                log::warn!(
+                    "🔧 EMERGENCY CLAMP: Bid budget {:.3} → {:.3} to meet MIN_NOTIONAL=${:.0}. Over-reduce by {:.3} units to escape deadlock.",
+                    original_budget, bid_budget, MIN_NOTIONAL, bid_budget - original_budget
+                );
+            }
+            if ask_budget > 0.0 && ask_budget < min_size_per_level {
+                let original_budget = ask_budget;
+                ask_budget = min_size_per_level;
+                log::warn!(
+                    "🔧 EMERGENCY CLAMP: Ask budget {:.3} → {:.3} to meet MIN_NOTIONAL=${:.0}. Over-reduce by {:.3} units to escape deadlock.",
+                    original_budget, ask_budget, MIN_NOTIONAL, ask_budget - original_budget
+                );
+            }
+        }
 
         // Determine how many levels we can actually support
         let effective_levels = if bid_budget > 0.0 {
@@ -736,12 +827,18 @@ mod tests {
 
     #[test]
     fn test_multi_level_optimizer() {
-        let config = MultiLevelConfig::default();
+        let mut config = MultiLevelConfig::default();
+        // Increase total_size_per_side to ensure we can support 3 levels
+        // With the Kelly sizing factor, we need enough budget
+        config.total_size_per_side = 30.0;
         let optimizer = MultiLevelOptimizer::new(config);
         let hawkes = HawkesFillModel::new(3);
 
         // Use default tuning params
         let tuning_params = TuningParams::default().get_constrained();
+
+        let open_bids: Vec<crate::RestingOrder> = vec![];
+        let open_asks: Vec<crate::RestingOrder> = vec![];
 
         let state = OptimizationState {
             mid_price: 100.0,
@@ -752,6 +849,8 @@ mod tests {
             volatility_bps: 100.0,
             current_time: 0.0,
             hawkes_model: &hawkes,
+            open_bids: &open_bids,
+            open_asks: &open_asks,
         };
 
         let control = optimizer.optimize(&state, 6.0, &tuning_params, 1.5);

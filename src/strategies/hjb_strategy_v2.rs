@@ -127,6 +127,12 @@ pub struct HjbStrategyV2Config {
 
     /// Order state machine config
     pub state_machine_config: StateMachineConfig,
+
+    /// Auto-tuning configuration (None if disabled)
+    pub tuner_config: Option<crate::strategies::components::TunerConfig>,
+
+    /// Number of market updates per tuning episode
+    pub tuner_updates_per_episode: usize,
 }
 
 impl HjbStrategyV2Config {
@@ -156,6 +162,32 @@ impl HjbStrategyV2Config {
         // Order state machine configuration
         let state_machine_config = StateMachineConfig::default();
 
+        // Auto-tuning configuration
+        let (tuner_config, tuner_updates_per_episode) = if let Some(auto_tuning) = params.get("auto_tuning") {
+            let enabled = auto_tuning.get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            if enabled {
+                // Parse tuner config from JSON or use defaults
+                let tuner_cfg = if let Some(tuner_params) = params.get("auto_tuning_config") {
+                    serde_json::from_value(tuner_params.clone()).unwrap_or_default()
+                } else {
+                    crate::strategies::components::TunerConfig::default()
+                };
+
+                let updates_per_episode = auto_tuning.get("updates_per_episode")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(100) as usize;
+
+                (Some(tuner_cfg), updates_per_episode)
+            } else {
+                (None, 100)
+            }
+        } else {
+            (None, 100)
+        };
+
         Self {
             max_position,
             phi: params.get("phi").and_then(|v| v.as_f64()).unwrap_or(0.01),
@@ -176,6 +208,8 @@ impl HjbStrategyV2Config {
             position_manager_config,
             ewma_vol_config,
             state_machine_config,
+            tuner_config,
+            tuner_updates_per_episode,
         }
     }
 }
@@ -203,8 +237,14 @@ pub struct HjbStrategyV2 {
     // Metrics
     metrics_subscriber: Arc<MetricsSubscriber>,
 
+    // Auto-tuner actor (None if disabled)
+    tuner_actor: Option<crate::strategies::async_tuner_actor::AsyncTunerActorHandle>,
+
     // Last quote timestamp (to avoid over-quoting)
     last_quote_time: f64,
+
+    // Episode tracking for tuner
+    market_updates_in_episode: usize,
 }
 
 impl HjbStrategyV2 {
@@ -253,7 +293,8 @@ impl HjbStrategyV2 {
         market_pipeline.add_processor(Box::new(AdverseSelectionProcessor::new()));
 
         // Initialize signal generator
-        use crate::{MultiLevelConfig, TuningParams};
+        use crate::MultiLevelConfig;
+        use super::components::parameter_transforms::StrategyTuningParams;
 
         // Create separate volatility model for signal generator (for getter methods)
         let volatility_model: Box<dyn VolatilityModel> = Box::new(
@@ -267,7 +308,7 @@ impl HjbStrategyV2 {
                 InventorySkewConfig::default(),
                 config.asset.clone(),
                 config.max_position,
-                TuningParams::default().get_constrained(),
+                StrategyTuningParams::default().get_constrained(),
             )
         );
 
@@ -324,6 +365,38 @@ impl HjbStrategyV2 {
             config.requote_threshold_bps,
         );
 
+        // Initialize auto-tuner actor if enabled
+        let tuner_actor = if let Some(ref tuner_config) = config.tuner_config {
+            info!("[HJB V2] Initializing auto-tuner actor (mode={})", tuner_config.mode);
+
+            // Create initial tuning parameters from defaults
+            // The params will be initialized from the unconstrained phi space
+            // and the tuner will optimize them from there
+            use crate::strategies::components::StrategyTuningParams;
+            let initial_params = StrategyTuningParams::default();
+
+            // Generate seed from asset name
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            config.asset.hash(&mut hasher);
+            let seed = hasher.finish();
+
+            // Spawn tuner actor
+            let actor = crate::strategies::async_tuner_actor::AsyncTunerActor::spawn(
+                tuner_config.clone(),
+                initial_params,
+                config.tuner_updates_per_episode,
+                seed,
+            );
+
+            info!("[HJB V2] Auto-tuner actor spawned successfully");
+            Some(actor)
+        } else {
+            info!("[HJB V2] Auto-tuning disabled");
+            None
+        };
+
         Self {
             config,
             event_bus,
@@ -334,7 +407,9 @@ impl HjbStrategyV2 {
             position_manager,
             order_executor,
             metrics_subscriber,
+            tuner_actor,
             last_quote_time: 0.0,
+            market_updates_in_episode: 0,
         }
     }
 
@@ -533,6 +608,33 @@ impl Strategy for HjbStrategyV2 {
         state: &CurrentState,
         update: &MarketUpdate,
     ) -> Vec<StrategyAction> {
+        // 0. Track market update for tuner and check for episode completion
+        if let Some(ref tuner) = self.tuner_actor {
+            use crate::strategies::async_tuner_actor::TunerEvent;
+
+            // Send market update event (non-blocking)
+            tuner.send_event(TunerEvent::MarketUpdate);
+
+            // Track episode progress
+            self.market_updates_in_episode += 1;
+
+            // Check if episode is complete
+            if self.market_updates_in_episode >= self.config.tuner_updates_per_episode {
+                tuner.send_event(TunerEvent::EpisodeComplete);
+                self.market_updates_in_episode = 0;
+
+                // Read updated parameters (non-blocking RwLock read ~10ns)
+                let updated_params = tuner.get_params();
+
+                // Apply updated parameters to signal generator
+                // This updates the optimizer and clears the cache
+                self.signal_generator.apply_tuning_params(&updated_params);
+
+                info!("[HJB V2 Tuner] ✅ Applied new parameters: phi={:.4}, lambda={:.2}, max_pos={:.1}",
+                    updated_params.phi, updated_params.lambda_base, updated_params.max_absolute_position_size);
+            }
+        }
+
         // 1. Sync external state into our state store
         self.sync_external_state(state);
 
@@ -581,6 +683,26 @@ impl Strategy for HjbStrategyV2 {
                 timestamp,
             });
 
+            // Track fill in tuner
+            if let Some(ref tuner) = self.tuner_actor {
+                use crate::strategies::async_tuner_actor::TunerEvent;
+
+                // Calculate PnL (simplified - would need more context for accurate PnL)
+                let pnl_estimate = if is_buy {
+                    (state.l2_mid_price - price) * size
+                } else {
+                    (price - state.l2_mid_price) * size
+                };
+
+                tuner.send_event(TunerEvent::Fill {
+                    pnl: pnl_estimate,
+                    fill_price: price,
+                    fill_size: size,
+                    is_buy,
+                    timestamp,
+                });
+            }
+
             // Remove filled order
             self.state_store.remove_order(fill_info.oid);
 
@@ -599,6 +721,12 @@ impl Strategy for HjbStrategyV2 {
                 order_id: *oid,
                 timestamp,
             });
+
+            // Track cancellation in tuner
+            if let Some(ref tuner) = self.tuner_actor {
+                use crate::strategies::async_tuner_actor::TunerEvent;
+                tuner.send_event(TunerEvent::Cancel { timestamp });
+            }
 
             self.state_store.remove_order(*oid);
 
@@ -674,6 +802,30 @@ impl Strategy for HjbStrategyV2 {
 
     fn on_shutdown(&mut self, state: &CurrentState) -> Vec<StrategyAction> {
         info!("[HJB V2] Shutting down strategy");
+
+        // Shutdown tuner actor if running
+        if let Some(tuner) = self.tuner_actor.take() {
+            use crate::strategies::async_tuner_actor::TunerEvent;
+
+            info!("[HJB V2] Shutting down auto-tuner actor...");
+
+            // Send shutdown event
+            tuner.send_event(TunerEvent::Shutdown);
+
+            // Wait for shutdown (this is an async operation, so we spawn a blocking task)
+            // Note: In a production system, you might want to handle this differently
+            // For now, we just send the shutdown signal and let the actor clean up
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                runtime.block_on(async {
+                    if let Some(history) = tuner.shutdown().await {
+                        info!("[HJB V2 Tuner] Final history: {}", history);
+                    }
+                });
+            });
+
+            info!("[HJB V2] Auto-tuner shutdown initiated");
+        }
 
         // Log final metrics
         info!("[HJB V2] Total fills: {}", self.metrics_subscriber.get_fill_count());

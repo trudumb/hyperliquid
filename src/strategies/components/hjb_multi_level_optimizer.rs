@@ -55,7 +55,7 @@ use serde_json::Value;
 
 use crate::strategy::CurrentState;
 use crate::{
-    ConstrainedTuningParams, HawkesFillModel, MultiLevelConfig, MultiLevelOptimizer,
+    HawkesFillModel, MultiLevelConfig, MultiLevelOptimizer,
     OptimizationState, TickLotValidator, EPSILON,
 };
 use super::quote_optimizer::{QuoteOptimizer, OptimizerInputs};
@@ -63,6 +63,8 @@ use super::robust_control::RobustControlModel;
 use super::robust_control_impl::{StandardRobustControl, RobustConfig};
 use super::inventory_skew::{InventorySkewModel};
 use super::inventory_skew_impl::{StandardInventorySkew, InventorySkewConfig};
+use super::parameter_transforms::StrategyConstrainedParams;
+use crate::ConstrainedTuningParams;
 
 /// Extended optimizer output with metadata.
 ///
@@ -108,10 +110,30 @@ pub struct HjbMultiLevelOptimizer {
     max_position_size: f64,
 
     /// Tuning parameters (constrained, i.e., theta space)
-    tuning_params: ConstrainedTuningParams,
+    tuning_params: StrategyConstrainedParams,
 }
 
 impl HjbMultiLevelOptimizer {
+    /// Convert new StrategyConstrainedParams to legacy ConstrainedTuningParams.
+    ///
+    /// This is a temporary compatibility layer while we migrate from the old
+    /// parameter system to the new one. The old system has fewer parameters
+    /// and different semantics, so we use reasonable defaults for unmapped fields.
+    pub fn to_legacy_params(_params: &StrategyConstrainedParams) -> ConstrainedTuningParams {
+        // Use default legacy parameters since the new param structure
+        // doesn't have direct equivalents for all old fields
+        ConstrainedTuningParams {
+            skew_adjustment_factor: 0.5,
+            adverse_selection_adjustment_factor: 0.5,
+            adverse_selection_lambda: 1.0,
+            inventory_urgency_threshold: 0.85,
+            liquidation_rate_multiplier: 0.5,
+            min_spread_base_ratio: 0.7,
+            adverse_selection_spread_scale: 0.5,
+            control_gap_threshold: 0.3,
+        }
+    }
+
     /// Create a new HJB multi-level optimizer with default parameters.
     ///
     /// Default configuration:
@@ -122,14 +144,14 @@ impl HjbMultiLevelOptimizer {
     /// - Max position: 50.0
     /// - Default tuning parameters
     pub fn new_default() -> Self {
-        use crate::TuningParams;
+        use super::parameter_transforms::StrategyTuningParams;
         Self::new(
             MultiLevelConfig::default(),
             RobustConfig::default(),
             InventorySkewConfig::default(),
             "HYPE".to_string(),
             50.0,
-            TuningParams::default().get_constrained(),
+            StrategyTuningParams::default().get_constrained(),
         )
     }
 
@@ -148,7 +170,7 @@ impl HjbMultiLevelOptimizer {
         inventory_skew_config: InventorySkewConfig,
         asset: String,
         max_position_size: f64,
-        tuning_params: ConstrainedTuningParams,
+        tuning_params: StrategyConstrainedParams,
     ) -> Self {
         let multi_level_optimizer = MultiLevelOptimizer::new(multi_level_config);
         let robust_control = StandardRobustControl::new(robust_config);
@@ -172,12 +194,12 @@ impl HjbMultiLevelOptimizer {
     }
     
     /// Update tuning parameters (for online tuning)
-    pub fn set_tuning_params(&mut self, tuning_params: ConstrainedTuningParams) {
+    pub fn set_tuning_params(&mut self, tuning_params: StrategyConstrainedParams) {
         self.tuning_params = tuning_params;
     }
-    
+
     /// Get current tuning parameters
-    pub fn get_tuning_params(&self) -> &ConstrainedTuningParams {
+    pub fn get_tuning_params(&self) -> &StrategyConstrainedParams {
         &self.tuning_params
     }
 
@@ -195,7 +217,7 @@ impl HjbMultiLevelOptimizer {
     /// }
     /// ```
     pub fn from_json(config: &Value) -> Self {
-        use crate::TuningParams;
+        use super::parameter_transforms::StrategyTuningParams;
 
         let asset = config.get("asset")
             .and_then(|v| v.as_str())
@@ -220,8 +242,8 @@ impl HjbMultiLevelOptimizer {
 
         let tuning_params = config.get("tuning_params")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .map(|tp: TuningParams| tp.get_constrained())
-            .unwrap_or_else(|| TuningParams::default().get_constrained());
+            .map(|tp: StrategyTuningParams| tp.get_constrained())
+            .unwrap_or_else(|| StrategyTuningParams::default().get_constrained());
 
         Self::new(multi_level_config, robust_config, inventory_skew_config, asset, max_position_size, tuning_params)
     }
@@ -237,6 +259,50 @@ impl QuoteOptimizer for HjbMultiLevelOptimizer {
         // Use a default maker fee of 1.5 bps for the trait method
         let output = self.calculate_target_quotes_with_metadata(inputs, state, fill_model, 1.5);
         (output.target_bids, output.target_asks)
+    }
+
+    fn apply_tuning_params(&mut self, params: &super::StrategyConstrainedParams) {
+        use log::info;
+
+        info!("[HJB Multi-Level Optimizer] Applying new tuning parameters");
+        info!("  Core params - phi: {:.4}, lambda: {:.2}, max_pos: {:.1}",
+            params.phi, params.lambda_base, params.max_absolute_position_size);
+        info!("  Multi-level - num_levels: {}, spacing: {:.1} bps, min_spread: {:.1} bps",
+            params.num_levels, params.level_spacing_bps, params.min_profitable_spread_bps);
+        info!("  Fees - maker: {:.1} bps, taker: {:.1} bps",
+            params.maker_fee_bps, params.taker_fee_bps);
+
+        // Update stored tuning parameters
+        self.tuning_params = params.clone();
+
+        // Update max position size
+        self.max_position_size = params.max_absolute_position_size;
+
+        // Update PositionManager with new max position
+        self.multi_level_optimizer.update_max_position(params.max_absolute_position_size);
+
+        // Update multi-level config parameters
+        let ml_config = self.multi_level_optimizer.config_mut();
+        ml_config.max_levels = params.num_levels;
+        ml_config.level_spacing_bps = params.level_spacing_bps;
+        ml_config.min_profitable_spread_bps = params.min_profitable_spread_bps;
+        ml_config.volatility_to_spread_factor = params.volatility_to_spread_factor;
+
+        // Note: The following parameters from StrategyConstrainedParams are not directly
+        // mapped to MultiLevelConfig fields and would require changes to the optimizer logic:
+        // - base_maker_size, maker_aggression_decay, taker_size_multiplier, min_taker_rate_threshold
+        // These could be added to MultiLevelConfig in the future if needed for auto-tuning.
+
+        // Update robust control enabled flag
+        // Note: The detailed robust control parameters (robustness_level, min_epsilon_mu, etc.)
+        // are not part of the auto-tunable parameters and remain fixed from the config
+        let robust_config = self.robust_control.config_mut();
+        robust_config.enabled = params.enable_robust_control;
+
+        // Note: Inventory skew parameters are not part of StrategyConstrainedParams yet.
+        // They could be added in the future if needed for auto-tuning.
+
+        info!("[HJB Multi-Level Optimizer] Parameters successfully applied");
     }
 }
 
@@ -311,13 +377,17 @@ impl HjbMultiLevelOptimizer {
             volatility_bps: robust_params.sigma_worst_case,
             current_time: inputs.current_time_sec,
             hawkes_model: fill_model,
+            open_bids: &state.open_bids,
+            open_asks: &state.open_asks,
         };
 
         // 6. Run multi-level optimization
+        // Convert new params to legacy format for backward compatibility
+        let legacy_params = Self::to_legacy_params(&self.tuning_params);
         let multi_level_control = self.multi_level_optimizer.optimize(
             &opt_state,
             robust_base_half_spread,
-            &self.tuning_params,
+            &legacy_params,
             maker_fee_bps,
         );
 

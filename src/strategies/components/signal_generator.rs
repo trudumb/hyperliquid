@@ -317,6 +317,29 @@ impl HjbSignalGenerator {
         // TODO: Add proper tracking
         (0, 0)
     }
+
+    /// Apply updated tuning parameters from auto-tuner
+    ///
+    /// This method is called when new optimized parameters are available from
+    /// the auto-tuning system. It forwards the parameters to the underlying
+    /// quote optimizer and clears the cache to force recomputation.
+    ///
+    /// # Arguments
+    /// - `params`: New constrained parameters from the tuner
+    ///
+    /// # Notes
+    /// - This is called from the main trading thread and must be fast
+    /// - Cache is cleared to ensure new parameters take effect immediately
+    pub fn apply_tuning_params(&mut self, params: &super::StrategyConstrainedParams) {
+        // Forward to the quote optimizer (which may update internal config)
+        self.quote_optimizer.apply_tuning_params(params);
+
+        // Clear cache to force recomputation with new parameters
+        self.clear_cache();
+
+        debug!("[SIGNAL GEN] Applied new tuning params: phi={:.4}, lambda={:.2}, max_pos={:.1}",
+            params.phi, params.lambda_base, params.max_absolute_position_size);
+    }
 }
 
 // ============================================================================
@@ -412,7 +435,8 @@ mod tests {
         assert_eq!(signal.best_ask_price(), Some(100.05));
         assert_eq!(signal.total_bid_size(), 15.0);
         assert_eq!(signal.total_ask_size(), 10.0);
-        assert_eq!(signal.theoretical_spread_bps(), 10.0);
+        // Use epsilon comparison for floating-point result
+        assert!((signal.theoretical_spread_bps() - 10.0).abs() < 1e-9);
     }
 
     #[test]

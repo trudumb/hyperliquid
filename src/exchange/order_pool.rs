@@ -30,8 +30,8 @@ pub struct OrderPoolStats {
 /// - Provides statistics for monitoring pool efficiency
 ///
 /// # Example
-/// ```no_run
-/// use hyperliquid_rust_sdk::exchange::order_pool::OrderPool;
+/// ```
+/// use hyperliquid_rust_sdk::OrderPool;
 ///
 /// let pool = OrderPool::new();
 ///

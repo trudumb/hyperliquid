@@ -82,7 +82,7 @@ pub trait FillModel: Send {
     /// the existing HjbMultiLevelOptimizer. In a fully generalized design, we
     /// would define a more abstract interface like:
     ///
-    /// ```rust
+    /// ```ignore
     /// fn get_fill_probability(&self, level: usize, offset_bps: f64, side: Side) -> f64;
     /// ```
     ///

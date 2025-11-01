@@ -17,9 +17,10 @@ use crate::ws::message_types::{AllMids, L2Book, Message, Trades, User};
 /// processor function with a reference to avoid cloning.
 ///
 /// # Example
-/// ```no_run
-/// use hyperliquid_rust_sdk::ws::message_processor::process_message_inline;
+/// ```ignore
+/// use hyperliquid_rust_sdk::process_message_inline;
 ///
+/// // Assume `message` is a Message instance
 /// process_message_inline(&message, |l2_book| {
 ///     // Process L2 book data inline
 ///     println!("Mid price: {}", l2_book.data.coin);
@@ -106,9 +107,8 @@ pub fn extract_user_events(message: &Message) -> Option<&User> {
 /// Implement this trait to create custom zero-copy message handlers
 ///
 /// # Example
-/// ```no_run
-/// use hyperliquid_rust_sdk::ws::message_processor::MessageProcessor;
-/// use hyperliquid_rust_sdk::ws::message_types::L2Book;
+/// ```
+/// use hyperliquid_rust_sdk::{MessageProcessor, L2Book, Trades};
 ///
 /// struct MyProcessor {
 ///     l2_count: u64,
@@ -120,7 +120,7 @@ pub fn extract_user_events(message: &Message) -> Option<&User> {
 ///         // Process inline without cloning
 ///     }
 ///
-///     fn process_trades_inline(&mut self, trades: &hyperliquid_rust_sdk::ws::message_types::Trades) {
+///     fn process_trades_inline(&mut self, trades: &Trades) {
 ///         // Process trades inline
 ///     }
 /// }

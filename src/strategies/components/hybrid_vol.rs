@@ -556,6 +556,9 @@ mod tests {
     fn test_bid_ask_tracking() {
         let mut tracker = BidAskRateTracker::new(10);
 
+        // Initialize the timestamp
+        tracker.update_rates();
+
         // Record some fills
         for _ in 0..5 {
             tracker.record_fill(true); // Bid fill
@@ -564,7 +567,7 @@ mod tests {
             tracker.record_fill(false); // Ask fill
         }
 
-        // Wait a bit and update rates
+        // Wait a bit and update rates (second call will record the rates)
         std::thread::sleep(std::time::Duration::from_millis(100));
         tracker.update_rates();
 

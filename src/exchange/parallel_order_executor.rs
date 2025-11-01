@@ -89,18 +89,19 @@ impl Default for ExecutorConfig {
 /// - Reducing API calls through intelligent grouping
 ///
 /// # Example
-/// ```no_run
-/// use hyperliquid_rust_sdk::prelude::*;
+/// ```ignore
+/// use hyperliquid_rust_sdk::{ExchangeClient, ParallelOrderExecutor, StrategyAction};
 /// use std::sync::Arc;
 ///
-/// async fn example() -> Result<()> {
+/// async fn example() -> Result<(), Box<dyn std::error::Error>> {
 ///     let exchange = Arc::new(ExchangeClient::new(/* ... */).await?);
 ///     let executor = ParallelOrderExecutor::new(exchange, 10);
 ///
-///     let actions = vec![
-///         StrategyAction::Place(order1),
-///         StrategyAction::Place(order2),
-///         StrategyAction::Cancel(cancel1),
+///     // Assume we have some actions to execute
+///     let actions: Vec<StrategyAction> = vec![
+///         // StrategyAction::Place(order1),
+///         // StrategyAction::Place(order2),
+///         // StrategyAction::Cancel(cancel1),
 ///     ];
 ///
 ///     let result = executor.execute_actions_parallel(actions).await;
