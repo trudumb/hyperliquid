@@ -92,6 +92,9 @@ pub mod order_executor;
 // Market data processing
 pub mod market_data_pipeline;
 
+// Inventory markout (proactive inventory defense)
+pub mod inventory_markout;
+
 // Re-export traits for convenience
 pub use volatility::VolatilityModel;
 pub use fill_model::FillModel;
@@ -161,4 +164,9 @@ pub use order_executor::{
 pub use market_data_pipeline::{
     MarketDataPipeline, ProcessedMarketData, MarketDataProcessor,
     ImbalanceProcessor, VolatilityProcessor, AdverseSelectionProcessor
+};
+
+// Inventory markout
+pub use inventory_markout::{
+    InventoryMarkoutCalculator, InventoryMarkoutConfig, InventoryAdjustment, PenaltyBreakdown
 };

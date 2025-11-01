@@ -133,6 +133,9 @@ pub struct HjbStrategyV2Config {
 
     /// Number of market updates per tuning episode
     pub tuner_updates_per_episode: usize,
+
+    /// Inventory markout configuration
+    pub inventory_markout_config: Option<crate::strategies::components::InventoryMarkoutConfig>,
 }
 
 impl HjbStrategyV2Config {
@@ -188,6 +191,13 @@ impl HjbStrategyV2Config {
             (None, 100)
         };
 
+        // Inventory markout configuration
+        let inventory_markout_config = if let Some(markout_cfg) = params.get("inventory_markout_config") {
+            serde_json::from_value(markout_cfg.clone()).ok()
+        } else {
+            None
+        };
+
         Self {
             max_position,
             phi: params.get("phi").and_then(|v| v.as_f64()).unwrap_or(0.01),
@@ -210,6 +220,7 @@ impl HjbStrategyV2Config {
             state_machine_config,
             tuner_config,
             tuner_updates_per_episode,
+            inventory_markout_config,
         }
     }
 }
@@ -233,6 +244,9 @@ pub struct HjbStrategyV2 {
     risk_adjuster: RiskAdjuster,
     position_manager: PositionManager,
     order_executor: OrderExecutor,
+
+    // Inventory markout calculator (None if disabled)
+    inventory_markout_calc: Option<crate::strategies::components::InventoryMarkoutCalculator>,
 
     // Metrics
     metrics_subscriber: Arc<MetricsSubscriber>,
@@ -397,6 +411,20 @@ impl HjbStrategyV2 {
             None
         };
 
+        // Initialize inventory markout calculator if enabled
+        let inventory_markout_calc = if let Some(ref markout_config) = config.inventory_markout_config {
+            info!("[HJB V2] Initializing inventory markout calculator");
+            info!("[HJB V2] Linear penalty: {:.4}, Urgency threshold: {:.2}",
+                markout_config.linear_penalty_per_unit, markout_config.urgency_threshold);
+            Some(crate::strategies::components::InventoryMarkoutCalculator::new(
+                markout_config.clone(),
+                config.tick_size,
+            ))
+        } else {
+            info!("[HJB V2] Inventory markout disabled");
+            None
+        };
+
         Self {
             config,
             event_bus,
@@ -406,6 +434,7 @@ impl HjbStrategyV2 {
             risk_adjuster,
             position_manager,
             order_executor,
+            inventory_markout_calc,
             metrics_subscriber,
             tuner_actor,
             last_quote_time: 0.0,
@@ -531,6 +560,25 @@ impl HjbStrategyV2 {
         self.market_pipeline.process(update.clone())
     }
 
+    /// Cancel all orders on one side (true = bids, false = asks)
+    fn cancel_side(&self, state: &CurrentState, is_bid: bool) -> Vec<StrategyAction> {
+        let orders_to_cancel = if is_bid {
+            &state.open_bids
+        } else {
+            &state.open_asks
+        };
+
+        orders_to_cancel
+            .iter()
+            .filter_map(|order| order.oid.map(|oid| {
+                StrategyAction::Cancel(ClientCancelRequest {
+                    asset: self.config.asset.clone(),
+                    oid,
+                })
+            }))
+            .collect()
+    }
+
     /// Generate trading actions based on current snapshot
     fn generate_trading_actions(&mut self, snapshot: &TradingSnapshot, state: &CurrentState) -> Result<Vec<StrategyAction>, String> {
         // 1. Check position state
@@ -547,9 +595,32 @@ impl HjbStrategyV2 {
             );
         }
 
-        // 2. Generate raw signal from HJB optimizer
+        // 2. Apply inventory markout BEFORE signal generation (proactive defense)
+        let market_data_for_signal = if let Some(ref calc) = self.inventory_markout_calc {
+            let raw_mid = snapshot.market_data.mid_price;
+            let adjusted_mid = calc.adjust_fair_value(
+                raw_mid,
+                snapshot.risk_metrics.position,
+                snapshot.risk_metrics.max_position_size,
+                snapshot.market_data.volatility_bps,
+            );
+
+            if (adjusted_mid - raw_mid).abs() > 0.001 {
+                debug!("[HJB V2] Inventory markout: {:.4} → {:.4} (Δ{:.4}, pos={:.2})",
+                    raw_mid, adjusted_mid, adjusted_mid - raw_mid, snapshot.risk_metrics.position);
+            }
+
+            // Create adjusted market data with inventory-adjusted mid
+            let mut adjusted_market_data = snapshot.market_data.clone();
+            adjusted_market_data.mid_price = adjusted_mid;
+            adjusted_market_data
+        } else {
+            snapshot.market_data.clone()
+        };
+
+        // 3. Generate raw signal from HJB optimizer (with inventory-adjusted mid)
         let signal = self.signal_generator.generate_quotes(
-            &snapshot.market_data,
+            &market_data_for_signal,
             state,
         );
 
@@ -559,7 +630,7 @@ impl HjbStrategyV2 {
             signal.urgency
         );
 
-        // 3. Apply risk adjustments
+        // 4. Apply risk adjustments (size limits)
         let adjusted_signal = self.risk_adjuster.adjust_signal(
             signal,
             snapshot,
@@ -569,7 +640,7 @@ impl HjbStrategyV2 {
             debug!("[HJB V2] Signal adjusted: {}", adjusted_signal.adjustment_reason);
         }
 
-        // 4. Execute orders
+        // 5. Execute orders
         match self.order_executor.execute(adjusted_signal, snapshot) {
             Ok(actions) => {
                 debug!("[HJB V2] Generated {} strategy actions", actions.len());
@@ -630,8 +701,35 @@ impl Strategy for HjbStrategyV2 {
                 // This updates the optimizer and clears the cache
                 self.signal_generator.apply_tuning_params(&updated_params);
 
-                info!("[HJB V2 Tuner] ✅ Applied new parameters: phi={:.4}, lambda={:.2}, max_pos={:.1}",
-                    updated_params.phi, updated_params.lambda_base, updated_params.max_absolute_position_size);
+                let old_max_pos = self.config.max_position;
+                let new_max_pos = updated_params.max_absolute_position_size;
+
+                // ✅ Cancel dangerous orders if max_pos was reduced
+                if new_max_pos < old_max_pos {
+                    warn!("[HJB V2 Tuner] Max position reduced: {:.1} → {:.1}",
+                        old_max_pos, new_max_pos);
+
+                    self.config.max_position = new_max_pos;
+                    self.position_manager = PositionManager::new(
+                        new_max_pos,
+                        self.config.position_manager_config.clone()
+                    );
+
+                    let current_pos = state.position;
+                    if current_pos.abs() > new_max_pos * 0.8 {
+                        let cancel_actions = if current_pos > 0.0 {
+                            self.cancel_side(state, true)
+                        } else {
+                            self.cancel_side(state, false)
+                        };
+
+                        info!("[HJB V2 Tuner] Canceled dangerous orders");
+                        return cancel_actions;
+                    }
+                }
+
+                info!("[HJB V2 Tuner] ✅ Applied: phi={:.4}, lambda={:.2}, max_pos={:.1}",
+                    updated_params.phi, updated_params.lambda_base, new_max_pos);
             }
         }
 
@@ -742,6 +840,32 @@ impl Strategy for HjbStrategyV2 {
         // Re-quote if we had a fill (position changed)
         if !update.fills.is_empty() {
             let snapshot = self.state_store.get_snapshot();
+            let position = snapshot.risk_metrics.position;
+            let max_pos = snapshot.risk_metrics.max_position_size;
+
+            // ✅ CRITICAL: Cancel dangerous orders if over-limit
+            if position.abs() >= max_pos * 0.95 {  // 95% threshold
+                warn!("[HJB V2] ⚠️  Near/over limit after fill! pos={:.2}, max={:.2}",
+                    position, max_pos);
+
+                let cancel_actions = if position > 0.0 {
+                    debug!("[HJB V2] Emergency: canceling all BIDs");
+                    self.cancel_side(state, true)
+                } else {
+                    debug!("[HJB V2] Emergency: canceling all ASKs");
+                    self.cancel_side(state, false)
+                };
+
+                // Return cancellations first, then requote reduce-only
+                let mut actions = cancel_actions;
+                match self.generate_trading_actions(&snapshot, state) {
+                    Ok(mut requote) => actions.append(&mut requote),
+                    Err(e) => warn!("[HJB V2] Error generating reduce-only: {}", e),
+                }
+                return actions;
+            }
+
+            // Normal requote
             match self.generate_trading_actions(&snapshot, state) {
                 Ok(actions) => return actions,
                 Err(e) => {
